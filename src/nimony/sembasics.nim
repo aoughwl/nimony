@@ -257,6 +257,16 @@ proc buildErr*(c: var SemContext; dest: var TokenBuf; info: PackedLineInfo; msg:
   orig.addDotToken()
   c.buildErr dest, info, msg, cursorAt(orig, 0)
 
+proc warn*(c: var SemContext; info: PackedLineInfo; msg: string) =
+  ## Emit a user-facing compile-time warning. Unlike `buildErr`, a warning is not
+  ## written into the tree (it must not abort compilation or reach later passes);
+  ## it is printed immediately through a `Reporter`, exactly as `reportErrors`
+  ## does for errors. Deduplicated by source position so a construct that is
+  ## semchecked more than once is only reported once.
+  if not c.warnedSources.containsOrIncl(info):
+    var r = Reporter(verbosity: 2, noColors: not useColors())
+    r.warn infoToStr(info), msg
+
 proc combineErr*(c: var SemContext; dest: var TokenBuf; pos: int; info: PackedLineInfo; msg: string; orig: Cursor) =
   ## Builds ErrT node and combine it with the node at `pos` so that no nodes are added outside of
   ## the node at `pos`.

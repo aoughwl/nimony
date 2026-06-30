@@ -1,0 +1,2 @@
+tests/nimony/object/tobjconstr_evalorder.nim(18, 14) Warning: object constructor fields are out of order; reorder them to match the field declaration (evaluation) order
+tests/nimony/object/tobjconstr_evalorder.nim(24, 15) Warning: named call arguments are out of order; reorder them to match the parameter (evaluation) order

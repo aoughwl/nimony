@@ -174,6 +174,9 @@ type
     checkedForWriteNifModule*: bool
     inWhen*: int
     inUncheckedAccess*: int
+    warnedSources*: HashSet[PackedLineInfo]
+      ## source positions already reported via `warn` (dedup so a construct that
+      ## is semchecked more than once is only warned about once)
     templateInstCounter*: int
     commandLineArgs*: string # for IC we make nimony `exec` itself. Thus it is important
                              # to forward command line args properly.

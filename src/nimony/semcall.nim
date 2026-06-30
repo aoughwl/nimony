@@ -908,6 +908,15 @@ proc resolveOverloads(c: var SemContext; dest: var TokenBuf; it: var Item; cs: v
   if idx >= 0:
     dest.add cs.callNode
     let finalFn = m[idx].fn
+    if m[idx].namedArgsReordered and finalFn.kind notin {TemplateY, MacroY}:
+      # The chosen overload's named arguments are written in an order that does
+      # not match parameter (evaluation) order; the values' side effects run in
+      # parameter order, not source order. Flag it, consistently with object
+      # constructor fields. Templates/macros are skipped: their arguments are not
+      # plain call values (the plugin reads `cs.args`), so reordering carries no
+      # evaluation-order meaning there.
+      c.warn m[idx].namedArgsReorderInfo,
+        "named call arguments are out of order; reorder them to match the parameter (evaluation) order"
     # only merge symbols defined in args to scope if we did not match a macro/template:
     closeArgsScope c, cs, merge = finalFn.kind notin {MacroY, TemplateY}
     let isMagic = c.addFn(dest, finalFn, cs.fn.n, m[idx])

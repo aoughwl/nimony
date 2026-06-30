@@ -4072,6 +4072,32 @@ proc semSumTypeObjConstr(c: var SemContext; dest: var TokenBuf; it: var Item;
   semObjConstr c, dest, objConstr
   it.typ = objConstr.typ
 
+proc isFlatObjectType(typ: Cursor): bool =
+  ## True for a concrete object type with no inheritance and no variant
+  ## (`case`) part — the shapes where object-constructor fields can be freely
+  ## reordered without disturbing discriminator handling or base-class field
+  ## ordering. Used by the eval-order fix in `semObjConstr` to decide where it
+  ## is safe to hoist given field values into source-order temporaries.
+  var objImpl = typ
+  if objImpl.typeKind in {RefT, PtrT}: inc objImpl
+  discard skipInvoke(objImpl)
+  if objImpl.kind != Symbol: return false
+  let objDecl = getTypeSection(objImpl.symId)
+  if objDecl.kind != TypeY: return false
+  var objBody = objDecl.objBody
+  if objBody.typeKind != ObjectT: return false
+  let obj = asObjectDecl(objBody)
+  if obj.parentType.kind != DotToken: return false
+  var f = obj.body
+  inc f                # past (object
+  skip f               # inheritance slot
+  if f.kind == DotToken: return false   # no fields → nothing to reorder
+  var iter = initObjFieldIter()
+  while nextField(iter, f, keepCase = true):
+    if f.substructureKind == CaseU: return false
+    skip f
+  return true
+
 proc semObjConstr(c: var SemContext; dest: var TokenBuf, it: var Item) =
   let exprStart = dest.len
   let expected = it.typ
@@ -4145,6 +4171,9 @@ proc semObjConstr(c: var SemContext; dest: var TokenBuf, it: var Item) =
   let bindings = bindInvokeArgs(decl, invokeArgs)
   var fieldBuf = createTokenBuf(16)
   var setFieldPositions = initTable[SymId, int]()
+  var givenOrder: seq[SymId] = @[]
+  var fieldTypeBuf = createTokenBuf(16)
+  var fieldTypePos = initTable[SymId, int]()
   while it.n.hasMore:
     if it.n.substructureKind != KvU:
       c.buildErr dest, it.n.info, "expected key/value pair in object constructor"
@@ -4175,6 +4204,9 @@ proc semObjConstr(c: var SemContext; dest: var TokenBuf, it: var Item) =
             skip it.n
           else:
             setFieldPositions[field.sym] = fieldStart
+            givenOrder.add field.sym
+            fieldTypePos[field.sym] = fieldTypeBuf.len
+            fieldTypeBuf.addSubtree field.typ
             if isGenericObj:
               # do not save generic field sym
               fieldBuf.add identToken(fieldName, fieldInfo)
@@ -4202,7 +4234,65 @@ proc semObjConstr(c: var SemContext; dest: var TokenBuf, it: var Item) =
   var setFields = initTable[SymId, Cursor]()
   for field, pos in setFieldPositions:
     setFields[field] = cursorAt(fieldBuf, pos)
+
+  # The constructor below is emitted in *declaration* order, but the user may
+  # write the fields in a different order. When two or more fields are given and
+  # the object is a flat (non-variant, non-inherited) type, hoist each given
+  # field's non-trivial value into a temporary evaluated in *source* order, so
+  # observable side effects run as written (nim-lang/nimony#1056). The
+  # declaration-order constructor then merely references the temporaries; the
+  # remaining trivial values (literals, symbols) have no side effects, so their
+  # position is immaterial.
+  var hoistBuf = createTokenBuf(16)
+  var hoistKvPos = initTable[SymId, int]()
+  var wrappedInExpr = false
+  if not isGenericObj and givenOrder.len >= 2 and dest.len == exprStart and
+      isFlatObjectType(it.typ):
+    var anyHoisted = false
+    for sym in givenOrder:
+      var v = setFields[sym]
+      inc v                 # into (kv
+      skip v                # past field name
+      if v.kind == ParLe:   # compound value → must preserve eval order
+        anyHoisted = true
+        break
+    if anyHoisted:
+      wrappedInExpr = true
+      dest.addParLe(ExprX, info)
+      for sym in givenOrder:
+        var kv = setFields[sym]
+        inc kv              # into (kv
+        let nameTok = kv    # field name (single token)
+        skip kv             # kv now at the value
+        if kv.kind != ParLe: continue   # trivial value: leave inline
+        var tmpName = "`objc"
+        c.makeLocalSym(tmpName)
+        let tmpSym = pool.syms.getOrIncl(tmpName)
+        let tmpDeclStart = dest.len
+        dest.addParLe(VarS, info)
+        dest.add symdefToken(tmpSym, info)
+        dest.addDotToken()  # export marker
+        dest.addDotToken()  # pragmas
+        var ftyp = cursorAt(fieldTypeBuf, fieldTypePos[sym])
+        if bindings.len != 0:
+          dest.addSubtree instantiateType(c, ftyp, bindings)
+        else:
+          dest.addSubtree ftyp
+        dest.addSubtree kv  # the value subtree, evaluated here in source order
+        dest.addParRi()
+        publish c, dest, tmpSym, tmpDeclStart
+        hoistKvPos[sym] = hoistBuf.len
+        hoistBuf.addParLe(KvU, info)
+        hoistBuf.addSubtree nameTok
+        hoistBuf.add symToken(tmpSym, info)
+        hoistBuf.addParRi()
+      # hoistBuf is now fully built; only assign cursors into it afterwards so
+      # earlier reallocations can't dangle them.
+      for sym, pos in hoistKvPos:
+        setFields[sym] = cursorAt(hoistBuf, pos)
   buildDefaultObjConstr(c, dest, it.typ, setFields, info, bindings)
+  if wrappedInExpr:
+    dest.addParRi()
   commonType c, dest, it, exprStart, expected
 
 proc semObjDefault(c: var SemContext; dest: var TokenBuf; it: var Item) =

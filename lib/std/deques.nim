@@ -35,7 +35,17 @@ func nextPowerOfTwo(x: int): int =
   while result < x:
     result = result shl 1
 
-func initDeque*[T: HasDefault](initialSize: int = defaultInitialSize): Deque[T] =
+func uninitBuffer[T](cap: int): seq[T] =
+  ## A `cap`-slot backing buffer whose slots are `=wasMoved` (binary-zero, and
+  ## therefore safe to destroy or overwrite) rather than default-valued. Using
+  ## this instead of `newSeq` keeps the ring buffer working for any `T` — the
+  ## element type need not satisfy `HasDefault`. The ring only ever reads slots
+  ## it has written; zeroing the rest just keeps the unused tail destructible.
+  result = newSeqUninit[T](cap)
+  for i in 0 ..< cap:
+    `=wasMoved`(result[i])
+
+func initDeque*[T](initialSize: int = defaultInitialSize): Deque[T] =
   ## Creates a new empty `Deque`.
   ##
   ## `initialSize` is rounded up to the next power of two and used as the
@@ -44,20 +54,20 @@ func initDeque*[T: HasDefault](initialSize: int = defaultInitialSize): Deque[T] 
     var a = initDeque[int]()
     assert a.len == 0
   let cap = nextPowerOfTwo(initialSize)
-  result = Deque[T](data: newSeq[T](cap), head: 0, tail: 0, count: 0, mask: cap - 1)
+  result = Deque[T](data: uninitBuffer[T](cap), head: 0, tail: 0, count: 0, mask: cap - 1)
 
 func len*[T](d: Deque[T]): int {.inline.} =
   ## Returns the number of elements of `d`.
   d.count
 
-func growIfNeeded[T: HasDefault](d: var Deque[T]) =
+func growIfNeeded[T](d: var Deque[T]) =
   ## Doubles the capacity if the ring buffer is full, re-laying the elements
   ## out contiguously starting at index 0.
   if d.count < d.data.len:
     return
   let oldCap = d.data.len
   let newCap = if oldCap == 0: defaultInitialSize else: oldCap * 2
-  var newData = newSeq[T](newCap)
+  var newData = uninitBuffer[T](newCap)
   var i = 0
   var j = d.head
   while i < d.count:
@@ -69,7 +79,7 @@ func growIfNeeded[T: HasDefault](d: var Deque[T]) =
   d.tail = d.count
   d.mask = newCap - 1
 
-func addLast*[T: HasDefault](d: var Deque[T]; item: sink T) =
+func addLast*[T](d: var Deque[T]; item: sink T) =
   ## Adds an `item` to the end of `d`.
   runnableExamples:
     var a = initDeque[int]()
@@ -80,7 +90,7 @@ func addLast*[T: HasDefault](d: var Deque[T]; item: sink T) =
   d.tail = (d.tail + 1) and d.mask
   inc d.count
 
-func addFirst*[T: HasDefault](d: var Deque[T]; item: sink T) =
+func addFirst*[T](d: var Deque[T]; item: sink T) =
   ## Adds an `item` to the beginning of `d`.
   runnableExamples:
     var a = initDeque[int]()
@@ -180,7 +190,7 @@ func `$`*[T: Stringable](d: Deque[T]): string =
     result.add $d.data[(d.head + i) and d.mask]
   result.add "]"
 
-func toDeque*[T: HasDefault](xs: openArray[T]): Deque[T] =
+func toDeque*[T](xs: openArray[T]): Deque[T] =
   ## Creates a new `Deque` containing the elements of `xs`, in order.
   runnableExamples:
     let a = toDeque([1, 2, 3])

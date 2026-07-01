@@ -242,8 +242,10 @@ proc commonType*(c: var SemContext; dest: var TokenBuf; it: var Item; argBegin: 
       endRead convArg.n
       expectUnique dest
       shrink dest, argBegin
-      #buildErr c, dest, info, getErrorMsg(m)
-      c.typeMismatch dest, info, it.typ, expected
+      if m.isValueOutOfRange:
+        buildErr c, dest, info, getErrorMsg(m)
+      else:
+        c.typeMismatch dest, info, it.typ, expected
   else:
     endRead arg.n
     expectUnique dest
@@ -702,6 +704,8 @@ proc semBaseobj(c: var SemContext; dest: var TokenBuf; it: var Item) =
   if not m.err and m.args[0].tagEnum == BaseobjTagId:
     dest.shrink beforeExpr
     dest.add m.args
+  elif m.isValueOutOfRange:
+    buildErr c, dest, it.n.info, getErrorMsg(m)
   else:
     c.typeMismatch dest, it.n.info, it.typ, destType
   skipParRi it.n
@@ -765,7 +769,10 @@ proc semConvArg(c: var SemContext; dest: var TokenBuf; destType: Cursor; arg: It
     var m = createMatch(addr c)
     typematch m, destBase, matchArg
     if m.err:
-      c.typeMismatch dest, info, arg.typ, destType
+      if m.isValueOutOfRange:
+        buildErr c, dest, info, getErrorMsg(m)
+      else:
+        c.typeMismatch dest, info, arg.typ, destType
     else:
       # distinct type conversions can also involve conversions
       # between different integer sizes or object types and then
@@ -783,6 +790,11 @@ proc semConvArg(c: var SemContext; dest: var TokenBuf; destType: Cursor; arg: It
     typematch m, destType, matchArg
     if not m.err:
       addMaybeBaseobjConv(c, dest, m, beforeExpr)
+    elif m.isValueOutOfRange:
+      # a statically-known out-of-range value for a `range` destination is a
+      # hard error; the reverse-direction (object downcast) probe below would
+      # spuriously accept it, so report here.
+      buildErr c, dest, info, getErrorMsg(m)
     else:
       # also try the other direction:
       var m = createMatch(addr c)

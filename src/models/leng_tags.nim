@@ -152,9 +152,10 @@ type
     ExportcP = (ord(ExportcTagId), "exportc")  ## `exportc` pragma
     HeaderP = (ord(HeaderTagId), "header")  ## `header` pragma
     PackedP = (ord(PackedTagId), "packed")  ## `packed` pragma
+    VariantP = (ord(VariantTagId), "variant")  ## discriminator-field annotation on a variant (case) object: one `(ranges ...)` per emitted `(union ...)` branch, in branch order, recording the discriminant values that select each branch; an empty `(ranges)` marks the `else`/default branch. Lets the LLVM backend recover the kind→branch mapping and emit DWARF `DW_TAG_variant_part` debug info (issue #2068)
 
 proc rawTagIsLengPragma*(raw: TagEnum): bool {.inline.} =
-  raw in {InlineTagId, NoinlineTagId, AttrTagId, SmryTagId, WasTagId, SelectanyTagId, AlignTagId, BitsTagId, VectorTagId, NodeclTagId, RaisesTagId, ErrsTagId, StaticTagId, ImportcTagId, ImportcppTagId, ExportcTagId, HeaderTagId, PackedTagId}
+  raw in {InlineTagId, NoinlineTagId, AttrTagId, SmryTagId, WasTagId, SelectanyTagId, AlignTagId, BitsTagId, VectorTagId, NodeclTagId, RaisesTagId, ErrsTagId, StaticTagId, ImportcTagId, ImportcppTagId, ExportcTagId, HeaderTagId, PackedTagId, VariantTagId}
 
 type
   LengTypeQualifier* = enum

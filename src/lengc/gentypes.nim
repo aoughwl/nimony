@@ -258,6 +258,10 @@ proc genFieldPragmas(c: var GeneratedCode; n: var Cursor; bits: var BiggestInt) 
           while n.hasMore: skip n
       of ExportcP, ImportcP, ImportcppP, NodeclP:
         skip n
+      of VariantP:
+        # kind→branch mapping for variant-object debug info (#2068);
+        # irrelevant to the C struct layout.
+        skip n
       else:
         error c.m, "invalid field pragma: ", n
   else:

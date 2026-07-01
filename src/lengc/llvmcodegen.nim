@@ -620,6 +620,9 @@ proc parseProcPragmasLLVM(c: var LLVMCode; n: var Cursor): PragmaInfo =
         skip n
       of AttrP:
         skip n # ignore attributes for now
+      of VariantP:
+        # variant-object discriminator annotation (#2068); never valid on a proc.
+        error c.m, "invalid proc pragma: ", n
   else:
     error c.m, "expected proc pragmas but got: ", n
 

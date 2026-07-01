@@ -21,6 +21,11 @@ type
     kind*: SymKind
     hasDefer*: bool
     inGeneric*, inLoop*, inBlock*, inInst*, inExcept*: int
+    inTemplExpand*: int  ## >0 while semchecking a template/macro-plugin
+                         ## expansion: unlike a generic instantiation (`inInst`),
+                         ## the spliced `untyped` content is semchecked here for
+                         ## the *first* time, so field-visibility must still be
+                         ## enforced (nim-lang/nimony#1988).
     returnType*: TypeCursor
     pragmas*: set[PragmaKind]
     raisesType*: TypeCursor  # Type from .raises pragma (e.g., ErrorCode, MyError)

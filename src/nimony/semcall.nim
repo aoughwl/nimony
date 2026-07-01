@@ -142,6 +142,7 @@ proc semTemplateCall(c: var SemContext; dest: var TokenBuf; it: var Item; fnId: 
     var a = Item(n: cursorAt(expandedInto, 0), typ: c.types.autoType)
     let aInfo = a.n.info
     inc c.routine.inInst
+    inc c.routine.inTemplExpand
     semExpr c, dest, a, flags
     # make sure template body expression matches return type, mirrored with `semProcBody`:
     let returnType =
@@ -157,6 +158,7 @@ proc semTemplateCall(c: var SemContext; dest: var TokenBuf; it: var Item; fnId: 
       typecheck(c, dest, aInfo, a.typ, returnType)
     else:
       commonType c, dest, a, beforeCall, returnType
+    dec c.routine.inTemplExpand
     dec c.routine.inInst
     # now match to expected type:
     it.kind = a.kind
@@ -799,7 +801,9 @@ proc runCompiledMacroPlugin(c: var SemContext; dest: var TokenBuf; it: var Item;
       expandedInto.addParRi() # extra token so final `inc` doesn't break
       var a = Item(n: cursorAt(expandedInto, 0), typ: c.types.autoType)
       inc c.routine.inInst
+      inc c.routine.inTemplExpand
       semExpr c, dest, a
+      dec c.routine.inTemplExpand
       dec c.routine.inInst
       it.kind = a.kind
       typeofCallIs c, dest, it, cs.beforeCall, a.typ

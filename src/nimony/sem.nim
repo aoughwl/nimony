@@ -960,11 +960,17 @@ proc findObjFieldConsiderVis(c: var SemContext; decl: TypeDecl; name: StrId;
                               bypassVis = false): ObjField =
   let impl = decl.objBody
   result = findObjFieldAux(c, impl, name, bindings)
-  if c.routine.inInst == 0 and not bypassVis:
-    # only check visibility during first semcheck, unless the input NIF
-    # already carried an access-token proving the access was hygiene-checked
-    # at a site that had visibility (e.g. a template body semchecked in the
-    # field's owner module).
+  if (c.routine.inInst == 0 or c.routine.inTemplExpand > 0) and not bypassVis:
+    # Check visibility during a first semcheck (`inInst == 0`) and during a
+    # template/macro-plugin expansion (`inTemplExpand > 0`), whose spliced
+    # `untyped` content is being semchecked here for the first time. We must NOT
+    # skip merely because `inInst > 0`: a generic *instantiation* re-checks a
+    # body already validated in the field's owner module (its fields carry a
+    # resolved symbol, honoured via `bypassVis`), but an `untyped` template
+    # argument was never checked, so a private field named at a non-owner call
+    # site has to be rejected here (nim-lang/nimony#1988). Entering a generic
+    # proc body starts a fresh `SemRoutine` (so `inTemplExpand` resets to 0),
+    # which keeps a generic instantiated *from within* an expansion correct.
     if result.level == 0:
       result.rootOwner = genericRootSym(decl)
     if result.level >= 0:

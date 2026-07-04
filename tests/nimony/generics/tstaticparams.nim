@@ -99,3 +99,29 @@ let wide = concatCols(col, pair)   # Matrix[2, 3, int] = [[1, 3, 4], [2, 5, 6]]
 echo wide.data[0]
 echo wide.data[3]
 echo sizeof(wide)                  # 2 * 3 * 8 = 48
+
+# static parameters are not limited to primitive builtins.
+type
+  Channel = enum
+    red, green, blue
+
+proc paint[C: static[Channel]](): int =
+  when C == red:
+    result = 1
+  elif C == green:
+    result = 2
+  else:
+    result = 3
+
+echo paint[green]()
+
+# static openArray values are accepted as compile-time generic values.
+proc countValues[XS: static[openArray[int]]](): int = XS.len
+
+echo countValues[[1, 2, 3, 4]]()
+
+# overload resolution folds known static[int] expressions.
+proc takesFlat[R, C: static[int]; T](x: array[R * C, T]): int = x.len
+
+var flat: array[6, int]
+echo takesFlat[3, 2, int](flat)

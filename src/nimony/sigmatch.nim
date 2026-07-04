@@ -486,6 +486,124 @@ proc isStaticTypevar(s: SymId): bool =
   assert res.status == LacksNothing
   result = res.decl.symKind == StaticTypevarY
 
+proc sameStaticSymbol(a, b: SymId): bool =
+  if a == b:
+    return true
+  let sa = pool.syms[a]
+  let sb = pool.syms[b]
+  result = isInstantiation(sa) and isInstantiation(sb) and
+    removeModule(sa) == removeModule(sb)
+
+proc isStaticValue*(n: Cursor): bool =
+  ## A canonical compile-time value as bound to a `staticTypevar`.
+  case n.kind
+  of IntLit, UIntLit, FloatLit, CharLit, StringLit:
+    result = true
+  of Symbol:
+    let res = tryLoadSym(n.symId)
+    result = res.status == LacksNothing and
+      res.decl.symKind in {ConstY, EfldY, StaticTypevarY}
+  of ParLe:
+    case n.exprKind
+    of FalseX, TrueX:
+      result = true
+    of SufX:
+      var elem = n
+      inc elem
+      result = isStaticValue(elem)
+    of AconstrX, SetconstrX, TupconstrX, OconstrX:
+      var elem = n
+      inc elem
+      skip elem # type
+      result = true
+      while elem.hasMore:
+        if elem.substructureKind in {KvU, RangeU}:
+          inc elem
+          skip elem # key or range start
+          if not isStaticValue(elem):
+            result = false
+            break
+          skip elem
+          if elem.kind == ParRi:
+            break
+          inc elem
+        else:
+          if not isStaticValue(elem):
+            result = false
+            break
+          skip elem
+    else:
+      result = false
+  else:
+    result = false
+
+proc staticValueType(a: Cursor): Cursor =
+  result = default(Cursor)
+  case a.kind
+  of Symbol:
+    let res = tryLoadSym(a.symId)
+    if res.status == LacksNothing and isLocal(res.decl.symKind):
+      result = asLocal(res.decl).typ
+  of ParLe:
+    case a.exprKind
+    of AconstrX, SetconstrX, TupconstrX, OconstrX:
+      var typ = a
+      inc typ
+      result = typ
+    else:
+      discard
+  else:
+    discard
+
+proc staticOpenArrayElemType(t: Cursor): Cursor =
+  result = default(Cursor)
+  var t = t
+  var depth = 0
+  while t.kind == Symbol and depth < 20:
+    let res = tryLoadSym(t.symId)
+    if res.status != LacksNothing or res.decl.symKind != TypeY:
+      return default(Cursor)
+    let decl = asTypeDecl(res.decl)
+    if decl.typevars.typeKind == InvokeT:
+      t = decl.typevars
+      break
+    elif decl.body.kind == Symbol:
+      t = decl.body
+    else:
+      return default(Cursor)
+    inc depth
+  if t.typeKind == InvokeT:
+    inc t
+    if t.kind == Symbol and pool.syms[t.symId] == OpenArrayHeadName:
+      inc t
+      result = t
+  elif t.typeKind == VarargsT:
+    inc t
+    if t.kind != ParRi:
+      result = t
+
+proc staticValueTypeMatches(elemType, valueType: Cursor): bool =
+  if cursorIsNil(valueType):
+    return false
+  if sameTrees(elemType, valueType):
+    return true
+  if elemType.kind == Symbol and valueType.kind == Symbol:
+    return sameStaticSymbol(elemType.symId, valueType.symId)
+  if elemType.typeKind == VarargsT and valueType.typeKind == ArrayT:
+    var elem = elemType
+    inc elem
+    if elem.kind == ParRi:
+      return true
+    var arrElem = valueType
+    inc arrElem
+    return sameTrees(elem, arrElem)
+  let openArrayElem = staticOpenArrayElemType(elemType)
+  if not cursorIsNil(openArrayElem) and valueType.typeKind == ArrayT:
+    var arrElem = valueType
+    inc arrElem
+    return sameTrees(openArrayElem, arrElem)
+  false
+
 proc foldValueExpr(m: var Match; a: Cursor; depth = 0): xint =
   ## The tiny fixed-opcode evaluator for compile-time *values* in type
   ## positions: folds `+ - *` over integer literals and rewrites an
@@ -499,6 +617,10 @@ proc foldValueExpr(m: var Match; a: Cursor; depth = 0): xint =
     result = createXint(pool.integers[a.intId])
   of UIntLit:
     result = createXint(pool.uintegers[a.uintId])
+  of Symbol:
+    if isStaticTypevar(a.symId) and m.inferred.contains(a.symId):
+      let inferred = m.inferred.getOrQuit(a.symId)
+      result = foldValueExpr(m, inferred, depth+1)
   of ParLe:
     case a.exprKind
     of AddX, SubX, MulX:
@@ -550,6 +672,8 @@ proc staticValueToBind(m: var Match; elemType: Cursor; a: Cursor): Cursor =
     # a symbolic value: a value parameter of an enclosing generic; it is
     # compared or substituted later, no value is computed here
     if isStaticTypevar(a.symId): result = a
+    elif isStaticValue(a) and staticValueTypeMatches(elemType, staticValueType(a)):
+      result = a
   of ParLe:
     case a.exprKind
     of FalseX, TrueX:
@@ -567,6 +691,8 @@ proc staticValueToBind(m: var Match; elemType: Cursor; a: Cursor): Cursor =
       if containsGenericParams(a):
         # a symbolic expression over value parameters, e.g. `N1 + N2`:
         # compared syntactically, never solved
+        result = a
+      elif isStaticValue(a) and staticValueTypeMatches(elemType, staticValueType(a)):
         result = a
       elif k in {IntT, UIntT} and m.context != nil:
         # a concrete value expression (an array-index `rangetype` or fully
@@ -1526,8 +1652,12 @@ proc matchArrayType(m: var Match; f: var Cursor; a: var Cursor) =
     inc f1
     skip a1
     skip f1
-    let fLen = lengthOrd(m.context[], f1)
-    let aLen = lengthOrd(m.context[], a1)
+    var fLen = foldValueExpr(m, f1)
+    if fLen.isNaN:
+      fLen = lengthOrd(m.context[], f1)
+    var aLen = foldValueExpr(m, a1)
+    if aLen.isNaN:
+      aLen = lengthOrd(m.context[], a1)
     if fLen.isNaN or aLen.isNaN:
       # match typevars
       linearMatch m, f, a

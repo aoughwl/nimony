@@ -452,11 +452,6 @@ proc semMagicInvoke(c: var SemContext; dest: var TokenBuf; n: var Cursor; kind: 
   var m = cursorAt(typeBuf, 0)
   semLocalTypeImpl c, dest, m, InLocalDecl
 
-proc isStaticValue(n: Cursor): bool =
-  ## a canonical compile-time value as bound to a `staticTypevar`
-  n.kind in {IntLit, UIntLit, FloatLit, CharLit, StringLit} or
-    n.exprKind in {FalseX, TrueX, SufX}
-
 proc semStaticInvokeArg(c: var SemContext; dest: var TokenBuf; n: var Cursor;
                         elemType: Cursor; info: PackedLineInfo): bool =
   ## Sem a generic argument bound to a value (`static`) parameter: an ordinary

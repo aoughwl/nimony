@@ -125,3 +125,11 @@ proc takesFlat[R, C: static[int]; T](x: array[R * C, T]): int = x.len
 
 var flat: array[6, int]
 echo takesFlat[3, 2, int](flat)
+
+# a `const` used as a value argument is folded (via the shared expreval engine)
+# so it works in an enum position and inside static[int] length arithmetic.
+const chosen = blue
+echo paint[chosen]()               # 3
+
+const rows = 3
+echo takesFlat[rows, 2, int](flat) # rows * 2 == 6

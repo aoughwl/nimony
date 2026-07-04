@@ -10,7 +10,7 @@ include ".." / lib / nifprelude
 include ".." / lib / compat2
 
 import nimony_model, decls, programs, semdata, typeprops, xints, builtintypes, renderer, asthelpers,
-  features, symtabs, sigconcepts
+  features, symtabs, sigconcepts, expreval
 import ".." / lib / symparser
 import ".." / models / tags
 
@@ -604,12 +604,28 @@ proc staticValueTypeMatches(elemType, valueType: Cursor): bool =
     return sameTrees(openArrayElem, arrElem)
   false
 
+proc evalStaticOrdinal(m: var Match; a: Cursor): xint =
+  ## Fold `a` to an ordinal value with the shared `expreval` engine, in a mode
+  ## that never shells out to a sub-compile (overload resolution must stay
+  ## in-process and cheap). Resolves `const` symbols, enum fields and constant
+  ## expressions that the caller's fixed-opcode fold does not handle itself.
+  ## Returns NaN when `a` cannot be folded locally.
+  result = createNaN()
+  if m.context == nil: return
+  var ec = initEvalContext(m.context, noExecute = true)
+  var cur = a
+  let v = eval(ec, cur)
+  if v.kind == ParLe and v.tagId == nifstreams.ErrT:
+    return
+  result = getConstOrdinalValue(v)
+
 proc foldValueExpr(m: var Match; a: Cursor; depth = 0): xint =
-  ## The tiny fixed-opcode evaluator for compile-time *values* in type
-  ## positions: folds `+ - *` over integer literals and rewrites an
-  ## array-index `rangetype` to its length. Anything else — in particular a
-  ## still-symbolic expression — yields NaN and is compared syntactically
-  ## instead; matching never solves for a value parameter backwards.
+  ## Folds a compile-time integer *value* in a type position: `+ - *` over
+  ## integer operands, an array-index `rangetype` taken by length, and value
+  ## parameters substituted from the current inference. Leaf constants — a
+  ## `const` symbol or enum field — resolve through the shared `expreval` engine.
+  ## Anything still symbolic yields NaN and is compared syntactically instead;
+  ## matching never solves for a value parameter backwards.
   result = createNaN()
   if depth > 10: return
   case a.kind
@@ -621,6 +637,10 @@ proc foldValueExpr(m: var Match; a: Cursor; depth = 0): xint =
     if isStaticTypevar(a.symId) and m.inferred.contains(a.symId):
       let inferred = m.inferred.getOrQuit(a.symId)
       result = foldValueExpr(m, inferred, depth+1)
+    elif not isStaticTypevar(a.symId):
+      # a `const` or enum field bound as a value parameter: let the engine
+      # resolve it to its ordinal (a still-unbound value parameter stays NaN).
+      result = evalStaticOrdinal(m, a)
   of ParLe:
     case a.exprKind
     of AddX, SubX, MulX:

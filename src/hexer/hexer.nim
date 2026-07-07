@@ -43,7 +43,7 @@ Hexer accepts Nimony's grammar.
 ]##
 
 import std / [parseopt, strutils, os, osproc, tables, assertions, syncio]
-import ".." / nimony / [langmodes, nifconfig]
+import ".." / nimony / [langmodes, nifconfig, programs]
 import lengcgen, lifter, duplifier, destroyer, inliner, constparams, dce2
 import ".." / lib / vfs
 
@@ -148,3 +148,4 @@ proc handleCmdLine*() =
 when isMainModule:
   handleCmdLine()
   dumpVfsProfile("hexer")
+  dumpIdxProfile("hexer")

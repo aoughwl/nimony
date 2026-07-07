@@ -175,3 +175,4 @@ when isMainModule:
       " slowBytes=", cowSlowBytes,
       " cmdline=", commandLineParams().join(" ")
   dumpVfsProfile("nimsem")
+  dumpIdxProfile("nimsem")

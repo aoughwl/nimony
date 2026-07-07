@@ -53,6 +53,8 @@ when defined(vfsProfile):
     statRemove*:   VfsCounter
 
   import std/strutils
+  import std/monotimes
+  from std/times import inNanoseconds
 
   proc dumpVfsProfile*(label: string) =
     template emit(name: string; c: VfsCounter) =

@@ -59,6 +59,58 @@ type
 var
   prog*: Program
 
+# -------------- index parse/intern profiling (-d:idxProfile) -----------
+#
+# The single seam `load(suffix)` parses + interns a module's `.s.idx.nif`
+# into this process's `pool` exactly once per suffix (memoized in
+# `prog.mods`). Every nimsem/hexer process that imports a module pays this
+# cost afresh, because `pool` is process-local. We record, per suffix, how
+# many times a *cold* load happened in THIS process and the wall-time it
+# cost, then dump one line per suffix at process exit. `awk` over the lines
+# aggregates the redundant cost across the whole build (see
+# docs/daemon-prototype-findings.md).
+when defined(idxProfile):
+  import std / monotimes
+  from std / strutils import formatFloat, ffDecimal
+
+  type
+    IdxCounter* = object
+      coldLoads*: int   # times load() did the parse+intern (cache miss)
+      warmHits*: int    # times load() returned the memoized module
+      ns*: int64        # wall-time spent in the parse+intern body
+
+  var idxStats*: Table[string, IdxCounter]
+
+  proc idxRecordCold(suffix: string; ns: int64) =
+    var c = idxStats.getOrDefault(suffix)
+    inc c.coldLoads
+    c.ns += ns
+    idxStats[suffix] = c
+
+  proc idxRecordWarm(suffix: string) =
+    var c = idxStats.getOrDefault(suffix)
+    inc c.warmHits
+    idxStats[suffix] = c
+
+  proc dumpIdxProfile*(label: string) =
+    var totalCold = 0
+    var totalWarm = 0
+    var totalNs: int64 = 0
+    for suffix, c in idxStats:
+      totalCold += c.coldLoads
+      totalWarm += c.warmHits
+      totalNs += c.ns
+      stderr.writeLine "[idx] " & label & " " & suffix &
+        " cold=" & $c.coldLoads &
+        " warm=" & $c.warmHits &
+        " ms=" & formatFloat(float(c.ns) / 1_000_000.0, ffDecimal, 3)
+    stderr.writeLine "[idx] " & label & " TOTAL" &
+      " cold=" & $totalCold &
+      " warm=" & $totalWarm &
+      " ms=" & formatFloat(float(totalNs) / 1_000_000.0, ffDecimal, 3)
+else:
+  template dumpIdxProfile*(label: string) = discard
+
 # -------------- Iface helpers (style-aware) ----------------------------
 #
 # Thin wrappers over the global `pool.styleSiblings` index. When
@@ -221,6 +273,8 @@ proc needsRecompile*(dep, output: string): bool =
 
 proc load*(suffix: string): NifModule =
   if not prog.mods.hasKey(suffix):
+    when defined(idxProfile):
+      let t0 = getMonoTime()
     let infile = suffixToNif suffix
     result = newNifModule(infile)
     result.index = default(NifIndex)
@@ -230,7 +284,11 @@ proc load*(suffix: string): NifModule =
     let indexName = infile.changeModuleExt(semIndexExt())
     result.index = readIndex(indexName)
     prog.mods[suffix] = result
+    when defined(idxProfile):
+      idxRecordCold(suffix, (getMonoTime() - t0).inNanoseconds)
   else:
+    when defined(idxProfile):
+      idxRecordWarm(suffix)
     result = prog.mods.getOrDefault(suffix)
 
 proc mergeFilter*(f: var ImportFilter; g: ImportFilter) =

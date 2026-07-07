@@ -17,7 +17,7 @@
 when defined(nimony):
   {.feature: "lenientnils".}
   {.feature: "untyped".}
-import std/[os, tables, sets, syncio, hashes, assertions, strutils, times, formatfloat, dirs, paths]
+import std/[os, tables, sets, syncio, hashes, assertions, strutils, times, formatfloat, dirs, paths, osproc]
 import semos, nifconfig, nimony_model, semdata, langmodes
 import ".." / gear2 / modnames
 import ".." / lib / [tooldirs, platform, nifindexes, symparser, docpaths, argsfinder]
@@ -596,10 +596,15 @@ proc getLastModTime(path: string): int64 =
   except:
     result = -1'i64
 
-proc execNifler(c: var DepContext; f: FilePair) =
+proc niflerCommandFor(c: DepContext; f: FilePair): tuple[cmd: string, needsRun: bool] =
+  ## Compute the nifler command string for `f` plus a staleness decision,
+  ## WITHOUT running anything. `needsRun == false` means the on-disk `.p.nif`
+  ## and `.p.deps.nif` are already up to date (or `f` is a `.nif` input that
+  ## never needs nifling). Shared by the serial `execNifler` fallback and the
+  ## parallel `preNifle` pre-pass so both agree on exactly what work is pending.
   # File can be a .nif file, if so, we don't need to run nifler.
   if f.nimFile.endsWith(".nif"):
-    return
+    return ("", false)
   let preserveDocs = c.cmd == DoDoc
   let output = c.config.parsedFile(f, preserveDocs)
   let depsFile = c.config.depsFile(f, preserveDocs)
@@ -607,11 +612,15 @@ proc execNifler(c: var DepContext; f: FilePair) =
   if not c.forceRebuild and semos.fileExists(output) and
       semos.fileExists(f.nimFile) and getLastModTime(output) > srcTime and
       semos.fileExists(depsFile) and getLastModTime(depsFile) > srcTime:
-    discard "nothing to do"
+    result = ("", false)
   else:
     let docsFlag = if preserveDocs: " --docs" else: ""
-    let cmd = quoteShell(c.nifler) & " --portablePaths --deps" & docsFlag & " parse " &
-      quoteShell(f.nimFile) & " " & quoteShell(output)
+    result = (quoteShell(c.nifler) & " --portablePaths --deps" & docsFlag & " parse " &
+      quoteShell(f.nimFile) & " " & quoteShell(output), true)
+
+proc execNifler(c: var DepContext; f: FilePair) =
+  let (cmd, needsRun) = niflerCommandFor(c, f)
+  if needsRun:
     exec cmd
 
 proc importSystem(c: var DepContext; current: Node) =
@@ -644,6 +653,139 @@ proc traverseDeps(c: var DepContext; p: FilePair; current: Node) =
       importSystem c, current
   finally:
     nifstreams.close(stream)
+
+# --------------------------------------------------------------------------
+# Parallel dependency-discovery pre-pass.
+#
+# `preNifle` walks the import closure breadth-first and runs `nifler` over the
+# whole frontier IN PARALLEL before the serial DFS in `traverseDeps` starts.
+# It only ever writes the on-disk `.p.nif` / `.p.deps.nif` cache files that the
+# DFS would have written anyway (via `execNifler`), and mutates NOTHING on the
+# node graph. After pre-warming, every `execNifler` inside the DFS hits the
+# staleness short-circuit in `niflerCommandFor` and becomes a no-op, so the DFS
+# does only cheap in-memory work. Correctness is preserved by construction: if
+# the harvest ever misses a module, the DFS's own `execNifler` runs it as a
+# self-healing serial fallback. Over-nifling (e.g. ignoring `when` pruning) is
+# harmless — it only warms a cache entry the DFS may not consult.
+
+proc collectDepPath(c: DepContext; origin, path: string;
+                    res: var seq[FilePair]; seen: var HashSet[string]) =
+  ## Resolve one imported module path relative to `origin` and, if it is a new
+  ## `.nim` module, queue it for the next BFS round. Dedup is by `modname` (the
+  ## key used for `.p.nif` / `.p.deps.nif`), matching `processedModules`.
+  let f2 = resolveFileWrapper(c.config.paths, origin, path)
+  if not semos.fileExists(f2): return
+  if f2.endsWith(".nif"): return  # .nif inputs never need nifling
+  let mp = c.toPair(f2)
+  if not seen.containsOrIncl(mp.modname):
+    res.add mp
+
+proc harvestImport(c: DepContext; it: var Cursor; origin: string;
+                   res: var seq[FilePair]; seen: var HashSet[string]) =
+  ## Read-only mirror of `processImport`: collect imported module paths without
+  ## touching the graph. Ignores `when` conditions (over-nifle is safe) and
+  ## skips plugin imports (the DFS does not recurse into them). Cyclic imports
+  ## ARE harvested — the DFS recurses into them via `importCyclicModule`.
+  var x = it
+  skip it
+  x.into:  # (import …)
+    if x.stmtKind == WhenS:
+      skip x, SkipCond
+    while x.hasMore:
+      var isCyclic = false
+      if x.kind == ParLe and x.exprKind == PragmaxX:
+        var y = x
+        inc y
+        skip y
+        if y.substructureKind == PragmasU:
+          inc y
+          if y.kind == Ident and pool.strings[y.litId] == "cyclic":
+            isCyclic = true
+      var files: seq[ImportedFilename] = @[]
+      var hasError = false
+      if isCyclic:
+        x.into PragmaxX:
+          filenameVal(x, files, hasError, allowAs = false)
+          skip x, SkipPragmas
+          while x.hasMore: skip x, SkipFull
+      else:
+        filenameVal(x, files, hasError, allowAs = true)
+      if not hasError:
+        for f in files:
+          if f.plugin.len == 0:
+            collectDepPath(c, origin, f.path, res, seen)
+
+proc harvestSingleImport(c: DepContext; it: var Cursor; origin: string;
+                         res: var seq[FilePair]; seen: var HashSet[string]) =
+  ## Read-only mirror of `processSingleImport` (`from import` / `import except`).
+  var x = it
+  skip it
+  var files: seq[ImportedFilename] = @[]
+  var hasError = false
+  x.into:  # (fromimport …) / (importexcept …)
+    if x.stmtKind == WhenS:
+      skip x, SkipCond
+    filenameVal(x, files, hasError, allowAs = true)
+    while x.hasMore: skip x
+  if not hasError:
+    for f in files:
+      if f.plugin.len == 0:
+        collectDepPath(c, origin, f.path, res, seen)
+      break
+
+proc harvestDepImports(c: DepContext; p: FilePair;
+                       res: var seq[FilePair]; seen: var HashSet[string]) =
+  ## Cheaply parse `p`'s `.p.deps.nif` (read-only) to extract the modules it
+  ## imports. Includes are intra-module and left to the DFS. If the deps file
+  ## is missing (harvest miss), the DFS self-heals.
+  let depsFile = c.config.depsFile(p, c.cmd == DoDoc)
+  if not semos.fileExists(depsFile): return
+  var stream = nifstreams.open(depsFile)
+  try:
+    discard processDirectives(stream.r)
+    var buf = fromStream(stream)
+    var n = beginRead(buf)
+    if n.kind == ParLe and pool.tags[n.tagId] == "stmts":
+      n.into:
+        while n.hasMore:
+          case stmtKind(n)
+          of ImportS:
+            harvestImport(c, n, p.nimFile, res, seen)
+          of FromimportS, ImportexceptS:
+            harvestSingleImport(c, n, p.nimFile, res, seen)
+          else:
+            skip n
+  finally:
+    nifstreams.close(stream)
+
+proc preNifle(c: var DepContext; root: FilePair) =
+  ## BFS over the import closure, running nifler in parallel per round.
+  var seen = initHashSet[string]()
+  var frontier: seq[FilePair] = @[]
+  seen.incl root.modname
+  frontier.add root
+  # Seed std/system unless it is excluded (mirror traverseDeps' importSystem).
+  if {SkipSystem, IsSystem} * c.moduleFlags == {}:
+    let sysp = c.toPair(stdlibFile("std/system.nim"))
+    if not seen.containsOrIncl(sysp.modname):
+      frontier.add sysp
+  while frontier.len > 0:
+    # 1. Run nifler in parallel over the frontier modules that need it.
+    var cmds: seq[string] = @[]
+    for f in frontier:
+      let (cmd, needsRun) = niflerCommandFor(c, f)
+      if needsRun:
+        cmds.add cmd
+    if cmds.len > 0:
+      # execProcesses defaults n to countProcessors(). Nonzero exit must abort,
+      # mirroring semos.exec's `quit` on failure.
+      if execProcesses(cmds) != 0:
+        quit("FAILURE: nifler pre-pass")
+    # 2. Harvest the next frontier from each module's freshly-written deps file.
+    var nextFrontier: seq[FilePair] = @[]
+    for f in frontier:
+      harvestDepImports(c, f, nextFrontier, seen)
+    frontier = nextFrontier
 
 proc rootPath(c: DepContext): string =
   # XXX: Relative paths in build files are relative to current working directory, not the location of the build file.
@@ -1582,6 +1724,12 @@ proc initDepContext(config: sink NifConfig; project, nifler: string; isFinal, fo
   result.rootNode = root
   result.nodes.add root
   result.processedModules[p.modname] = 0
+  # Parallel dependency-discovery pre-pass: pre-warm the nifler cache over the
+  # whole import closure so the serial DFS below only does cheap in-memory work.
+  # Only meaningful for the cold discovery path (`not isFinal`); the final path
+  # consumes nimsem's `.s.deps.nif`, which the DFS never nifles.
+  if not isFinal:
+    preNifle result, p
   traverseDeps result, p, root
 
 proc buildGraphForEval*(config: NifConfig; mainNifFile: string; dependencyNifFiles: seq[string];

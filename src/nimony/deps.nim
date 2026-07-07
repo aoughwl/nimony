@@ -18,6 +18,7 @@ when defined(nimony):
   {.feature: "lenientnils".}
   {.feature: "untyped".}
 import std/[os, tables, sets, syncio, hashes, assertions, strutils, times, formatfloat, dirs, paths]
+import std/osproc  # worker-pool: speculative parallel `nifler` prefetch (graph stays single-threaded)
 import semos, nifconfig, nimony_model, semdata, langmodes
 import ".." / gear2 / modnames
 import ".." / lib / [tooldirs, platform, nifindexes, symparser, docpaths, argsfinder]
@@ -213,6 +214,17 @@ type
     bundles: seq[Bundle]
     passL: seq[string]
     passC: seq[string]
+    # --- worker-pool for speculative `nifler` prefetch -------------------
+    # `nifler` is a PURE PRODUCER (writes .p.nif/.deps.nif, mutates nothing on
+    # `c`). We run up to `maxNiflerJobs` of them concurrently, kicked off the
+    # instant a module's imports become known, so cores stay busy while the
+    # graph itself is still built strictly single-threaded in DFS order (node
+    # ids therefore remain byte-identical to the serial baseline).
+    maxNiflerJobs: int
+    niflerStarted: HashSet[string]        # nimFile paths already spawned/skipped
+    niflerInflight: Table[string, Process] # nimFile -> running nifler process
+    niflerSpawns: int                     # metric: total nifler processes launched
+    niflerPeak: int                       # metric: peak simultaneous nifler processes
 
 proc toPair(c: DepContext; f: string): FilePair =
   if f.endsWith(".nif"):
@@ -596,10 +608,13 @@ proc getLastModTime(path: string): int64 =
   except:
     result = -1'i64
 
-proc execNifler(c: var DepContext; f: FilePair) =
-  # File can be a .nif file, if so, we don't need to run nifler.
+proc niflerCommandFor(c: DepContext; f: FilePair): string =
+  ## Returns the `nifler` command to (re)parse `f`, or "" when nothing needs to
+  ## run (an already-parsed .nif input, or a cache-fresh .p.nif/.deps.nif pair).
+  ## Pure query: identical staleness logic to the old `execNifler`, but it does
+  ## not run anything, so the same decision can drive a background worker pool.
   if f.nimFile.endsWith(".nif"):
-    return
+    return ""
   let preserveDocs = c.cmd == DoDoc
   let output = c.config.parsedFile(f, preserveDocs)
   let depsFile = c.config.depsFile(f, preserveDocs)
@@ -607,19 +622,134 @@ proc execNifler(c: var DepContext; f: FilePair) =
   if not c.forceRebuild and semos.fileExists(output) and
       semos.fileExists(f.nimFile) and getLastModTime(output) > srcTime and
       semos.fileExists(depsFile) and getLastModTime(depsFile) > srcTime:
-    discard "nothing to do"
+    result = ""  # nothing to do — cache is fresh
   else:
     let docsFlag = if preserveDocs: " --docs" else: ""
-    let cmd = quoteShell(c.nifler) & " --portablePaths --deps" & docsFlag & " parse " &
+    result = quoteShell(c.nifler) & " --portablePaths --deps" & docsFlag & " parse " &
       quoteShell(f.nimFile) & " " & quoteShell(output)
-    exec cmd
+
+proc reapFinishedNiflers(c: var DepContext) =
+  ## Non-blocking sweep: drop any nifler that has exited, freeing a pool slot.
+  ## Mirrors `semos.exec`'s abort-on-failure contract (quit on non-zero exit).
+  if c.niflerInflight.len == 0: return
+  var done: seq[string] = @[]
+  for k, p in c.niflerInflight:
+    if not running(p):
+      let code = peekExitCode(p)
+      close(p)
+      if code != 0:
+        quit("FAILURE: nifler parse of " & k & " (exit " & $code & ")")
+      done.add k
+  for k in done: c.niflerInflight.del k
+
+proc waitOneNifler(c: var DepContext) =
+  ## Block until at least one in-flight nifler finishes, then reap it. `nifler`
+  ## runs are short, so a 1ms poll keeps the main thread from spinning hot while
+  ## still returning promptly. (`os.sleep` is available under the stock build.)
+  while c.niflerInflight.len > 0:
+    reapFinishedNiflers(c)
+    if c.niflerInflight.len < c.maxNiflerJobs: return
+    sleep(1)
+
+proc prefetchNifler(c: var DepContext; f: FilePair) =
+  ## Speculatively launch (or note as cache-fresh) `f`'s nifler run. Dedup by
+  ## source path so a module is niflered at most once. Does NOT touch the graph.
+  if f.nimFile in c.niflerStarted: return
+  c.niflerStarted.incl f.nimFile
+  let cmd = niflerCommandFor(c, f)
+  if cmd.len == 0: return  # .nif input or cache-fresh: nothing to spawn
+  reapFinishedNiflers(c)
+  if c.niflerInflight.len >= c.maxNiflerJobs:
+    waitOneNifler(c)  # pool full: BACKOFF until a slot frees
+  let p = startProcess(cmd, options = {poEvalCommand, poParentStreams})
+  c.niflerInflight[f.nimFile] = p
+  inc c.niflerSpawns
+  if c.niflerInflight.len > c.niflerPeak: c.niflerPeak = c.niflerInflight.len
+
+proc waitNifler(c: var DepContext; f: FilePair) =
+  ## Ensure `f`'s .p.nif/.deps.nif are on disk before the main thread reads
+  ## them. Prefetch if it was never started, then block on its process.
+  if f.nimFile notin c.niflerStarted:
+    prefetchNifler(c, f)
+  let p = c.niflerInflight.getOrDefault(f.nimFile, nil)
+  if not p.isNil:
+    let code = waitForExit(p)
+    close(p)
+    c.niflerInflight.del f.nimFile
+    if code != 0:
+      quit("FAILURE: nifler parse of " & f.nimFile & " (exit " & $code & ")")
+
+proc prefetchOne(c: var DepContext; current: Node; path: string) =
+  ## Resolve one imported filename against `current` and kick off its nifler.
+  let f2 = resolveFileWrapper(c.config.paths, current.files[current.active].nimFile, path)
+  if not semos.fileExists(f2): return
+  prefetchNifler(c, c.toPair(f2))
+
+proc prefetchImports(c: var DepContext; n0: Cursor; current: Node) =
+  ## Pass over `current`'s freshly-parsed deps and eagerly nifle every module it
+  ## imports, so the pool fills while the DFS is still descending into the first
+  ## child. Permissive on purpose: `when`-guards are ignored (a wrongly-prefetched
+  ## nifler run is harmless — it only writes cache files), plugins are skipped
+  ## (they never recurse), and includes are left to the sequential DFS path.
+  ## The graph (`processDeps`) is a SEPARATE pass and stays byte-identical.
+  var n = n0
+  if n.kind == ParLe and pool.tags[n.tagId] == "stmts":
+    n.into:
+      while n.hasMore:
+        case stmtKind(n)
+        of ImportS:
+          var x = n
+          skip n
+          x.into:  # (import …)
+            if x.stmtKind == WhenS:
+              skip x, SkipCond
+            while x.hasMore:
+              var isCyclic = false
+              if x.kind == ParLe and x.exprKind == PragmaxX:
+                var y = x
+                inc y
+                skip y
+                if y.substructureKind == PragmasU:
+                  inc y
+                  if y.kind == Ident and pool.strings[y.litId] == "cyclic":
+                    isCyclic = true
+              var files: seq[ImportedFilename] = @[]
+              var hasError = false
+              if isCyclic:
+                x.into PragmaxX:
+                  filenameVal(x, files, hasError, allowAs = false)
+                  skip x, SkipPragmas
+                  while x.hasMore: skip x, SkipFull
+              else:
+                filenameVal(x, files, hasError, allowAs = true)
+              if not hasError:
+                for f in files:
+                  if f.plugin.len == 0:
+                    prefetchOne c, current, f.path
+        of FromimportS, ImportexceptS:
+          var x = n
+          skip n
+          var files: seq[ImportedFilename] = @[]
+          var hasError = false
+          x.into:  # (fromimport …) / (importexcept …)
+            if x.stmtKind == WhenS:
+              skip x, SkipCond
+            filenameVal(x, files, hasError, allowAs = true)
+            while x.hasMore: skip x
+          if not hasError:
+            for f in files:
+              if f.plugin.len == 0:
+                prefetchOne c, current, f.path
+              break
+        else:
+          skip n
 
 proc importSystem(c: var DepContext; current: Node) =
   let p = c.toPair(stdlibFile("std/system.nim"))
   var existingNode = c.processedModules.getOrDefault(p.modname, -1)
   if existingNode == -1:
     #echo "NIFLING ", p.nimFile, " -> ", c.config.parsedFile(p)
-    execNifler c, p
+    # (nifler for `p` is run lazily by `traverseDeps` via `waitNifler`.)
     var imported = Node(files: @[p], id: c.nodes.len, parent: current.id, isSystem: true)
     c.nodes.add imported
     c.processedModules[p.modname] = imported.id
@@ -630,7 +760,7 @@ proc importSystem(c: var DepContext; current: Node) =
 proc traverseDeps(c: var DepContext; p: FilePair; current: Node) =
   let depsFile: string
   if not c.isGeneratingFinal:
-    execNifler c, p
+    waitNifler c, p   # ensure p's nifler (possibly prefetched) has finished
     depsFile = c.config.depsFile(p, c.cmd == DoDoc)
   else:
     depsFile = c.config.deps2File(p)
@@ -639,6 +769,11 @@ proc traverseDeps(c: var DepContext; p: FilePair; current: Node) =
   try:
     discard processDirectives(stream.r)
     var buf = fromStream(stream)
+    # Pass 1: speculatively nifle every import of `p` into the worker pool so
+    # cores stay busy while pass 2's DFS descends into the first child.
+    if not c.isGeneratingFinal:
+      prefetchImports c, beginRead(buf), current
+    # Pass 2: build the graph, strictly single-threaded, in DFS order (unchanged).
     processDeps c, beginRead(buf), current
     if {SkipSystem, IsSystem} * c.moduleFlags == {} and not current.isSystem:
       importSystem c, current
@@ -1576,7 +1711,11 @@ proc generateCachedConfigFile(c: DepContext; passC, passL: string) =
 proc initDepContext(config: sink NifConfig; project, nifler: string; isFinal, forceRebuild: bool; moduleFlags: set[ModuleFlag]; cmd: Command): DepContext =
   result = DepContext(nifler: nifler, config: config, rootNode: nil, includeStack: @[],
     forceRebuild: forceRebuild, moduleFlags: moduleFlags, nimsem: findTool("nimsem"),
-    cmd: cmd, isGeneratingFinal: isFinal)
+    cmd: cmd, isGeneratingFinal: isFinal,
+    maxNiflerJobs: (block:
+      # `NIMONY_NIFLER_JOBS=1` forces the serial-equivalent path for A/B timing.
+      let e = getEnv("NIMONY_NIFLER_JOBS")
+      if e.len > 0: max(1, parseInt(e)) else: max(1, countProcessors())))
   let p = result.toPair(project)
   let root = Node(files: @[p], id: 0, parent: -1, active: 0, isSystem: IsSystem in moduleFlags)
   result.rootNode = root
@@ -1796,7 +1935,13 @@ proc buildGraph*(config: sink NifConfig; project: string;
       quoteShell(cfgNif)
     parseNifConfig cfgNif, config
 
+  let discoStart = epochTime()
   var c = initDepContext(config, project, nifler, false, forceRebuild, moduleFlags, cmd)
+  if getEnv("NIMONY_NIFLER_STATS").len > 0:
+    stderr.writeLine "[nifler-stats] discovery=" &
+      formatFloat((epochTime() - discoStart) * 1000.0, ffDecimal, 2) & "ms nodes=" &
+      $c.nodes.len & " spawns=" & $c.niflerSpawns & " peak=" & $c.niflerPeak &
+      " jobs=" & $c.maxNiflerJobs
   generateCachedConfigFile c, passC, passL
   let buildFilename = generateFrontendBuildFile(c, commandLineArgs, cmd)
   #echo "run with: nifmake run ", buildFilename

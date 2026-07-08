@@ -11,6 +11,30 @@ interned once for the whole session instead of once per module. This is the
 foundation for interactive / incremental (LSP) use; the cold full-build payoff is
 marginal (system re-intern is CPU-cheap and wall-hidden behind parallel fan-out).
 
+## Consumers / motivation (why the daemon exists)
+
+The cold full-build speedup is marginal, so it is **not** the justification. The
+justification is a set of index-API consumers that need a **persistent,
+whole-program, interned symbol graph** — something a one-shot single-module
+`nimsem m` process structurally cannot provide. Today the `nimony-lsp` side
+implements these with source-scan + single-module NIF heuristics ("good"); the
+daemon upgrades them to "exact" by resolving overloads across module boundaries
+against the warm cross-module graph:
+
+1. **Go-to-definition with exact overload resolution** (`defs`) — pick the exact
+   winning overload at a call site whose candidates are imported from other
+   modules. A single-module process only sees its own decls + opaque stubs and
+   must guess; the daemon holds every imported interface in one `pool` and
+   resolves precisely.
+2. **Call hierarchy** (`callHierarchy`) — incoming/outgoing call sites across
+   modules. Callers/callees live in other modules and the exact callee depends
+   on cross-module overload resolution, so a source scan can only approximate.
+3. **Go-to-type-definition** (`typeDefinition`) — resolve the type of the symbol
+   at a position to its (usually cross-module) declaration site.
+
+These three are the concrete drivers of the reserved query verbs below. Each MUST
+use the warm whole-program graph; none is exact without it.
+
 ## Framing
 
 - Transport: the worker's **stdin/stdout**. Launch with `nimsem serve`.
@@ -82,24 +106,75 @@ Incremental re-check of ONE module against the warm cached graph. Same request
 shape as `semcheck`; will diverge to a cache-diff fast path.
 
 ### `defs` — reserved (schema fixed, handler `unimplemented in v0 prototype`)
-Position query. Request adds `"file"`, `"line"`, `"col"`. Reply returns a
-`"symbols"` object keyed by symbol id (see below) with definition + use locations
-and kinds. MUST reuse `idetools`' existing text record shape for the per-location
-payload where practical; any divergence is called out to the LSP author.
+**Exact resolved definition** at a position. Request adds `"file"`, `"line"`,
+`"col"`. The reply's `"symbols"` object holds the ONE symbol the expression at
+that position resolves to — the **correct overload**, its definition site, and
+its type.
+
+Overload resolution **MUST** be performed against the warm **whole-program**
+symbol graph (`prog` + interned `pool`), not a single-module guess. This is the
+capability a one-shot single-module `nimsem m` process structurally cannot
+provide: at a call site whose candidates are declared in (and imported from)
+other modules, only the daemon — holding every imported interface interned in
+one `pool` — can pick the exact winning overload. A single-module process sees
+only its own module's decls plus opaque interface stubs and must fall back to
+heuristics. Where resolution is genuinely ambiguous the reply lists every live
+candidate (multiple keys) rather than guessing; `"resolved": true|false` marks
+whether a unique winner was found.
+
+Request:
+```jsonc
+{ "v":0, "id":9, "verb":"defs", "file":"src/app.nim", "line":42, "col":11 }
+```
+Reply keyed by symbol id, each entry carrying `kind`, `type`, definition
+`locations`, and a `role:"def"` location for the definition site (see the shared
+shape below). For `defs` the winning symbol's `def` location is the go-to-
+definition target.
+
+### `typeDefinition` — reserved (schema fixed, handler `unimplemented in v0 prototype`)
+**Go-to-type-definition.** Request adds `"file"`, `"line"`, `"col"`. Resolves the
+**type** of the symbol/expression at that position, then returns that type's
+definition site — **cross-module**: the type is very often declared in a
+different module than the reference, so this too requires the persistent
+whole-program graph to name the exact declaring symbol. Reply is the standard
+`"symbols"` object; the single key is the resolved **type** symbol id, with its
+`def` location as the jump target.
+
+### `callHierarchy` — reserved (schema fixed, handler `unimplemented in v0 prototype`)
+**Incoming/outgoing call sites across modules** for a routine. Request identifies
+the anchor by symbol id OR by position, and a direction:
+```jsonc
+{ "v":0, "id":10, "verb":"callHierarchy",
+  "symbol":"foo.1.app",              // OR "file"/"line"/"col"
+  "direction":"incoming" }            // "incoming" | "outgoing"
+```
+- `incoming`: every routine that calls the anchor (callers), across all cached
+  modules.
+- `outgoing`: every routine the anchor calls (callees).
+
+Reply `"symbols"` is keyed by the **caller/callee symbol id**; each entry's
+`locations` are the concrete call-site positions (`role:"call"`) that link it to
+the anchor. Because callers/callees routinely live in other modules and the exact
+callee depends on cross-module overload resolution, this is another consumer that
+the warm daemon uniquely serves exactly (vs. a source-scan approximation).
 
 ### `symbols` — reserved (schema fixed, handler `unimplemented in v0 prototype`)
 Name / substring symbol query. Request adds `"query":"substr"`. Reply returns the
-same symbol-keyed `"symbols"` object.
+same symbol-keyed `"symbols"` object (workspace-symbol style).
 
-## Query response shape (reserved, for `defs` / `symbols`)
-Keyed by **symbol id** (the fully-qualified NIF symbol string, e.g. `foo.1.mod`):
+## Query response shape (reserved: `defs` / `typeDefinition` / `callHierarchy` / `symbols`)
+Keyed by **symbol id** (the fully-qualified NIF symbol string, e.g. `foo.1.mod`).
+The `type` field is itself a symbol id (or a rendered type string when the type
+is structural/anonymous). `role` is one of `def` | `use` | `call`:
 
 ```jsonc
 {
   "v": 0, "id": 9, "verb": "defs", "ok": true,
+  "resolved": true,                     // false => ambiguous, all candidates listed
   "symbols": {
     "foo.1.mod": {
       "kind": "proc",
+      "type": "proc.2.mod",             // symbol id of the (resolved) type
       "locations": [ { "file":"…","line":12,"col":6,"role":"def" },
                      { "file":"…","line":40,"col":10,"role":"use" } ]
     }
@@ -118,6 +193,7 @@ tracked as remaining work.
 
 ## Compatibility note
 The standalone `idetools` text output format is unchanged and owned by a separate
-effort; this daemon does not alter it. If `defs`/`symbols` later emit
+effort; this daemon does not alter it. If the query verbs
+(`defs` / `typeDefinition` / `callHierarchy` / `symbols`) later emit
 idetools-style records they will keep that format byte-for-byte or the divergence
 will be announced.

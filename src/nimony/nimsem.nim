@@ -187,9 +187,11 @@ proc handleRequest(req: JsonNode): JsonNode =
     result = %*{"v": DaemonProtocolVersion, "id": id, "verb": verb, "ok": true}
   of "shutdown", "quit", "bye":
     result = %*{"v": DaemonProtocolVersion, "id": id, "verb": "shutdown", "ok": true}
-  of "defs", "symbols":
+  of "defs", "typeDefinition", "callHierarchy", "symbols":
     # RESERVED (schema fixed in v0; handler to be implemented). Query responses
-    # will be keyed by symbol id under a "symbols" object. See protocol doc.
+    # are keyed by symbol id under a "symbols" object. These verbs REQUIRE the
+    # warm whole-program symbol graph for exact cross-module overload resolution
+    # (go-to-def, go-to-type-def, call hierarchy). See docs/daemon-protocol.md.
     result = jsErr(id, verb, "unimplemented in v0 prototype")
   else:
     result = jsErr(id, verb, "unknown verb: " & verb)

@@ -462,7 +462,8 @@ proc semcheckCore(c: var SemContext; dest: var TokenBuf; n0: Cursor) =
     var finalBuf = beginRead afterSem
     dest = injectDerefs(finalBuf, c.typeHooks, c.classes, c.thisModuleSuffix, c.g.config.bits)
     when true: #defined(enableContracts):
-      var moreErrors = analyzeContractsFinalIr(dest, c.thisModuleSuffix, c.g.config.verbose)
+      var moreErrors = analyzeContractsFinalIr(dest, c.thisModuleSuffix, c.g.config.verbose,
+        rangeChecks = RangeCheck in parseFlags(c.g.config.checkFlags))
       if reporters.reportErrors(moreErrors) > 0:
         quit 1
   else:
@@ -537,7 +538,8 @@ proc semcheckPostProcess(c: var SemContext; dest: var TokenBuf) =
   if reportErrors(dest) == 0:
     var afterSem = move dest
     when true:
-      var moreErrors = analyzeContractsFinalIr(afterSem, c.thisModuleSuffix, c.g.config.verbose)
+      var moreErrors = analyzeContractsFinalIr(afterSem, c.thisModuleSuffix, c.g.config.verbose,
+        rangeChecks = RangeCheck in parseFlags(c.g.config.checkFlags))
       if reporters.reportErrors(moreErrors) > 0:
         quit 1
     if c.genericInnerProcs.len > 0:

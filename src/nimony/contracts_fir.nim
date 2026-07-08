@@ -79,6 +79,12 @@ type
     activeBorrows: seq[BorrowInfo]
     verbose: bool                      # --verbose: dump final IR on init/contract
                                        # failures for easier debugging
+    rangeChecks: bool                  # RangeCheck mode active: an unprovable
+                                       # conversion to `range[lo..hi]` is caught
+                                       # at runtime (hexer/desugar inserts a
+                                       # `nimIRcheck`), so the static prover
+                                       # defers the undecidable case instead of
+                                       # rejecting it at compile time.
     currentProcStart: Cursor           # cursor at the start of the proc whose
                                        # body we are currently analysing (used
                                        # for the --verbose dump)
@@ -327,11 +333,19 @@ proc staticRangeBounds(typ: Cursor; lo, hi: var xint): bool =
   else: return false
   result = lo <= hi
 
-proc checkRangeAssign(c: var NjvlContext; targetType, value: Cursor) =
+proc checkRangeAssign(c: var NjvlContext; targetType, value: Cursor;
+                      runtimeChecked = false) =
   ## Emit and discharge the `lo <= value <= hi` obligation for a value bound to a
   ## `range[lo..hi]`-typed target. Value conversions are handled at the
   ## conversion site (see the `ConvX`/`HconvX` case in `traverseExpr`), so we
   ## skip them here to avoid double-reporting.
+  ##
+  ## `runtimeChecked` is set at the conversion site when the RangeCheck mode is
+  ## active: hexer/desugar will wrap the value in a `nimIRcheck` that aborts at
+  ## runtime, so an *undecidable* obligation (a value we cannot prove in range)
+  ## is discharged at runtime rather than reported here. A *decidable* violation
+  ## (an out-of-range literal) is still a compile-time error either way, since it
+  ## can never succeed at runtime.
   if value.exprKind in {ConvX, HconvX, CastX, BaseobjX}: return
   var lo = zero()
   var hi = zero()
@@ -362,8 +376,10 @@ proc checkRangeAssign(c: var NjvlContext; targetType, value: Cursor) =
     of IntLit: off = createXint(pool.integers[value.intId]); isLit = true
     of UIntLit: off = createXint(pool.uintegers[value.uintId]); isLit = true
     else:
-      # A value we cannot model cannot be proven in range, so we reject it.
-      buildErr c, value.info, "cannot prove value is in range " & $lo & ".." & $hi
+      # A value we cannot model cannot be proven in range. Reject it, unless a
+      # runtime range check will catch it (see `runtimeChecked`).
+      if not runtimeChecked:
+        buildErr c, value.info, "cannot prove value is in range " & $lo & ".." & $hi
       return
 
   # lo <= v + off   <=>   0 <= v + (off - lo)
@@ -372,7 +388,12 @@ proc checkRangeAssign(c: var NjvlContext; targetType, value: Cursor) =
   let upper = query(v, VarId(0), hi - off)
   if not (implies(c.facts, lower) and implies(c.facts, upper)):
     if isLit:
+      # Decidably out of range: can never succeed, so a compile-time error even
+      # when a runtime check is present.
       buildErr c, value.info, "value out of range: " & $off & " notin " & $lo & ".." & $hi
+    elif runtimeChecked:
+      # Undecidable statically, but a runtime `nimIRcheck` will guard it.
+      discard
     elif sym != NoSymId:
       buildErr c, value.info, "cannot prove '" & pool.syms[sym] &
         "' is in range " & $lo & ".." & $hi
@@ -923,8 +944,11 @@ proc traverseExpr(c: var NjvlContext; pc: var Cursor) =
         skip pc # skips type
         # A checked conversion to a `range[lo..hi]` carries the same obligation
         # as an assignment. `cast` is an unchecked escape hatch and is exempt.
+        # When RangeCheck is active the conversion is also guarded at runtime
+        # (hexer/desugar inserts a `nimIRcheck`), so an unprovable value is
+        # deferred to that runtime check rather than rejected here.
         if not isCast:
-          checkRangeAssign c, convType, pc
+          checkRangeAssign c, convType, pc, runtimeChecked = c.rangeChecks
         traverseExpr c, pc
         skipParRi pc
       of NilX:
@@ -1808,10 +1832,13 @@ proc lowerToFinalIr(input: var TokenBuf; moduleSuffix: string): TokenBuf =
   toFinalIr(pass)
   result = ensureMove pass.dest
 
-proc analyzeContractsFinalIr*(input: var TokenBuf; moduleSuffix: string; verbose = false): TokenBuf =
+proc analyzeContractsFinalIr*(input: var TokenBuf; moduleSuffix: string;
+                             verbose = false; rangeChecks = true): TokenBuf =
   ## Main entry point: lowers `input` to the Final IR and analyzes contracts.
   ## When `verbose` is true, every contract/init failure dumps the enclosing
-  ## proc's IR to stderr to aid debugging.
+  ## proc's IR to stderr to aid debugging. When `rangeChecks` is true the
+  ## RangeCheck runtime mode is active, so unprovable range conversions defer to
+  ## the runtime `nimIRcheck` instead of failing to compile.
   var finalBuf = lowerToFinalIr(input, moduleSuffix)
 
   var c = NjvlContext(
@@ -1820,7 +1847,8 @@ proc analyzeContractsFinalIr*(input: var TokenBuf; moduleSuffix: string; verbose
     tr: newInitTracker(),
     loopExitLabels: initHashSet[SymId](),
     facts: createFacts(),
-    verbose: verbose
+    verbose: verbose,
+    rangeChecks: rangeChecks
   )
   c.facts.enableJournaling()
   c.typeCache.openScope()

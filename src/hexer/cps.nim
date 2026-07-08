@@ -126,6 +126,7 @@ proc trPassiveCall(c: var Context; dest: var TokenBuf; n: var Cursor; target: Cu
         copyIntoKind dest, CallS, info:
           inc n
           if n.kind == Symbol and typ.firstSon.kind == SymbolDef:
+            publishForeignPassiveWrapper(c, n.symId)
             dest.addSymUse coroWrapperProc(c, n.symId), info
             inc n
           else:
@@ -217,6 +218,7 @@ proc trPassiveCall(c: var Context; dest: var TokenBuf; n: var Cursor; target: Cu
     copyIntoKind dest, CallS, info:
       inc n
       if n.kind == Symbol and typ.firstSon.kind == SymbolDef:
+        publishForeignPassiveWrapper(c, n.symId)
         dest.addSymUse coroWrapperProc(c, n.symId), info
         inc n
       else:

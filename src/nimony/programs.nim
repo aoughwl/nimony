@@ -26,6 +26,13 @@ type
     index*: NifIndex
     public*: Table[string, NifIndexEntry]
     private*: Table[string, NifIndexEntry]
+    # Warm-worker bookkeeping (see prepareForNextRequest). `srcPath` is the file
+    # this module was parsed from; `srcMtime` its mtime at load time; `isInterface`
+    # is true only when it was loaded as a `.s.nif` *interface* (via `load`),
+    # false when it is a compilation *input* (`.p.nif`, from setupProgram/loadModule).
+    srcPath*: string
+    srcMtime*: float
+    isInterface*: bool
 
   SemPhase* = enum
     SemcheckTopLevelSyms,
@@ -58,6 +65,57 @@ type
 
 var
   prog*: Program
+
+  # --- warm-worker instrumentation (`nimsem serve`) -------------------------
+  # Counts how many times a fresh NIF module (index+stream) is parsed/interned.
+  # In a one-shot `nimsem m` process these are per-process; the persistent
+  # worker reuses cached modules so a shared interface (e.g. `std/system`) is
+  # parsed/interned once across many semchecks instead of once per importer.
+  #   interfaceLoads  = number of `.s.nif` interface parses (cache misses in `load`)
+  #   totalModuleLoads = every `newNifModule` (inputs + interfaces)
+  interfaceLoads*: int
+  totalModuleLoads*: int
+
+  # --- overlay / dirty-buffer registry (LSP seam) ---------------------------
+  # Maps an on-disk NIF path -> in-memory content that overrides the file for
+  # all subsequent parses, so an editor client can submit an unsaved buffer
+  # ("here's file X's current content") without touching disk. Consulted by
+  # `newNifModule` via `openNifStream`. Persists across requests until the
+  # client clears/replaces it. See docs/daemon-protocol.md.
+  fileOverlays*: Table[string, string]
+
+proc setOverlay*(path, content: string) =
+  ## Install/replace a dirty-buffer overlay for `path` (see fileOverlays).
+  fileOverlays[path] = content
+
+proc delOverlay*(path: string) =
+  fileOverlays.del(path)
+
+proc hasOverlay*(path: string): bool =
+  fileOverlays.hasKey(path)
+
+proc clearOverlays*() =
+  fileOverlays.clear()
+
+proc openNifStream(infile: string): Stream =
+  ## File-resolution seam: return a stream over the client-supplied overlay for
+  ## `infile` when one is registered, otherwise open the file from disk. This is
+  ## the single choke point that makes dirty-buffer submission possible without
+  ## a retrofit.
+  when not defined(nimony):
+    if fileOverlays.hasKey(infile):
+      return nifstreams.openFromBuffer(fileOverlays.getOrDefault(infile), infile)
+  result = nifstreams.open(infile)
+
+proc fileMtimeFloat*(path: string): float =
+  ## mtime in seconds (sub-second where the FS supports it). Host-only; under
+  ## nimony's own bootstrap `std/times` is unavailable, so this is a no-op there
+  ## (the warm worker only ever runs in the host-Nim `nimsem` binary).
+  when not defined(nimony):
+    try: result = getLastModificationTime(path).toUnixFloat()
+    except CatchableError: result = 0.0
+  else:
+    result = 0.0
 
 # -------------- Iface helpers (style-aware) ----------------------------
 #
@@ -165,9 +223,12 @@ iterator symIds*(t: ToplevelEntries): SymId =
 # -------------- end ToplevelEntries methods --------------
 
 proc newNifModule(infile: string): NifModule =
-  result = NifModule(stream: nifstreams.open(infile),
+  result = NifModule(stream: openNifStream(infile),
                      public: initTable[string, NifIndexEntry](),
-                     private: initTable[string, NifIndexEntry]())
+                     private: initTable[string, NifIndexEntry](),
+                     srcPath: infile,
+                     srcMtime: fileMtimeFloat(infile))
+  inc totalModuleLoads
   discard processDirectives(result.stream.r)
 
 proc addEmbeddedIndex(public, private: var Table[string, NifIndexEntry];
@@ -223,6 +284,8 @@ proc load*(suffix: string): NifModule =
   if not prog.mods.hasKey(suffix):
     let infile = suffixToNif suffix
     result = newNifModule(infile)
+    inc interfaceLoads  # counts `.s.nif` interface parses (cache misses)
+    result.isInterface = true  # loaded from a `.s.nif` interface, cacheable across requests
     result.index = default(NifIndex)
     let embedded = readEmbeddedIndex(result.stream)
     if embedded.len > 0:
@@ -232,6 +295,38 @@ proc load*(suffix: string): NifModule =
     prog.mods[suffix] = result
   else:
     result = prog.mods.getOrDefault(suffix)
+
+proc prepareForNextRequest*() =
+  ## Warm-worker invalidation, run before every `nimsem serve` request so a
+  ## persistent worker never serves stale or wrong-phase interfaces while still
+  ## keeping the expensive shared interfaces (esp. `std/system`) parsed/interned
+  ## exactly once. Correctness > speed: when in doubt we evict.
+  ##
+  ## We reset:
+  ##  * `prog.mem` (the current module's semchecked toplevels plus any lazily
+  ##    loaded external decls) — restored to the empty state a one-shot `nimsem
+  ##    m` process starts from, so per-request output cannot depend on leftovers.
+  ##  * `prog.main` — re-populated by `setupProgram` for the next module.
+  ##
+  ## We evict from `prog.mods`:
+  ##  * every non-interface entry (a `.p.nif` compilation input from a previous
+  ##    request's `setupProgram`/`loadModule`) — otherwise a later importer of
+  ##    that module would find the input's *empty* interface instead of loading
+  ##    its freshly written `.s.nif`.
+  ##  * every interface entry whose backing `.s.nif` changed on disk (mtime),
+  ##    so an edited/recompiled dependency is re-read.
+  ## Everything surviving (unchanged stdlib interfaces) stays warm.
+  prog.mem = default(ToplevelEntries)
+  prog.main = default(SplittedModulePath)
+  when not defined(nimony):
+    var toEvict: seq[string] = @[]
+    for suffix, m in prog.mods:
+      if not m.isInterface:
+        toEvict.add suffix
+      elif m.srcPath.len > 0 and fileMtimeFloat(m.srcPath) != m.srcMtime:
+        toEvict.add suffix
+    for s in toEvict:
+      prog.mods.del s
 
 proc mergeFilter*(f: var ImportFilter; g: ImportFilter) =
   # applies filter f to filter g, commutative since it computes the intersection

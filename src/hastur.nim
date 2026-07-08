@@ -266,9 +266,15 @@ var nimcacheDir* = "nimcache"
   ## race on the same `nimcache/` artifacts.
 
 var parallelJobs* = 1
-  ## How many tests `testDir` runs concurrently. 1 = serial (current
-  ## behavior). `--jobs:N` on the command line overrides; `--jobs:auto`
-  ## uses `countProcessors()`.
+  ## How many tests `testDir` runs concurrently. `--jobs:N` overrides;
+  ## `--jobs:auto` uses `countProcessors()`. A bare `hastur <dir>` tree walk
+  ## defaults to all cores (see `jobsExplicit`); everything else (the internal
+  ## `test <file>` worker invocations, boot/selfcheck) stays serial unless a
+  ## `--jobs` is passed, so there is no accidental nested parallelism.
+
+var jobsExplicit = false
+  ## Set once the user passes `--jobs` on the command line. When false, the
+  ## top-level tree-walk test command defaults `parallelJobs` to all cores.
 
 var skipBuild* = false
   ## Set by the parallel test runner on its worker invocations: the
@@ -772,6 +778,23 @@ proc parallelTestDir(c: var TestCounters; files: openArray[string];
          "parallel run: ",
          formatFloat(epochTime() - parallelStart, ffDecimal, precision=2), "s."
 
+const SerialMarker = "hastur.serial"
+  ## A test directory may drop an empty `hastur.serial` file to opt itself
+  ## (and everything beneath it) out of parallel execution even when `--jobs`
+  ## > 1. Used for load-sensitive suites that flake under heavy CPU
+  ## oversubscription but pass serially: `threads/` (race tests) and
+  ## `plugins/` (plugin subprocess contention).
+
+proc isParallelUnsafe(dir: string): bool =
+  ## True if `dir` or an ancestor carries a `SerialMarker` file.
+  var d = dir
+  while d.len > 0:
+    if fileExists(d / SerialMarker): return true
+    let parent = d.parentDir
+    if parent == d: break
+    d = parent
+  return false
+
 proc testDir(c: var TestCounters; dir: string; overwrite: bool; cat: Category; forward: string) =
   var files: seq[string] = @[]
   for x in walkDir(dir):
@@ -780,7 +803,7 @@ proc testDir(c: var TestCounters; dir: string; overwrite: bool; cat: Category; f
   sort files
   if cat in {Compat, Basics}:
     removeDir "nimcache"
-  if parallelJobs > 1 and canRunParallel(cat):
+  if parallelJobs > 1 and canRunParallel(cat) and not isParallelUnsafe(dir):
     parallelTestDir(c, files, overwrite, cat, forward, parallelJobs)
   else:
     for f in items files:
@@ -2137,6 +2160,7 @@ proc handleCmdLine =
         toolchainDir = val
         skipBuild = true
       of "jobs", "j":
+        jobsExplicit = true
         if val == "auto" or val.len == 0:
           parallelJobs = countProcessors()
         else:
@@ -2321,6 +2345,11 @@ proc handleCmdLine =
     pullpush("push")
   else:
     if dirExists(rawPrimary):
+      # A bare `hastur <dir>` tree walk defaults to all cores unless the user
+      # pinned `--jobs`. Dirs that flake under oversubscription opt out via a
+      # `hastur.serial` marker (isParallelUnsafe), so this stays deterministic.
+      if not jobsExplicit and parallelJobs <= 1:
+        parallelJobs = max(1, countProcessors())
       walkCmd(rawPrimary, forward, overwrite)
     else:
       quit "invalid command: " & primaryCmd

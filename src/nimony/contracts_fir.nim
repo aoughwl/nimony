@@ -74,6 +74,21 @@ type
                                        # Their post-join facts are the pre-loop
                                        # set `traverseLoop` rolled back to (via
                                        # the inferle journal), not "know nothing".
+    labelFacts: Table[SymId, Facts]    # facts snapshotted at each forward `(jmp L)`,
+                                       # joined (meet) per label. Materialised at
+                                       # `(lab L)` so a guard's refinements survive
+                                       # the jmp/label join instead of collapsing to
+                                       # "know nothing" (finalir doesn't snapshot
+                                       # facts per jmp). Bridges the `or`-with-early-
+                                       # return lowering; see `bindKeyBoth`.
+    condTrue: Table[SymId, Facts]      # facts guaranteed to hold when a lowered
+                                       # `and`/`or` boolean temp is true ...
+    condFalse: Table[SymId, Facts]     # ... or false. The short-circuit lowering of
+                                       # `a and b` / `a or b` spills the operands into
+                                       # a bool temp assigned in both arms of an
+                                       # `(ite cond ...)`; these record the per-operand
+                                       # facts so the later `(ite temp ...)` can refine
+                                       # (e.g. `x != nil and x.f`). See `traverseIte`.
     inlineVars: Table[SymId, Cursor] # var -> to its init expression
     resultSym: SymId                   # symId of the `result` local for the current proc, or NoSymId
     activeBorrows: seq[BorrowInfo]
@@ -146,6 +161,7 @@ proc contractViolation(c: var NjvlContext; orig: Cursor; fact: LeXplusC; report:
 proc traverseStmt(c: var NjvlContext; n: var Cursor)
 proc traverseExpr(c: var NjvlContext; pc: var Cursor)
 proc analyseCall(c: var NjvlContext; n: var Cursor)
+proc invalidateCondFlags(c: var NjvlContext; symId: SymId)
 
 proc extractSymId(n: Cursor): SymId {.inline.} =
   var n = n
@@ -1092,6 +1108,10 @@ proc traverseStore(c: var NjvlContext; n: var Cursor) =
 
     var fact = query(getVarId(c, symId), InvalidVarId, createXint(0'i32))
     markInit(c, symId)
+    # Reassigning a variable drops any `and`/`or` flag implication keyed on it or
+    # mentioning it as an operand (the recorded facts no longer hold). The store
+    # of the flag itself in the lowering re-records via `traverseIte`.
+    invalidateCondFlags(c, symId)
 
     # Check for not-nil type match
     let expected = getType(c.typeCache, n)
@@ -1131,11 +1151,45 @@ proc traverseStore(c: var NjvlContext; n: var Cursor) =
 
 # --- Exit-summary plumbing (facts ride alongside the Tracker's init-set) ---
 
+proc setFactsTo(c: var NjvlContext; cp: int; target: Facts) =
+  ## Make `c.facts` equal `target` *journaled* — roll back to the checkpoint
+  ## (the pre-branch base), then add/remove only the cells that differ. No
+  ## whole-`Facts` replacement, so an enclosing checkpoint stays valid.
+  c.facts.rollbackTo cp
+  var want = initTable[(VarId, VarId), xint]()
+  for k in 0 ..< target.len:
+    let m = target[k]
+    want[(m.a, m.b)] = m.c
+  var i = 0
+  while i < c.facts.len:
+    let f = c.facts[i]
+    let key = (f.a, f.b)
+    if key in want and want.getOrDefault(key) == f.c:
+      want.del key
+      inc i
+    else:
+      removeFactAt(c.facts, i)          # journaled removal; rechecks slot i
+  for key, cc in want:
+    c.facts.add LeXplusC(a: key[0], b: key[1], c: cc)
+
 proc retKey(): ExitKey[SymId] {.inline.} = ExitKey[SymId](kind: ekReturn)
 proc raiseKey(): ExitKey[SymId] {.inline.} = ExitKey[SymId](kind: ekRaise)
 proc contKey(): ExitKey[SymId] {.inline.} = ExitKey[SymId](kind: ekContinue)
 
 proc leaveToLabel(c: var NjvlContext; label: SymId) =
+  # Snapshot the facts live at this forward `jmp` and join (meet) them into the
+  # label's accumulator, mirroring the Tracker's per-exit init join. A `(lab)`
+  # reached only by jmps then restores the meet of its predecessors' facts rather
+  # than collapsing to "know nothing" — which is what lets a nil-guard's
+  # `a != nil`/`b != nil` survive the `or`-with-early-return lowering (see
+  # `bindKeyBoth`). Guarded on `tr.live` to match `Tracker.leaveVia`, so
+  # `labelFacts.hasKey` stays in lock-step with `tr.pending`.
+  if c.tr.live:
+    let snap = snapshotFacts(c.facts)
+    if c.labelFacts.hasKey(label):
+      c.labelFacts[label] = merge(snap, 0, c.labelFacts[label], false)
+    else:
+      c.labelFacts[label] = snap
   gotoLabel(c.tr, label)
 
 proc leaveToReturn(c: var NjvlContext) =
@@ -1164,36 +1218,153 @@ proc bindKeyBoth(c: var NjvlContext; key: ExitKey[SymId]) =
   let hadExit = c.tr.pending(key)
   case key.kind
   of ekLabel:
+    let preLive = c.tr.live   # was fall-through *into* the `(lab)` reachable?
     bindLabel(c.tr, key.label)
     # A loop-exit label keeps the journal-restored pre-loop facts (see
-    # `traverseLoop`); only a *general* forward-jump join collapses to "know
-    # nothing", since finalir doesn't snapshot facts per `jmp`.
+    # `traverseLoop`). A *general* forward-jump join used to collapse to "know
+    # nothing" since finalir doesn't snapshot facts per `jmp`; instead restore the
+    # meet of the label's predecessors — the per-`jmp` snapshots (from
+    # `leaveToLabel`) joined with the fall-through facts, if any. Sound (a meet of
+    # incoming edges) and monotonic (only adds facts that hold on *every* path in).
     if hadExit and not c.loopExitLabels.contains(key.label):
-      c.facts.clearJournaled()
+      let cp = c.facts.checkpoint()
+      var incoming = default(Facts)
+      var have = false
+      if c.labelFacts.hasKey(key.label):
+        incoming = c.labelFacts[key.label]
+        have = true
+      if preLive:
+        let ft = snapshotFacts(c.facts)
+        incoming = if have: merge(ft, 0, incoming, false) else: ft
+        have = true
+      if have:
+        setFactsTo(c, cp, incoming)
+      else:
+        c.facts.clearJournaled()
+    if c.labelFacts.hasKey(key.label):
+      c.labelFacts.del key.label
   of ekReturn: bindReturn(c.tr)
   of ekRaise: bindRaise(c.tr)
   of ekContinue: dropContinue(c.tr)
 
-proc setFactsTo(c: var NjvlContext; cp: int; target: Facts) =
-  ## Make `c.facts` equal `target` *journaled* — roll back to the checkpoint
-  ## (the pre-branch base), then add/remove only the cells that differ. No
-  ## whole-`Facts` replacement, so an enclosing checkpoint stays valid.
-  c.facts.rollbackTo cp
-  var want = initTable[(VarId, VarId), xint]()
-  for k in 0 ..< target.len:
-    let m = target[k]
-    want[(m.a, m.b)] = m.c
-  var i = 0
-  while i < c.facts.len:
-    let f = c.facts[i]
-    let key = (f.a, f.b)
-    if key in want and want.getOrDefault(key) == f.c:
-      want.del key
-      inc i
+# --- `and`/`or` short-circuit flag conditioned facts ---
+#
+# A short-circuit `a and b` / `a or b` used as a *value* is lowered to a bool
+# temp assigned in both arms of an `(ite cond ...)`:
+#   `a and b`  ->  (ite a (store b flag) (store false flag))
+#   `a or  b`  ->  (ite a (store true flag) (store b flag))
+# and a later `(ite flag ...)` tests it. The per-operand nil facts are intersected
+# away at the arm merge, so without help the `(ite flag ...)` cannot prove them.
+# We record, structurally and soundly, the implication the *literal* arm makes
+# unambiguous — `and` pins `flag == true` to a single arm (=> its conjuncts hold),
+# `or` pins `flag == false` — and re-inject it when the flag is later tested. This
+# is the Final-IR analogue of the njvl cfvar-conditioned-fact layer.
+
+proc pureCondFact(c: var NjvlContext; pc: Cursor; ok: var bool): LeXplusC =
+  ## Side-effect-free translation of a *simple* boolean condition into one linear
+  ## fact (a subset of `translateCond` with no `traverseExpr` fallback, so it can
+  ## be run on a peeked cursor without double-reporting). Handles `not`-wrapping,
+  ## `x == <nil|int|y>` and bare truthy `x` (`x != nil`); `ok=false` otherwise.
+  ok = false
+  result = LeXplusC(a: InvalidVarId, b: VarId(0), c: createXint(0'i32))
+  var r = pc
+  var negs = 0
+  while r.exprKind == NotX:
+    inc negs; inc r
+  if r.exprKind == EqX:
+    inc r
+    skip r # type
+    let sa = extractSymId(r)
+    if sa == NoSymId: return
+    result.a = getVarId(c, sa)
+    skip r
+    if r.exprKind == NilX:
+      result.b = VarId(0); result.c = createXint(0'i32)
+    elif r.kind == IntLit:
+      result.b = VarId(0); result.c = createXint(pool.integers[r.intId])
+    elif r.kind == UIntLit:
+      result.b = VarId(0); result.c = createXint(pool.uintegers[r.uintId])
     else:
-      removeFactAt(c.facts, i)          # journaled removal; rechecks slot i
-  for key, cc in want:
-    c.facts.add LeXplusC(a: key[0], b: key[1], c: cc)
+      let sb = extractSymId(r)
+      if sb == NoSymId: return
+      result.b = getVarId(c, sb); result.c = createXint(0'i32)
+    ok = true
+  else:
+    let sa = extractSymId(r)
+    if sa != NoSymId:
+      result = isNotNil(getVarId(c, sa))
+      ok = true
+    else:
+      return
+  for _ in 0 ..< negs:
+    negateFact(result)
+
+proc singleStoreArm(arm: Cursor; flag: var SymId; val: var Cursor): bool =
+  ## Peek: is `arm` a `(store val flag)` (possibly wrapped in one
+  ## `(stmts …)`/`(scope …)`)? Reports the stored value cursor and destination.
+  var a = arm
+  if a.kind == ParLe and a.stmtKind in {StmtsS, ScopeS}:
+    inc a
+  if a.njvlKind != StoreV: return false
+  inc a          # skip store tag
+  val = a
+  skip a         # skip value
+  let dest = extractSymIdForStore(a)
+  if dest == NoSymId: return false
+  flag = dest
+  result = true
+
+type FlagForm = enum ffNone, ffAnd, ffOr
+
+proc peekFlagLowering(c: var NjvlContext; iteStart: Cursor;
+                      flag: var SymId; operand: var Cursor): FlagForm =
+  ## Peek an `(ite cond then else)` for the `and`/`or` value lowering. On a match,
+  ## report the shared flag temp and the *conditional* operand's cursor (`cond`
+  ## for the shared conjunct/disjunct is taken separately by the caller).
+  result = ffNone
+  var p = iteStart
+  inc p               # skip ite tag
+  skip p              # skip condition
+  var thenFlag, elseFlag: SymId
+  var thenVal, elseVal: Cursor
+  if not singleStoreArm(p, thenFlag, thenVal): return
+  skip p              # skip then arm
+  if p.kind == DotToken: return
+  if not singleStoreArm(p, elseFlag, elseVal): return
+  if thenFlag != elseFlag: return
+  flag = thenFlag
+  if elseVal.exprKind == FalseX and thenVal.exprKind notin {TrueX, FalseX}:
+    operand = thenVal; result = ffAnd
+  elif thenVal.exprKind == TrueX and elseVal.exprKind notin {TrueX, FalseX}:
+    operand = elseVal; result = ffOr
+
+proc dropCondFlagsMentioning(c: var NjvlContext; v: VarId) =
+  ## A store to `v` (or the flag itself) invalidates any flag implication keyed
+  ## on it or mentioning it as an operand.
+  var kills: seq[SymId] = @[]
+  for k, fs in c.condTrue:
+    for i in 0 ..< fs.len:
+      if fs[i].a == v or fs[i].b == v: kills.add k; break
+  for k in kills: c.condTrue.del k
+  kills.setLen 0
+  for k, fs in c.condFalse:
+    for i in 0 ..< fs.len:
+      if fs[i].a == v or fs[i].b == v: kills.add k; break
+  for k in kills: c.condFalse.del k
+
+proc invalidateCondFlags(c: var NjvlContext; symId: SymId) =
+  c.condTrue.del symId
+  c.condFalse.del symId
+  dropCondFlagsMentioning(c, getVarId(c, symId))
+
+proc materializeCondFlags(c: var NjvlContext; tbl: Table[SymId, Facts]; flag: SymId) =
+  ## Inject the facts recorded for `flag` having a known truth value.
+  if tbl.hasKey(flag):
+    let fs = tbl[flag]
+    for i in 0 ..< fs.len:
+      let f = fs[i]
+      if f.isValid and not (f.a == VarId(0) and f.b == VarId(0)):
+        c.facts.add f
 
 proc traverseIte(c: var NjvlContext; n: var Cursor) =
   ## `(ite cond then else)`. Each arm is analyzed under the condition's
@@ -1201,7 +1372,16 @@ proc traverseIte(c: var NjvlContext; n: var Cursor) =
   ## and the facts by liveness — a branch that always leaves drops out of the
   ## merge, unifying guard-clause and if-else style. Facts use the journaled
   ## checkpoint/rollback, so per-frame cost is O(writes), not a whole-set copy.
+  let iteStart = n
   inc n # skip ite/itec tag
+
+  # Is the condition a bare bool that carries recorded `and`/`or` flag facts?
+  let condSym = extractSymId(n)
+  # Does this ite *itself* lower `a and b` / `a or b` into a bool temp?
+  var flagSym = NoSymId
+  var flagOperand = default(Cursor)
+  let flagForm = peekFlagLowering(c, iteStart, flagSym, flagOperand)
+  let condCursor = n
 
   let cp = c.facts.checkpoint()
   let savedBorrowsLen = c.activeBorrows.len
@@ -1214,6 +1394,9 @@ proc traverseIte(c: var NjvlContext; n: var Cursor) =
 
   # then-branch (under assume(c)):
   var b = splitBranch(c.tr)
+  # Testing a lowered `and`/`or` temp: re-inject its recorded conjuncts here so
+  # `if a != nil and b != nil: <use a,b>` proves both operands non-nil.
+  if condSym != NoSymId: materializeCondFlags(c, c.condTrue, condSym)
   traverseStmt c, n
   let thenLive = c.tr.live
   # snapshot the then-path facts *only* when it falls through (needed for the
@@ -1228,6 +1411,7 @@ proc traverseIte(c: var NjvlContext; n: var Cursor) =
     var negated = f
     negateFact(negated)
     c.facts.add negated
+  if condSym != NoSymId: materializeCondFlags(c, c.condFalse, condSym)
   if n.kind == DotToken:
     inc n
   else:
@@ -1244,6 +1428,31 @@ proc traverseIte(c: var NjvlContext; n: var Cursor) =
   elif not elseLive:
     c.facts.rollbackTo cp           # both arms left — unreachable; reset to base
   # elif elseLive: keep c.facts (the else-path under assume(¬c))
+
+  # If this ite lowered `a and b` / `a or b`, record the flag's conditioned facts
+  # for the later `(ite flag ...)`. Sound because the *literal* arm makes one
+  # truth value of the flag reachable through a single arm:
+  #   `and` (else stores false): flag==true only via the then-arm => both the
+  #         shared condition and the operand hold => record on `condTrue`;
+  #   `or`  (then stores true):  flag==false only via the else-arm => both
+  #         negations hold => record on `condFalse`.
+  if flagForm != ffNone:
+    invalidateCondFlags(c, flagSym)   # fresh (re)assignment of the flag temp
+    var okA = false
+    var okB = false
+    let factA = pureCondFact(c, condCursor, okA)
+    var factB = pureCondFact(c, flagOperand, okB)
+    var fs = default(Facts)
+    if flagForm == ffAnd:
+      if okA: fs.add factA
+      if okB: fs.add factB
+      if fs.len > 0: c.condTrue[flagSym] = fs
+    else: # ffOr: flag==false => ¬condA ∧ ¬operand
+      if okA:
+        var na = factA; negateFact(na); fs.add na
+      if okB:
+        negateFact(factB); fs.add factB
+      if fs.len > 0: c.condFalse[flagSym] = fs
 
   skipParRi n
 
@@ -1584,6 +1793,13 @@ proc traverseProc(c: var NjvlContext; n: var Cursor) =
   let oldResultSym = c.resultSym
   let oldInlineVars = move c.inlineVars
   let oldBorrows = move c.activeBorrows
+  # Labels and lowered `and`/`or` temps are proc-local; start each proc fresh.
+  let oldLabelFacts = move c.labelFacts
+  let oldCondTrue = move c.condTrue
+  let oldCondFalse = move c.condFalse
+  c.labelFacts = initTable[SymId, Facts]()
+  c.condTrue = initTable[SymId, Facts]()
+  c.condFalse = initTable[SymId, Facts]()
   let oldProcStart = c.currentProcStart
   c.currentProcStart = decl
   c.resultSym = NoSymId
@@ -1644,6 +1860,9 @@ proc traverseProc(c: var NjvlContext; n: var Cursor) =
   c.resultSym = oldResultSym
   c.inlineVars = ensureMove oldInlineVars
   c.activeBorrows = ensureMove oldBorrows
+  c.labelFacts = ensureMove oldLabelFacts
+  c.condTrue = ensureMove oldCondTrue
+  c.condFalse = ensureMove oldCondFalse
   c.currentProcStart = oldProcStart
 
 proc traverseStmt(c: var NjvlContext; n: var Cursor) =
@@ -1819,6 +2038,9 @@ proc analyzeContractsFinalIr*(input: var TokenBuf; moduleSuffix: string; verbose
     moduleSuffix: moduleSuffix,
     tr: newInitTracker(),
     loopExitLabels: initHashSet[SymId](),
+    labelFacts: initTable[SymId, Facts](),
+    condTrue: initTable[SymId, Facts](),
+    condFalse: initTable[SymId, Facts](),
     facts: createFacts(),
     verbose: verbose
   )

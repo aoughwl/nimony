@@ -143,7 +143,8 @@ proc externPragmas(c: var EContext; dest: var TokenBuf; genPragmas: var GenPragm
   if prag.header != StrId(0):
     dest.addKeyVal genPragmas, "header", strToken(prag.header, pinfo), pinfo
 
-proc trField(c: var EContext; dest: var TokenBuf; n: var Cursor; flags: set[TypeFlag] = {}) =
+proc trField(c: var EContext; dest: var TokenBuf; n: var Cursor; flags: set[TypeFlag] = {};
+             variantPragma: Cursor = default(Cursor)) =
   # Translate gfld to fld for NIFC (NIFC only knows fld):
   dest.add parLeToken(pool.tags.getOrIncl("fld"), n.info)
   inc n
@@ -164,6 +165,11 @@ proc trField(c: var EContext; dest: var TokenBuf; n: var Cursor; flags: set[Type
     dest.addKeyVal genPragmas, "align", intToken(prag.align, pinfo), pinfo
   if prag.bits != IntId(0):
     dest.addKeyVal genPragmas, "bits", intToken(prag.bits, pinfo), pinfo
+  if not cursorIsNil(variantPragma):
+    # discriminator of a variant object: carry the `(variant (ranges ...)*)`
+    # kind→branch mapping (issue #2068).
+    maybeOpen dest, genPragmas, pinfo
+    dest.addSubtree variantPragma
   closeGenPragmas dest, genPragmas
 
   trType c, dest, n, flags
@@ -418,43 +424,81 @@ proc addRttiField(c: var EContext; dest: var TokenBuf; info: PackedLineInfo) =
   dest.addParRi() # "ptr"
   dest.addParRi() # "fld"
 
+proc trRanges(c: var EContext; dest: var TokenBuf; n: var Cursor) =
+  ## Translate a Nimony `(ranges ...)` selector (or a bare single value) into
+  ## the Leng form. Shared by `trCase` (runtime `case` statement) and the
+  ## variant-object discriminant mapping in `trObjFields`.
+  if n.kind == ParLe and n.substructureKind == RangesU:
+    inc n
+    dest.add "ranges", n.info
+    while n.hasMore:
+      if n.kind == ParLe and n.substructureKind == RangeU:
+        inc n
+        dest.add "range", n.info
+        while n.hasMore:
+          trExpr c, dest, n
+        takeParRi dest, n
+      else:
+        trExpr c, dest, n
+    takeParRi dest, n
+  else:
+    trExpr c, dest, n
+
 proc trObjFields(c: var EContext; dest: var TokenBuf; n: var Cursor; flags: set[TypeFlag]) =
   while n.hasMore:
     case n.substructureKind
     of FldU, GfldU:
       trField(c, dest, n, flags)
     of CaseU:
+      # A variant (case) object. The discriminator becomes an ordinary `fld`
+      # and the branches collapse into a C `union`, which loses the
+      # discriminant→branch mapping. We recover it by attaching a
+      # `(variant (ranges ...)*)` pragma to the discriminator field: one
+      # `(ranges ...)` per emitted union branch, in branch order (an empty
+      # `(ranges)` marks the `else`/default branch). The union body itself is
+      # emitted byte-for-byte as before, so every other `.c.nif` consumer is
+      # unaffected — only debug-info generation reads the pragma. See #2068.
       # XXX for now counts each case object field as separate
-      inc n
-      trField(c, dest, n, flags)
-      dest.add tagToken("union", n.info)
+      inc n # step into (case ...)
+      var discr = n # discriminator field; emitted after the branches are scanned
+      skip n        # advance to the first (of ...) / (else ...) branch
+      let unionInfo = n.info
+
+      var variantBuf = createTokenBuf(16)
+      variantBuf.add tagToken("variant", unionInfo)
+      var unionBuf = createTokenBuf(16)
+
       while n.hasMore:
         case n.substructureKind
         of OfU:
-          inc n
-          skip n
+          inc n # step into (of ...)
+          var rangesBuf = createTokenBuf(8)
+          trRanges(c, rangesBuf, n) # translate (ranges ...); advances past it
           assert n.stmtKind == StmtsS
           inc n
           if n.exprKind == NilX:
-            skip n
+            skip n # empty branch: no union member, hence no variant entry
           else:
-            dest.add tagToken("object", n.info)
-            dest.addDotToken  # base type
-            trObjFields(c, dest, n, flags)
-            dest.addParRi # end of object
+            unionBuf.add tagToken("object", n.info)
+            unionBuf.addDotToken  # base type
+            trObjFields(c, unionBuf, n, flags)
+            unionBuf.addParRi # end of object
+            variantBuf.add rangesBuf
           skipParRi c, n
           skipParRi c, n
         of ElseU:
-          inc n
+          inc n # step into (else ...)
           assert n.stmtKind == StmtsS
           inc n
           if n.exprKind == NilX:
             skip n
           else:
-            dest.add tagToken("object", n.info)
-            dest.addDotToken  # base type
-            trObjFields(c, dest, n, flags)
-            dest.addParRi # end of object
+            unionBuf.add tagToken("object", n.info)
+            unionBuf.addDotToken  # base type
+            trObjFields(c, unionBuf, n, flags)
+            unionBuf.addParRi # end of object
+            variantBuf.add tagToken("ranges", n.info) # empty = else/default
+            variantBuf.addParRi
           skipParRi c, n
           skipParRi c, n
         of NilU, NotnilU, KvU, VvU, RangeU, RangesU, ParamU,
@@ -463,8 +507,14 @@ proc trObjFields(c: var EContext; dest: var TokenBuf; n: var Cursor; flags: set[
             UnpackflatU, UnpacktupU, ExceptU, FinU, UncheckedU,
             GfldU, CallargsU, ForcallU, NoSub:
           error "expected `of` or `else` inside `case`"
+      variantBuf.addParRi # end of (variant ...)
+
+      var variantCursor = variantBuf.beginRead
+      trField(c, dest, discr, flags, variantCursor)
+      dest.add tagToken("union", unionInfo)
+      dest.add unionBuf
       dest.addParRi # end of union
-      skipParRi c, n
+      skipParRi c, n # end of (case ...)
     of NilU:
       skip n
     of NotnilU, KvU, VvU, RangeU, RangesU, ParamU, TypevarU,
@@ -1855,21 +1905,7 @@ proc trCase(c: var EContext; dest: var TokenBuf; n: var Cursor) =
     of OfU:
       dest.add n
       inc n
-      if n.kind == ParLe and n.substructureKind == RangesU:
-        inc n
-        dest.add "ranges", n.info
-        while n.hasMore:
-          if n.kind == ParLe and n.substructureKind == RangeU:
-            inc n
-            dest.add "range", n.info
-            while n.hasMore:
-              trExpr c, dest, n
-            takeParRi dest, n
-          else:
-            trExpr c, dest, n
-        takeParRi dest, n
-      else:
-        trExpr c, dest, n
+      trRanges(c, dest, n)
       trStmt c, dest, n
       takeParRi dest, n
     of ElseU:

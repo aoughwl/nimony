@@ -518,6 +518,99 @@ proc genDIUnionType(c: var LLVMCode; n: var Cursor): int =
     ", size: " & $uSize &
     ", align: " & $uAlign & ")")
 
+type
+  VariantBranch = object
+    ## One branch of a variant object, in union-branch order. ``values`` are the
+    ## discriminant ordinals that select this branch (from the discriminator
+    ## field's ``(variant (ranges ...)*)`` pragma); ``isDefault`` marks the
+    ## ``else`` branch, encoded as an empty ``(ranges)``. See issue #2068.
+    values: seq[BiggestInt]
+    isDefault: bool
+
+proc extractVariantBranches(pragmas: Cursor): seq[VariantBranch] =
+  ## Read the `(variant (ranges ...)*)` pragma off a discriminator field, one
+  ## `VariantBranch` per union branch in order. Returns `@[]` when the field is
+  ## not a variant discriminator.
+  result = @[]
+  if pragmas.substructureKind != PragmasU: return
+  var p = pragmas
+  p.loopInto:
+    if p.pragmaKind == VariantP:
+      var v = p # copy so loopInto's trailing `skip p` still advances p
+      v.into:
+        while v.hasMore:
+          if v.substructureKind == RangesU:
+            var br = VariantBranch(values: @[], isDefault: false)
+            v.into:
+              while v.hasMore:
+                if v.substructureKind == RangeU:
+                  var lo: BiggestInt = 0
+                  var hi: BiggestInt = 0
+                  v.into:
+                    lo = intVal(v); inc v
+                    hi = intVal(v)
+                    while v.hasMore: skip v
+                  var x = lo
+                  while x <= hi:
+                    br.values.add x
+                    inc x
+                elif v.kind == IntLit:
+                  br.values.add intVal(v)
+                  inc v
+                else:
+                  skip v
+            if br.values.len == 0: br.isDefault = true
+            result.add br
+          else:
+            skip v
+    skip p
+
+proc addVariantPart(c: var LLVMCode; n: var Cursor; members: var seq[int];
+                    fieldOffset: var int; discrMemberId: int;
+                    branches: seq[VariantBranch]) =
+  ## Emit a DWARF `DW_TAG_variant_part` for a variant object's union ``n``
+  ## (consumed), instead of a plain `DW_TAG_union_type`. ``discrMemberId`` is
+  ## the discriminator (`kind`) member the variant part selects on; ``branches``
+  ## gives the discriminant values per union branch in order. Each branch's
+  ## fields become a nested struct, referenced by one `DW_TAG_member` (which
+  ## LLVM lowers to a `DW_TAG_variant`) per discriminant value; an empty branch
+  ## (`isDefault`) omits `extraData` to become the default variant. See #2068.
+  let uSize = typeSizeBits(c, n)
+  let uAlign = typeAlignBits(c, n)
+  if uAlign > 0:
+    fieldOffset = ((fieldOffset + uAlign - 1) div uAlign) * uAlign
+  let unionOffset = fieldOffset
+  var variantElems: seq[int] = @[]
+  var branchIdx = 0
+  n.into:
+    while n.hasMore:
+      if n.typeKind == ObjectT:
+        let bSize = typeSizeBits(c, n)
+        let bAlign = typeAlignBits(c, n)
+        let bdi = genDIAnonObject(c, n) # consumes the branch object
+        if bdi != 0 and branchIdx < branches.len:
+          let br = branches[branchIdx]
+          let common = "!DIDerivedType(tag: DW_TAG_member" &
+            ", baseType: !" & $bdi &
+            ", size: " & $bSize & ", align: " & $bAlign &
+            ", offset: " & $unionOffset
+          if br.isDefault:
+            variantElems.add c.addMetadata(common & ")")
+          else:
+            for v in br.values:
+              variantElems.add c.addMetadata(common & ", extraData: i64 " & $v & ")")
+        inc branchIdx
+      elif n.substructureKind == FldU:
+        skip n
+      else:
+        skip n
+  let vpId = c.addMetadata("!DICompositeType(tag: DW_TAG_variant_part" &
+    ", size: " & $uSize & ", align: " & $uAlign &
+    ", discriminator: !" & $discrMemberId &
+    ", elements: !{" & diElemsList(variantElems) & "})")
+  members.add vpId
+  fieldOffset += uSize
+
 proc genDICompositeType(c: var LLVMCode; n: var Cursor): int =
   ## Generate DICompositeType for ObjectT or UnionT.
   ## Walks ``decl.body`` (not the inline cursor) — matches
@@ -575,12 +668,29 @@ proc genDICompositeType(c: var LLVMCode; n: var Cursor): int =
             ", offset: 0, flags: 0)")
         inc body
 
+    # A variant object emits its discriminator as a normal field carrying a
+    # `(variant ...)` pragma, immediately followed by the branch union. When we
+    # see that pairing, emit a DWARF variant part keyed on the discriminator
+    # member instead of a plain union, so a debugger shows only the active
+    # branch. See issue #2068.
+    var pendingBranches: seq[VariantBranch] = @[]
+    var discrMemberId = 0
     while body.hasMore:
       if body.substructureKind == FldU:
         var fd = takeFieldDecl(body)
+        let branches = extractVariantBranches(fd.pragmas)
+        let before = members.len
         addFieldMember(c, fd, members, fieldOffset)
+        if branches.len > 0 and members.len > before:
+          pendingBranches = branches
+          discrMemberId = members[^1]
       elif body.typeKind == UnionT:
-        addUnionMember(c, body, members, fieldOffset)
+        if pendingBranches.len > 0 and discrMemberId != 0:
+          addVariantPart(c, body, members, fieldOffset, discrMemberId, pendingBranches)
+          pendingBranches = @[]
+          discrMemberId = 0
+        else:
+          addUnionMember(c, body, members, fieldOffset)
       elif body.typeKind == ObjectT:
         skip body
       else:

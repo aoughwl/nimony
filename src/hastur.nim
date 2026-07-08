@@ -1243,7 +1243,85 @@ proc validatePassesFlag(): string =
   else:
     ""
 
+proc ensureNiflerParserOverlay() =
+  ## Nifler compiles Nim's own `compiler/parser.nim` (resolved through
+  ## `--path:$nim`, see src/nifler/nim.cfg). Support for the new-styled
+  ## `type C = concept of D` inheritance syntax (used by nimony's concept
+  ## tests and lowered by src/nifler/bridge.nim's `nkTypeClassTy` handler)
+  ## landed in Nim `devel`'s parser *after* the frozen nightly that
+  ## `alaviss/setup-nim` installs. On such a stale host Nim, `parseTypeClass`
+  ## treats the `of` after `concept` as a concept parameter and dies with
+  ## "identifier expected, but got 'keyword of'", so every inheriting concept
+  ## fails the nifler pre-pass.
+  ##
+  ## CI works around this by overlaying fresh `devel` compiler sources onto
+  ## the host Nim (see .github/workflows/ci.yml). We do the equivalent for
+  ## local builds without mutating the shared host Nim: generate a private
+  ## copy of the host `compiler/` dir with the one parser fix applied, and
+  ## point nifler's nim.cfg at it (searched last, so it wins). The overlay is
+  ## regenerated whenever the host parser is newer than our copy.
+  let nimExe = findExe("nim")
+  if nimExe.len == 0: return
+  let nimPrefix = nimExe.parentDir.parentDir      # <prefix>/bin/nim -> <prefix>
+  let srcCompiler = nimPrefix / "compiler"
+  let srcParser = srcCompiler / "parser.nim"
+  if not fileExists(srcParser): return
+  let overlayDir = getCurrentDir() / ".nim_overlay"
+  let dstCompiler = overlayDir / "compiler"
+  let dstParser = dstCompiler / "parser.nim"
+
+  const marker = "new-styled `concept of A, B`"
+  let upToDate = fileExists(dstParser) and
+    readFile(dstParser).contains(marker) and
+    getLastModificationTime(dstParser) >= getLastModificationTime(srcParser)
+  if upToDate: return
+
+  removeDir overlayDir
+  createDir overlayDir
+  copyDir srcCompiler, dstCompiler
+  # `compiler/extccomp.nim` imports `../dist/checksums/...`; make that sibling
+  # reachable from the overlay too.
+  let srcDist = nimPrefix / "dist"
+  if dirExists(srcDist):
+    let dstDist = overlayDir / "dist"
+    when defined(windows):
+      copyDir srcDist, dstDist
+    else:
+      createSymlink srcDist, dstDist
+
+  # Apply the parser fix: don't consume the `of` that starts concept
+  # inheritance as a concept parameter, and allow an empty body when the
+  # concept only inherits requirements from its parents.
+  var src = readFile(dstParser)
+  src = src.replace(
+    "  if p.tok.indent < 0:\n" &
+    "    var args = newNodeP(nkArgList, p)\n" &
+    "    result.add(args)\n" &
+    "    args.add(p.parseTypeClassParam)",
+    "  if p.tok.tokType == tkOf and p.tok.indent < 0:\n" &
+    "    # " & marker & " on the same line as `concept`\n" &
+    "    result.add(p.emptyNode)\n" &
+    "  elif p.tok.indent < 0:\n" &
+    "    var args = newNodeP(nkArgList, p)\n" &
+    "    result.add(args)\n" &
+    "    args.add(p.parseTypeClassParam)")
+  src = src.replace(
+    "  if not realInd(p):\n" &
+    "    if result.isNewStyleConcept:\n" &
+    "      parMessage(p, \"routine expected, but found '$1' (empty new-styled concepts are not allowed)\", p.tok)\n" &
+    "    result.add(p.emptyNode)",
+    "  if not realInd(p):\n" &
+    "    let hasParents = result[2].kind != nkEmpty\n" &
+    "    if result.isNewStyleConcept and not hasParents:\n" &
+    "      parMessage(p, \"routine expected, but found '$1' (empty new-styled concepts are not allowed)\", p.tok)\n" &
+    "    result.add(p.emptyNode)")
+  if not src.contains(marker):
+    quit "FAILURE: could not apply concept-of parser overlay to " & srcParser &
+      "\n(host Nim parser layout changed; update ensureNiflerParserOverlay)"
+  writeFile(dstParser, src)
+
 proc buildNifler(showProgress = false) =
+  ensureNiflerParserOverlay()
   exec nimcPrefix() & "src/nifler/nifler.nim", showProgress
   let exe = "nifler".addFileExt(ExeExt)
   robustMoveFile "src/nifler/" & exe, binDir() / exe

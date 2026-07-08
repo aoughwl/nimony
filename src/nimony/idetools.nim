@@ -4,7 +4,7 @@
 # See the file "license.txt", included in this
 # distribution, for details about the copyright.
 
-import std / [sets, syncio, assertions, os]
+import std / [sets, syncio, assertions, os, strutils]
 include ".." / lib / nifprelude
 import ".." / lib / [symparser, nifindexes, tooldirs]
 import semos, programs, typenav, typeprops, decls, nifconfig, nimony_model
@@ -21,11 +21,28 @@ proc lineInfoMatch*(info, toTrack: PackedLineInfo; tokenLen: int): bool =
     if t.col > i.col + tokenLen: return false
   return true
 
+type
+  IdeItem* = object
+    ## Structured idetools result, consumed by both the CLI text formatter and
+    ## the `nimsem serve` JSON verbs.
+    isDef*: bool
+    symId*: SymId
+    file*: string
+    line*, col*: int
+
+var
+  ideSink*: seq[IdeItem]     ## results collected during a tracking run
+  ideEmitText* = true        ## CLI writes stdout text; the daemon turns this off
+
 proc foundSymbol(tok: PackedToken; mode: TrackMode) =
   # format that is compatible with nimsuggest's in the hope it helps:
   let info = unpack(pool.man, tok.info)
   if info.file.isValid:
     if (tok.kind == Symbol and mode == TrackUsages) or (tok.kind == SymbolDef and mode == TrackDef):
+      ideSink.add IdeItem(isDef: tok.kind == SymbolDef, symId: tok.symId,
+                          file: pool.files[info.file],
+                          line: info.line, col: info.col)
+      if not ideEmitText: return
       var r = (if tok.kind == Symbol: "use\t" else: "def\t")
       r.add "\t" # unknown symbol kind
       r.add pool.syms[tok.symId]
@@ -300,7 +317,9 @@ proc usages*(files: openArray[string]; config: NifConfig) =
     close(s)
 
   if symId == SymId 0:
-    quit "symbol not found"
+    # Not found: stay alive (the daemon must not die). CLI prints nothing.
+    if ideEmitText: stderr.writeLine "symbol not found"
+    return
   elif isLocalSym:
     # Set path so files are found when resolving symbols
     prog.main.dir = nifFile.splitPath.head
@@ -324,3 +343,44 @@ proc usages*(files: openArray[string]; config: NifConfig) =
             discard "proceed"
       finally:
         close(s)
+
+proc collectIde*(files: openArray[string]; config: NifConfig): seq[IdeItem] =
+  ## Run def/usages tracking but COLLECT structured results instead of writing
+  ## nimsuggest-style text to stdout. Used by the `nimsem serve` query verbs.
+  ## Never raises: a bad request yields an empty result, keeping the worker alive.
+  ideSink.setLen(0)
+  let saved = ideEmitText
+  ideEmitText = false
+  try:
+    usages(files, config)
+  except CatchableError:
+    discard
+  ideEmitText = saved
+  result = ideSink
+
+proc symbolName*(id: SymId): string = pool.syms[id]
+
+proc searchSymbols*(files: openArray[string]; query: string; limit = 500): seq[IdeItem] =
+  ## Workspace-symbol name search: scan the given `.s.nif` files for SymbolDefs
+  ## whose demangled name contains `query` (case-insensitive). Deduped by symId.
+  result = @[]
+  let needle = query.toLowerAscii
+  var seen = initHashSet[SymId]()
+  for f in files:
+    var s = nifstreams.open(f)
+    try:
+      discard processDirectives(s.r)
+      while true:
+        let tok = next(s)
+        if tok.kind == EofToken: break
+        if tok.kind == SymbolDef:
+          var nm = pool.syms[tok.symId]
+          extractBasename nm
+          if nm.len > 0 and (needle.len == 0 or nm.toLowerAscii.contains(needle)):
+            let info = unpack(pool.man, tok.info)
+            if info.file.isValid and not seen.containsOrIncl(tok.symId):
+              result.add IdeItem(isDef: true, symId: tok.symId,
+                file: pool.files[info.file], line: info.line, col: info.col)
+              if result.len >= limit: return
+    finally:
+      close(s)

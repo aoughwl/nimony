@@ -6,7 +6,7 @@
 
 ## Nimony semantic checker.
 
-import std / [parseopt, sets, strutils, os, assertions, syncio, json]
+import std / [parseopt, sets, strutils, os, assertions, syncio, json, tables]
 
 import ".." / gear2 / modnames
 import ".." / lib / [argsfinder, symparser, nifcursors, nifstreams, nifreader,
@@ -154,6 +154,46 @@ proc jsErr(id: JsonNode; verb, msg: string): JsonNode =
   result = %*{"v": DaemonProtocolVersion, "id": id, "verb": verb,
               "ok": false, "error": msg}
 
+# --------------------------------------------------------------------------
+# Query verbs (defs / usages / symbols): reuse the idetools tracking machinery
+# against the warm program graph, formatted as the JSON "symbols" shape.
+# --------------------------------------------------------------------------
+
+proc buildQueryConfig(req: JsonNode; mode: TrackMode): NifConfig =
+  result = initNifConfig(getCurrentDir())
+  if req.hasKey("nimcache"): result.nifcachePath = req["nimcache"].getStr()
+  if req.hasKey("paths"):
+    for p in req["paths"]: result.paths.add p.getStr()
+  setupPaths(result)
+  result.toTrack = TrackPosition(mode: mode,
+    line: int32(req{"line"}.getInt()),
+    col: int32(req{"col"}.getInt()),
+    filename: req{"file"}.getStr())
+
+proc sNifFiles(config: NifConfig): seq[string] =
+  result = @[]
+  if dirExists(config.nifcachePath):
+    for f in walkFiles(config.nifcachePath / "*.s.nif"): result.add f
+
+proc itemsToJson(id: JsonNode; verb: string; items: seq[IdeItem]): JsonNode =
+  ## Group items by symbol id into the protocol's "symbols" object.
+  var byId = initOrderedTable[string, JsonNode]()
+  var seen = initHashSet[string]()
+  for it in items:
+    let key = symbolName(it.symId)
+    if not byId.hasKey(key):
+      byId[key] = %*{"locations": newJArray()}
+    let locKey = key & "#" & it.file & "#" & $it.line & "#" & $it.col
+    if seen.containsOrIncl(locKey): continue
+    byId[key]["locations"].add %*{
+      "file": it.file, "line": it.line, "col": it.col,
+      "role": (if it.isDef: "def" else: "use")}
+  var syms = newJObject()
+  for k, v in byId: syms[k] = v
+  result = %*{"v": DaemonProtocolVersion, "id": id, "verb": verb,
+              "ok": true, "resolved": byId.len == 1, "symbols": syms}
+
+
 proc handleRequest(req: JsonNode): JsonNode =
   ## Dispatch one v0 envelope. See docs/daemon-protocol.md.
   let id = if req.hasKey("id"): req["id"] else: newJNull()
@@ -187,11 +227,26 @@ proc handleRequest(req: JsonNode): JsonNode =
     result = %*{"v": DaemonProtocolVersion, "id": id, "verb": verb, "ok": true}
   of "shutdown", "quit", "bye":
     result = %*{"v": DaemonProtocolVersion, "id": id, "verb": "shutdown", "ok": true}
-  of "defs", "typeDefinition", "callHierarchy", "symbols":
-    # RESERVED (schema fixed in v0; handler to be implemented). Query responses
-    # are keyed by symbol id under a "symbols" object. These verbs REQUIRE the
-    # warm whole-program symbol graph for exact cross-module overload resolution
-    # (go-to-def, go-to-type-def, call hierarchy). See docs/daemon-protocol.md.
+  of "defs":
+    try:
+      let config = buildQueryConfig(req, TrackDef)
+      result = itemsToJson(id, verb, collectIde(sNifFiles(config), config))
+    except CatchableError as e:
+      result = jsErr(id, verb, e.msg)
+  of "usages", "references":
+    try:
+      let config = buildQueryConfig(req, TrackUsages)
+      result = itemsToJson(id, verb, collectIde(sNifFiles(config), config))
+    except CatchableError as e:
+      result = jsErr(id, verb, e.msg)
+  of "symbols":
+    try:
+      let config = buildQueryConfig(req, TrackNone)
+      result = itemsToJson(id, verb, searchSymbols(sNifFiles(config), req{"query"}.getStr()))
+    except CatchableError as e:
+      result = jsErr(id, verb, e.msg)
+  of "typeDefinition", "callHierarchy":
+    # Still reserved: need type-slot / call-graph resolution over the warm graph.
     result = jsErr(id, verb, "unimplemented in v0 prototype")
   else:
     result = jsErr(id, verb, "unknown verb: " & verb)
@@ -207,7 +262,7 @@ proc serveLoop() =
   while stdin.readLine(line):
     let raw = line.strip()
     if raw.len == 0: continue
-    var req: JsonNode
+    var req: JsonNode = nil
     try:
       req = parseJson(raw)
     except CatchableError as e:

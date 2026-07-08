@@ -1263,8 +1263,17 @@ proc insertType(c: var SemContext; dest: var TokenBuf; typ: TypeCursor; patchPos
   dest.insert t, patchPosition
 
 proc patchType(c: var SemContext; dest: var TokenBuf; typ: TypeCursor; patchPosition: int) =
+  # `patchPosition` currently holds the *user-written* declared type, whose head
+  # token carries the real source position of the type usage. `replace` swaps in
+  # the inferred/unified type cursor `typ`, whose head token instead carries the
+  # type's canonical (definition-site) line info. Preserve the original position
+  # so tooling (idetools) reports the type usage where the user actually wrote it
+  # rather than as a duplicate of some other occurrence of the same type.
+  let oldInfo = dest[patchPosition].info
   let t = skipModifier(typ)
   dest.replace t, patchPosition
+  if oldInfo.isValid and dest[patchPosition].info != oldInfo:
+    dest[patchPosition] = withLineInfo(dest[patchPosition], oldInfo)
 
 proc semIdentImpl(c: var SemContext; dest: var TokenBuf; n: var Cursor; ident: StrId; flags: set[SemFlag]): Sym =
   let mode =

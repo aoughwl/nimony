@@ -415,8 +415,16 @@ else:
     else:
       if dest.data != nil: dealloc(dest.data)
 
+template allocStorage(cap: int): Storage =
+  ## Floors the physical backing at 8 slots. Several contract-analysis paths
+  ## create a zero-capacity buffer, and Nim's default allocator corrupts its
+  ## small-block freelist on an `alloc(0)`/sub-`FreeCell` request (a hard
+  ## SIGSEGV without `-d:useMalloc`). The `cap` field is unchanged; only the
+  ## physical backing is floored, so callers see no behavioural difference.
+  cast[Storage](alloc(sizeof(PackedToken) * max(cap, 8)))
+
 proc createTokenBuf*(cap = 100): TokenBuf =
-  result = TokenBuf(data: cast[Storage](alloc(sizeof(PackedToken)*cap)), len: 0, cap: cap)
+  result = TokenBuf(data: allocStorage(cap), len: 0, cap: cap)
 
 proc prepareMutation*(b: var TokenBuf) {.inline.} =
   ## Detach the buffer from its CursorOwner so the next mutation does
@@ -446,7 +454,7 @@ proc prepareMutation*(b: var TokenBuf) {.inline.} =
       b.owner = nil
       when defined(prepMutStats): inc cowFastCount
     else:
-      let newData = cast[Storage](alloc(sizeof(PackedToken) * b.cap))
+      let newData = allocStorage(b.cap)
       copyMem(newData, b.data, sizeof(PackedToken) * b.len)
       decRcAndFree(b.owner)
       b.owner = nil

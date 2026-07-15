@@ -142,6 +142,14 @@ proc dumpCurrentProc(c: var NjvlContext; info: PackedLineInfo; msg: string) =
   stderr.writeLine toString(c.currentProcStart, false)
   stderr.writeLine "--- end NJ IR dump ---"
 
+proc userSymName(s: string): string =
+  ## Render a local symbol for a user-facing diagnostic: drop the internal
+  ## disambiguator suffix (`result.0` -> `result`, `x.14` -> `x`) so a mangling
+  ## artifact isn't mistaken for something meaningful — e.g. a tuple field index.
+  var base = ""
+  var disamb = 0
+  result = if splitLocalSymName(s, base, disamb): base else: s
+
 proc buildErr(c: var NjvlContext; info: PackedLineInfo; msg: string) =
   when defined(debug):
     writeStackTrace()
@@ -908,7 +916,7 @@ proc traverseExpr(c: var NjvlContext; pc: var Cursor) =
       let x = getLocalInfo(c.typeCache, symId)
       if x.kind in {VarY, LetY, CursorY, PatternvarY, ResultY}:
         if c.tr.live and not isInitialized(c, symId):
-          buildErr(c, pc.info, "cannot prove that " & pool.syms[symId] & " has been initialized")
+          buildErr(c, pc.info, "cannot prove that " & userSymName(pool.syms[symId]) & " has been initialized")
           # don't report the same symbol twice from later references
           markInit(c, symId)
       inc pc
@@ -1872,10 +1880,10 @@ proc traverseProc(c: var NjvlContext; n: var Cursor) =
     # exit, so the init obligation is vacuous — e.g. `proc f: string = raise X`.
     if c.tr.live:
       if c.resultSym != NoSymId and not isInitialized(c, c.resultSym):
-        buildErr c, info, "cannot prove that " & pool.syms[c.resultSym] & " has been initialized"
+        buildErr c, info, "cannot prove that " & userSymName(pool.syms[c.resultSym]) & " has been initialized"
       for sym in outParams:
         if not isInitialized(c, sym):
-          buildErr c, info, "cannot prove that " & pool.syms[sym] & " has been initialized"
+          buildErr c, info, "cannot prove that " & userSymName(pool.syms[sym]) & " has been initialized"
   else:
     skip n
   skipParRi n

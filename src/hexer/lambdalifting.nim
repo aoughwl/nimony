@@ -746,13 +746,21 @@ proc treParams(c: var Context; dest, init: var TokenBuf; n: var Cursor; doAddEnv
         takeTree dest, n # export marker
         takeTree dest, n # pragmas
         c.typeCache.registerLocal(name, ParamY, n)
+        let capturedParamType = n
         treType c, dest, n # type (might grow an environment parameter)
         tre c, dest, n # value
 
         # parameter might have been captured:
         let fld = c.localToEnv.getOrDefault(name)
         if fld.field != SymId(0):
-          # XXX Check here for memory safety violations: Cannot capture a `var T` parameter
+          # Memory-safety backstop (Araq's XXX): a captured `var T` / `out T`
+          # parameter aliases the *caller's* storage, so an environment that
+          # outlives the call would dangle. Sem rejects the common cases; this
+          # is the lowering-level check Araq flagged as still missing here.
+          if capturedParamType.typeKind in {MutT, OutT}:
+            error "cannot capture 'var'/'out' parameter '" &
+              extractVersionedBasename(pool.syms[name]) &
+              "' in a closure: its storage belongs to the caller", capturedParamType
           # We're emitting `outer_env.<field> = <param>` into the
           # body-prologue (treProcBody splices `init` after the
           # env-local decl). `c.env` isn't usable yet — it'll be set

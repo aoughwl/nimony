@@ -3755,6 +3755,11 @@ proc buildObjConstrField(c: var SemContext; dest: var TokenBuf; field: Local;
       dest.addIntLit(depth, info)
     dest.addParRi()
 
+proc caseHasSetField(c: var SemContext; n: Cursor; setFields: Table[SymId, Cursor]): (bool, SymId)
+proc emitNestedCase(c: var SemContext; dest: var TokenBuf; n: var Cursor;
+                    setFields: Table[SymId, Cursor]; info: PackedLineInfo;
+                    bindings: Table[SymId, Cursor]; depth: int)
+
 proc fieldsPresentInInitExpr(c: var SemContext; n: Cursor; setFields: Table[SymId, Cursor]): (bool, SymId) =
   var n = n
   inc n
@@ -3762,9 +3767,47 @@ proc fieldsPresentInInitExpr(c: var SemContext; n: Cursor; setFields: Table[SymI
   if n.substructureKind == NilU:
     return
   while n.hasMore:
-    let local = takeLocal(n, SkipFinalParRi)
-    if local.name.symId in setFields:
-      result = (true, local.name.symId)
+    if n.substructureKind == CaseU:
+      # a nested variant inside this branch: recurse into the nested case,
+      # scanning its discriminator and every branch for a set field.
+      let (nestedHas, nestedSym) = caseHasSetField(c, n, setFields)
+      if nestedHas:
+        result = (true, nestedSym)
+        break
+      skip n
+    else:
+      let local = takeLocal(n, SkipFinalParRi)
+      if local.name.symId in setFields:
+        result = (true, local.name.symId)
+        break
+
+proc caseHasSetField(c: var SemContext; n: Cursor; setFields: Table[SymId, Cursor]): (bool, SymId) =
+  ## `n` is at a `(case (fld sel) (of ...) (of/else ...))` node. Returns whether
+  ## the discriminator or any (possibly deeply nested) branch field is set.
+  result = (false, SymId(0))
+  var n = n
+  inc n # (case -> selector fld
+  let sel = takeLocal(n, SkipFinalParRi)
+  if sel.name.symId in setFields:
+    return (true, sel.name.symId)
+  while n.hasMore:
+    case n.substructureKind
+    of OfU:
+      inc n # (of -> (ranges ...)
+      skip n # skip ranges -> branch body
+      let (has, sym) = fieldsPresentInInitExpr(c, n, setFields)
+      if has:
+        return (true, sym)
+      skip n # skip branch body
+      skipParRi n # close (of
+    of ElseU:
+      inc n # (else -> branch body
+      let (has, sym) = fieldsPresentInInitExpr(c, n, setFields)
+      if has:
+        return (true, sym)
+      skip n # skip branch body
+      skipParRi n # close (else
+    else:
       break
 
 proc asNimSym(symId: SymId): string =
@@ -3860,8 +3903,11 @@ proc fieldsPresentInBranch(c: var SemContext; dest: var TokenBuf; n: var Cursor;
             wrongBranchError(c, dest, info, presentFieldSymId, selectorSymId, getValueInKv(setFields.getOrQuit(selectorSymId)))
           inc n # stmt
           while n.hasMore:
-            let field = takeLocal(n, SkipFinalParRi)
-            buildObjConstrField(c, dest, field, setFields, info, bindings, depth)
+            if n.substructureKind == CaseU:
+              emitNestedCase(c, dest, n, setFields, info, bindings, depth)
+            else:
+              let field = takeLocal(n, SkipFinalParRi)
+              buildObjConstrField(c, dest, field, setFields, info, bindings, depth)
           skipParRi n
           lastFieldSymId = presentFieldSymId
         else:
@@ -3878,8 +3924,11 @@ proc fieldsPresentInBranch(c: var SemContext; dest: var TokenBuf; n: var Cursor;
             wrongBranchError(c, dest, info, presentFieldSymId, selectorSymId, getValueInKv(setFields.getOrQuit(selectorSymId)))
           inc n # stmt
           while n.hasMore:
-            let field = takeLocal(n, SkipFinalParRi)
-            buildObjConstrField(c, dest, field, setFields, info, bindings, depth)
+            if n.substructureKind == CaseU:
+              emitNestedCase(c, dest, n, setFields, info, bindings, depth)
+            else:
+              let field = takeLocal(n, SkipFinalParRi)
+              buildObjConstrField(c, dest, field, setFields, info, bindings, depth)
           skipParRi n # stmt
           lastFieldSymId = presentFieldSymId
         else:
@@ -3900,8 +3949,11 @@ proc fieldsPresentInBranch(c: var SemContext; dest: var TokenBuf; n: var Cursor;
         if bestBranch.substructureKind == NilU:
           skip bestBranch
           break
-        let field = takeLocal(bestBranch, SkipFinalParRi)
-        buildObjConstrField(c, dest, field, setFields, info, bindings, depth)
+        if bestBranch.substructureKind == CaseU:
+          emitNestedCase(c, dest, bestBranch, setFields, info, bindings, depth)
+        else:
+          let field = takeLocal(bestBranch, SkipFinalParRi)
+          buildObjConstrField(c, dest, field, setFields, info, bindings, depth)
       skipParRi bestBranch
 
 proc buildObjConstrFields(c: var SemContext; dest: var TokenBuf; n: var Cursor;
@@ -3921,6 +3973,19 @@ proc buildObjConstrFields(c: var SemContext; dest: var TokenBuf; n: var Cursor;
     else:
       let field = takeLocal(n, SkipFinalParRi)
       buildObjConstrField(c, dest, field, setFields, info, bindings, depth)
+
+proc emitNestedCase(c: var SemContext; dest: var TokenBuf; n: var Cursor;
+                    setFields: Table[SymId, Cursor]; info: PackedLineInfo;
+                    bindings: Table[SymId, Cursor]; depth: int) =
+  ## `n` is at a nested `(case ...)` appearing inside a variant branch body.
+  ## Emit its discriminator field and recurse into the selected/best branch,
+  ## then advance `n` past the whole case. Mirrors `buildObjConstrFields`.
+  var body = n
+  inc body
+  let field = takeLocal(body, SkipFinalParRi)
+  buildObjConstrField(c, dest, field, setFields, info, bindings, depth)
+  fieldsPresentInBranch(c, dest, body, field, setFields, info, bindings, depth)
+  skip n
 
 proc buildDefaultObjConstr(c: var SemContext; dest: var TokenBuf; typ: Cursor;
                            setFields: Table[SymId, Cursor]; info: PackedLineInfo;

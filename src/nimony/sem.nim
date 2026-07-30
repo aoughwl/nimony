@@ -3056,13 +3056,18 @@ proc semFor(c: var SemContext; dest: var TokenBuf; it: var Item) =
 proc semReturn(c: var SemContext; dest: var TokenBuf; it: var Item) =
   let info = it.n.info
   takeToken dest, it.n
-  if c.routine.kind == NoSym:
+  let noRoutine = c.routine.kind == NoSym
+  if noRoutine:
     buildErr c, dest, info, "`return` only allowed within a routine"
   if it.n.kind == DotToken:
     # Templates have no `result` symbol — the `return` is text-substituted
     # into the caller, so the meaning depends on the caller's signature.
     # Preserve the dot and let template expansion resolve it.
-    if c.routine.kind != TemplateY and c.routine.returnType.typeKind != VoidT:
+    # With NO enclosing routine there is no `returnType` cursor at all: reading
+    # its `typeKind` asserts in nifcursors (`c.p != nil and c.rem > 0`), which
+    # turned a plain error into a compiler crash.
+    if not noRoutine and c.routine.kind != TemplateY and
+       c.routine.returnType.typeKind != VoidT:
       dest.addSymUse c.routine.resId, info
       inc it.n # skips the dot
     else:
@@ -3070,8 +3075,9 @@ proc semReturn(c: var SemContext; dest: var TokenBuf; it: var Item) =
   else:
     var a = Item(n: it.n, typ: c.routine.returnType)
     # `return` within a template refers to the caller, so
-    # we allow any type here:
-    if c.routine.kind == TemplateY:
+    # we allow any type here; and outside a routine there is no expected type to
+    # check against, so the error above stands on its own.
+    if c.routine.kind == TemplateY or noRoutine:
       a.typ = c.types.autoType
     semExpr c, dest, a
     it.n = a.n
@@ -3130,7 +3136,10 @@ proc semYield(c: var SemContext; dest: var TokenBuf; it: var Item) =
     takeToken dest, it.n
   else:
     let expectedType =
-      if c.routine.pragmas.contains(PassiveP): c.types.autoType
+      if c.routine.pragmas.contains(PassiveP) or c.routine.kind == NoSym:
+        # No enclosing routine: `returnType` is an empty cursor, and reading it
+        # asserts in nifcursors. The error was already reported above.
+        c.types.autoType
       else: c.routine.returnType
     var a = Item(n: it.n, typ: expectedType)
     semExpr c, dest, a

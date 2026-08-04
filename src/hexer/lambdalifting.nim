@@ -172,6 +172,20 @@ proc itertypeNeedsTuple(n: Cursor): bool {.inline.} =
   ## plain function pointer with the wrapper signature, no tuple wrap.
   n.typeKind == ItertypeT and procHasPragma(n, ClosureP)
 
+proc containsClosureProcType(n: Cursor): bool =
+  ## True when a `{.closure.}` routine type occurs anywhere inside `n`.
+  ## Used on a TYPE BODY: an object field, tuple element or array element can
+  ## be closure-typed, and none of those reach `treType`, so nothing else in
+  ## either pass would notice such a type declaration exists.
+  var n = n
+  if n.kind != ParLe: return false
+  if n.typeKind in RoutineTypes and procHasPragma(n, ClosureP): return true
+  inc n
+  while n.hasMore:
+    if containsClosureProcType(n): return true
+    skip n
+  return false
+
 proc trNil(c: var Context; dest: var TokenBuf; n: var Cursor) =
   let info = n.info
   inc n
@@ -279,6 +293,11 @@ proc tr(c: var Context; dest: var TokenBuf; n: var Cursor) =
         dest.takeParRi n
         programs.publish(typeSym, dest, typeStart)
       else:
+        # A closure-typed field/element is only lowered in pass 2, which runs
+        # solely when pass 1 saw closure pressure. A module that just declares
+        # such a type has none of the other signals (no capture, no `.closure`
+        # proc, no closure-typed `nil`), so record it here.
+        if containsClosureProcType(n): c.hasClosures = true
         while n.hasMore: takeTree dest, n
         dest.takeParRi n
     of IteratorS:
@@ -700,6 +719,27 @@ proc treType(c: var Context; dest: var TokenBuf; n: var Cursor)
   else:
     tre(c, dest, n)
 
+proc treTypeBody(c: var Context; dest: var TokenBuf; n: var Cursor) =
+  ## Copy a type body, lowering every `{.closure.}` routine type inside it to
+  ## its `(tuple <proctype-with-env> (ref RootObj))` shape. `treType` only ever
+  ## sees the type of a LOCAL; object fields are `FldS`, which is not in
+  ## `LocalDecls`, so a closure-typed field used to keep the bare one-word proc
+  ## pointer while every value of it is the two-word tuple.
+  if n.kind != ParLe:
+    takeTree dest, n
+  elif n.typeKind in RoutineTypes and isClosure(n):
+    c.hasClosures = true
+    treProcType c, dest, n
+  elif n.typeKind == TupleT and isLiftedClosureTuple(n):
+    # already the lifted shape -- its fn slot is a closure proctype by
+    # construction, and lowering it again would wrap the tuple in a tuple.
+    takeTree dest, n
+  else:
+    takeToken dest, n
+    while n.hasMore:
+      treTypeBody c, dest, n
+    takeParRi dest, n
+
 proc treLocal(c: var Context; dest: var TokenBuf; n: var Cursor) =
   let s = n.firstSon.symId
   let fld = c.localToEnv.getOrDefault(s)
@@ -1075,7 +1115,24 @@ proc tre(c: var Context; dest: var TokenBuf; n: var Cursor) =
         transformClosureIter c, dest, n
       else:
         takeTree dest, n
-    of MacroS, TemplateS, TypeS, EmitS, BreakS, ContinueS,
+    of TypeS:
+      let typeStart = dest.len
+      dest.takeToken n            # TypeS tag
+      var typeSym = SymId(0)
+      if n.kind == SymbolDef: typeSym = n.symId
+      takeTree dest, n            # name
+      takeTree dest, n            # exported
+      takeTree dest, n            # typevars
+      takeTree dest, n            # pragmas
+      let rewritten = containsClosureProcType(n)
+      while n.hasMore:
+        treTypeBody c, dest, n
+      dest.takeParRi n
+      if rewritten and typeSym != SymId(0):
+        # importers must see the lowered field, not the shape this module
+        # started with.
+        programs.publish(typeSym, dest, typeStart)
+    of MacroS, TemplateS, EmitS, BreakS, ContinueS,
       ForS, IncludeS, ImportS, FromimportS, ImportexceptS,
       ExportS, CommentS,
       PragmasS:

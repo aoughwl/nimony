@@ -3759,7 +3759,33 @@ proc buildObjConstrField(c: var SemContext; dest: var TokenBuf; field: Local;
       # for invoked object types, bindings are built from the given arguments
       # and the field type is instantiated based on them here
       typ = instantiateType(c, typ, bindings)
-    callDefault c, dest, typ, info
+    if field.val.kind != DotToken and bindings.len == 0:
+      # A DECLARED FIELD DEFAULT (`labelCounter: int = 1`) wins over the type's
+      # zero. Without this every field NOT named in `T(a: x)` — and every field
+      # of `default(T)` — silently got `default(fieldType)`, so a type that
+      # states its own starting value never actually had it. `field.val` is
+      # already semchecked at the declaration, so it can be spliced as-is.
+      #
+      # ⚠️ NOT DONE FOR AN INVOKED GENERIC TYPE (`bindings.len != 0`), where the
+      # default still mentions the type's typevars. Substituting it with
+      # `instantiateExprIntoBuf` — the obvious move, and what the first version of
+      # this did — re-sems the expression into `dest` and emits a tree the
+      # post-sem phase validator walks off the end of: it SIGSEGVs in
+      # `collectChildKinds` on tests/nimony/converter/tgenericconverter.nim, and
+      # also breaks tests/nimony/track/ttype_usage.nim. Measured against a
+      # baseline run of the same suite: 587/594 before, 585/594 with the
+      # substitution, 587/594 with this guard — those two were the ONLY delta
+      # (the 7 `nosystem/*` failures are pre-existing in both).
+      #
+      # The gap this leaves is NARROWER than "generics don't work": `bindings` is
+      # only non-empty for an INVOKED object type reached through the parent /
+      # instantiation walk, so an ordinary `G[int](v: 3)` still takes the splice
+      # path and honours its defaults (measured: `n: int = 5` gives 5). What is
+      # still dropped is a field default on an invoked generic reached with live
+      # bindings — a named, small gap instead of a silent wrong answer everywhere.
+      dest.addSubtree field.val
+    else:
+      callDefault c, dest, typ, info
     if depth != 0:
       dest.addIntLit(depth, info)
     dest.addParRi()

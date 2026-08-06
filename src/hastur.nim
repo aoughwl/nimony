@@ -546,10 +546,11 @@ proc warmupSharedCache(): string =
 
 var sharedObjectsPrebuilt = false
   ## `nimcache_static/` holds object files that don't depend on per-project
-  ## state and are reused across every build — currently just mimalloc's
-  ## `static.o`. nifmake's `needsRebuild` is purely mtime-based, so when that
-  ## `.o` is missing on a cold cache every parallel worker independently
-  ## decides to (re)compile `static.c` into the same shared path at once.
+  ## state and are reused across every build with the same `cc` flags —
+  ## currently just mimalloc's `static.o`. nifmake's `needsRebuild` is purely
+  ## mtime-based, so when that `.o` is missing on a cold cache every parallel
+  ## worker independently decides to (re)compile `static.c` into the same
+  ## shared path at once.
   ## The concurrent `cc … -o static.o` writes clobber each other and a
   ## half-written object links with `undefined reference to mi_malloc`. We
   ## build it once, serially, before any worker starts; thereafter the file
@@ -562,13 +563,14 @@ proc prebuildSharedObjects(forward: string) =
   ## does real work; once `static.o` is present the build is a no-op).
   ##
   ## `forward` MUST be the same flag string the test workers pass to nimony
-  ## (e.g. `--cc:clang` on Windows CI). `static.o` lands in the shared
-  ## `nimcache_static/` and is keyed only by mtime, so once we build it the
-  ## workers reuse it verbatim — if we built it with a different compiler than
-  ## the workers link with, the result is an ABI mismatch. Concretely: on
+  ## (e.g. `--cc:clang` on Windows CI). The shared object's name carries a digest
+  ## of the `cc` command it was built with, so a mismatched prebuild can no
+  ## longer be silently reused with the wrong ABI — but it also would not be
+  ## reused *at all*, leaving the workers to race on building it themselves,
+  ## which is the very thing this prebuild exists to prevent. Concretely: on
   ## Windows the tester forwards `--cc:clang` (clang uses native PE TLS); a
-  ## prebuild with the default gcc emits gthr/emulated-TLS `static.o`, and the
-  ## clang+lld worker link then fails with `undefined symbol: pthread_*`.
+  ## prebuild with the default gcc produces a *different* object than the one
+  ## the clang workers need, so the prebuild buys nothing.
   if sharedObjectsPrebuilt: return
   sharedObjectsPrebuilt = true
   let nimony = toolExe("nimony")
@@ -595,15 +597,12 @@ proc prebuildSharedObjects(forward: string) =
   # mimalloc's build pragma no longer bakes in `-DMI_TRACK_VALGRIND=1` (that
   # made the valgrind dev headers a hard build dependency for every nimony
   # program); valgrind tracking is now requested purely via this `--passC`.
-  # But the shared `static.o` is keyed only by mtime, so a prior *non*-valgrind
-  # build (e.g. a plain `bin/nimony c foo.nim`) can leave a stale, untracked
-  # `static.o` that nifmake would happily reuse — silently running the valgrind
-  # tests against non-tracked mimalloc. Delete it so this valgrind-tracked
-  # variant is always freshly produced.
+  # The shared object is keyed on the `cc` command (see `sharedObjFile` in
+  # deps.nim), so the valgrind-tracked variant has its own name and coexists
+  # with the plain one — no deletion needed, and a plain `bin/nimony c foo.nim`
+  # can no longer leave a stale untracked object in the slot these tests read.
   when defined(linux):
     if hasValgrind:
-      try: removeFile("nimcache_static" / "static.o")
-      except OSError: discard
       cmd.add " --passC:\"-DMI_TRACK_VALGRIND=1\""
   cmd.add ' ' & src.quoteShell
   if execShellCmd(cmd) != 0:

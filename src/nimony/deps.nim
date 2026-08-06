@@ -799,8 +799,35 @@ proc sharedObjDir(): string =
   ## across nimcaches saves ~4-5 s per cold build on Windows.
   result = parentDir(stdlibDir()) / "nimcache_static"
 
-proc sharedObjFile(cfile: CFile): string =
-  sharedObjDir() / cfile.obj
+proc ccIdentity(ccFlags: openArray[string]; customArgs: string): string =
+  ## Short stable digest (FNV-1a, hand-rolled so it means the same thing under
+  ## both the Nim and the Nimony build of this compiler) of the exact `cc`
+  ## invocation a `.compile`d TU is built with: the driver flags shared by every
+  ## TU plus that TU's own `{.compile.}` arguments.
+  var h: uint64 = 0xcbf29ce484222325'u64
+  for f in ccFlags:
+    for ch in f:
+      h = (h xor uint64(ord(ch))) * 0x100000001b3'u64
+    h = (h xor 0x20'u64) * 0x100000001b3'u64   # separator: `-DA -DB` != `-DA-DB`
+  for ch in customArgs:
+    h = (h xor uint64(ord(ch))) * 0x100000001b3'u64
+  const Digits = "0123456789abcdef"
+  result = ""
+  var shift = 60
+  while shift >= 0:
+    result.add Digits[int((h shr uint64(shift)) and 0xf'u64)]
+    shift -= 4
+
+proc sharedObjFile(cfile: CFile; ccFlags: openArray[string]): string =
+  ## `nimcache_static/` is shared by every nimony build on the machine, so the
+  ## object's NAME must carry the flags it was built with: keyed by basename
+  ## alone, a `-O0` debug build, a `--cc:clang` build and a test run injecting
+  ## `--passC:-DMI_TRACK_VALGRIND=1` all write the one `static.o` slot and then
+  ## silently hand their allocator to every other project — including builds
+  ## already running in another session. A cache key that omits an input is a
+  ## wrong answer waiting for a second consumer.
+  sharedObjDir() / (splitFile(cfile.obj).name & "_" &
+                    ccIdentity(ccFlags, cfile.customArgs) & splitFile(cfile.obj).ext)
 
 proc defineNiflerCmd(b: var Builder; nifler: string; preserveDocs = false) =
   b.withTree "cmd":
@@ -1077,20 +1104,23 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string; passC, 
     # Command for hexer
     defineHexerCmds(b, hexer, c.config.bits, platform.CPU[c.config.targetCPU].endian == bigEndian, c.config.checkFlags)
 
-    # Command for C/LLVM compiler (object files)
-    b.withTree "cmd":
-      b.addSymbolDef "cc"
+    # Command for C/LLVM compiler (object files). The flags are collected into a
+    # seq first rather than emitted inline because the shared `nimcache_static/`
+    # objects are KEYED on them (see `sharedObjFile`); building the list once
+    # keeps the key and the actual command line from drifting apart.
+    var ccFlags: seq[string] = @[]
+    block:
       if c.config.backend == backendLLVM:
-        b.addStrLit "clang"
+        ccFlags.add "clang"
       elif nativeSysLink:
         # Compiles the `.compile`d TUs (e.g. Objective-C `.m`); same driver that
         # links them, so the toolchain/ABI matches.
-        b.addStrLit sysLinker
+        ccFlags.add sysLinker
       else:
-        b.addStrLit c.config.cc
-      b.addStrLit "-c"
+        ccFlags.add c.config.cc
+      ccFlags.add "-c"
       # Suppress visibility-attribute warnings from mimalloc etc. (GCC/Clang)
-      b.addStrLit "-Wno-attributes"
+      ccFlags.add "-Wno-attributes"
       # Note on TLS for clang/Windows: clang emits native PE TLS by default,
       # which is what we want — `__thread` access compiles to a single
       # `gs:0x58` load instead of a `__emutls_get_address` call. ld.bfd
@@ -1100,24 +1130,29 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string; passC, 
       # here.
       # Add -fPIC for shared libraries
       if c.config.appType == appLib:
-        b.addStrLit "-fPIC"
+        ccFlags.add "-fPIC"
       # Optimization level. Even the default ("debug") gets -O1: in
       # practice it produces code that's just as easy to step through
       # as -O0, while letting the C compiler skip the truly silly
       # codegen patterns (per-statement spills, dead stores, etc.).
       case c.config.optLevel
-      of optDebug: b.addStrLit "-O1"
-      of optNone:  b.addStrLit "-O0"
-      of optSize:  b.addStrLit "-Os"
-      of optSpeed: b.addStrLit "-O3"
+      of optDebug: ccFlags.add "-O1"
+      of optNone:  ccFlags.add "-O0"
+      of optSize:  ccFlags.add "-Os"
+      of optSpeed: ccFlags.add "-O3"
       if passC.len > 0:
         for arg in passC.split(' '):
           if arg.len > 0:
-            b.addStrLit arg
+            ccFlags.add arg
       for i in c.passC:
-        b.addStrLit i
+        ccFlags.add i
       if c.config.backend == backendC:
-        b.addStrLit "-I" & rootPath(c)
+        ccFlags.add "-I" & rootPath(c)
+
+    b.withTree "cmd":
+      b.addSymbolDef "cc"
+      for f in ccFlags:
+        b.addStrLit f
       b.addKeyw "args"
       b.addKeyw "input"
       b.addStrLit "-o"
@@ -1326,7 +1361,7 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string; passC, 
           # the dedup must happen here (not only on the DO-node ordering inputs).
           var seenObjs = initHashSet[string]()
           for cfile in c.toBuild:
-            let o = sharedObjFile(cfile)
+            let o = sharedObjFile(cfile, ccFlags)
             if not seenObjs.containsOrIncl(o): objs.add o
           for v in c.nodes:
             let o = c.config.objFile(v.files[0], backend)
@@ -1400,7 +1435,7 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string; passC, 
             b.addStrLit nativeObj
           objFiles.incl nativeObj
           for cfile in c.toBuild:
-            let obj = sharedObjFile(cfile)
+            let obj = sharedObjFile(cfile, ccFlags)
             if not objFiles.containsOrIncl(obj):
               b.withTree "input":
                 b.addStrLit obj
@@ -1435,7 +1470,7 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string; passC, 
       # that uses the `.compile` pragma (`nativeSysLink`) compiles them.
       if (not native) or nativeSysLink:
         for cfile in c.toBuild:
-          let obj = sharedObjFile(cfile)
+          let obj = sharedObjFile(cfile, ccFlags)
           if not objFiles.containsOrIncl(obj):
             b.withTree "do":
               b.addIdent "cc"

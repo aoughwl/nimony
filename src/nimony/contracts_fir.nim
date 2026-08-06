@@ -399,6 +399,12 @@ proc checkRangeAssign(c: var NjvlContext; targetType, value: Cursor;
     case value.kind
     of IntLit: off = createXint(pool.integers[value.intId]); isLit = true
     of UIntLit: off = createXint(pool.uintegers[value.uintId]); isLit = true
+    of CharLit:
+      # A char literal is as ordinal as an int literal — `var c: range['a'..'z']
+      # = 'b'` was rejected with "cannot prove value is in range 97..122" purely
+      # because this case was missing and the literal fell through to the
+      # unmodellable branch. `getConstOrdinalValue` reads it the same way.
+      off = createXint(value.uoperand); isLit = true
     else:
       # A value we cannot model cannot be proven in range. Reject it, unless a
       # runtime range check will catch it (see `runtimeChecked`).

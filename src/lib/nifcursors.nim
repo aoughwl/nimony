@@ -296,7 +296,18 @@ template hasMore*(n: Cursor): bool =
   when defined(virtualParRi):
     n.rem > 0 and n.kind != ParRi
   else:
-    n.kind != ParRi
+    # The `rem > 0` guard belongs in BOTH branches. Without it this contradicts
+    # the contract two lines up: `n.kind` calls `load`, whose first statement is
+    # `assert c.p != nil and c.rem > 0`, so an exhausted cursor DIES here instead
+    # of answering `false`.
+    #
+    # It is reached from the ERROR PATH. `resolveOverloads` renders the call it
+    # could not resolve, via `asNimCode` -> `renderTree` -> `gcallComma`, and a
+    # cursor that has run out is exactly what an unresolvable call hands it. The
+    # compiler then dies while REPORTING an error instead of reporting it, which
+    # is strictly worse than a bad message -- nothing downstream can see the
+    # diagnosis at all.
+    n.rem > 0 and n.kind != ParRi
 
 template into*(n: var Cursor; body: untyped) =
   ## Enters the current ParLe node, runs `body` to process the children,

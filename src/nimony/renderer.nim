@@ -15,9 +15,16 @@ import std/[strutils, assertions, formatfloat]
 ## Rendering of Nim code from a cursor.
 
 proc skipParRi(n: var Cursor) =
-  if n.hasMore:
-    raiseAssert "expected ')' but got: " & $n & " (expr=" & $n.exprKind &
-      ", stmt=" & $n.stmtKind & ", type=" & $n.typeKind & ")"
+  # A RENDERER MUST NOT ASSERT. This is reached from `asNimCode`, i.e. while
+  # BUILDING A DIAGNOSTIC for something the compiler could not resolve -- so the
+  # tree is unusual by definition, which is exactly when this runs. Raising here
+  # replaces the message the user needed with a traceback, and the compiler then
+  # prints `Errors: 0` and exits non-zero, because the count is emitted before
+  # the message. That makes the error count from such a run a lie.
+  #
+  # Skipping what we are not positioned on renders a slightly wrong message.
+  # That is strictly better than rendering none.
+  if n.hasMore: return
   consumeParRi n
 
 type

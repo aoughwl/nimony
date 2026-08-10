@@ -186,11 +186,19 @@ proc consumeParRi*(c: var Cursor) {.inline.} =
   ## may sit at the bounded scope's tail without being counted in `rem`,
   ## so plain `inc` would trip its `rem != 0` guard — we accept rem == 0
   ## and just advance the pointer.
-  assert c.kind == ParRi, "consumeParRi: cursor not at ParRi"
+  # AN EXHAUSTED CURSOR HAS NOTHING TO CONSUME. `c.kind` calls `load`, whose
+  # first statement is `assert c.p != nil and c.rem > 0`, so the assertion below
+  # was itself crashing on the very case it exists to describe. Reached from the
+  # error path, where the cursor has run out precisely because the tree being
+  # rendered is the unusual one.
+  if c.p == nil: return
   when defined(virtualParRi):
+    if c.rem > 0: assert c.kind == ParRi, "consumeParRi: cursor not at ParRi"
     c.p = cast[ptr PackedToken](cast[uint](c.p) + sizeof(PackedToken).uint)
     if c.rem > 0: dec c.rem
   else:
+    if c.rem <= 0: return
+    assert c.kind == ParRi, "consumeParRi: cursor not at ParRi"
     inc c
 
 # `setTag(PackedToken, TagId)` lives in nifstreams now (gated by `-d:virtualParRi`)

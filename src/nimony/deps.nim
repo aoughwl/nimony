@@ -1146,8 +1146,20 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string; passC, 
             ccFlags.add arg
       for i in c.passC:
         ccFlags.add i
-      if c.config.backend == backendC:
-        ccFlags.add "-I" & rootPath(c)
+      # NB: the project's own include path is deliberately NOT here. It is a
+      # cwd-RELATIVE path (`rootPath`), and everything in `ccFlags` is part of
+      # `ccIdentity`, i.e. part of the NAME of the shared objects in
+      # `nimcache_static/`. With it here, the same program built from its own
+      # directory and from its parent produced two differently-named copies of
+      # mimalloc's `static.o` — measured 2026-08-16, `static_e1f81b58197cd00b.o`
+      # and `static_5083d71df367201c.o` — so the directory that exists to compile
+      # that TU ONCE for the whole machine instead grew one object per (cwd ×
+      # flags), with no GC and no sharing.
+      #
+      # It belongs to the generated project TUs, which are the only ones that
+      # include project headers, so it is passed per-node in their `args` slot
+      # below. A `{.compile.}`d TU that genuinely needs a project header can say
+      # so in its own pragma arguments, which are already in its identity.
 
     b.withTree "cmd":
       b.addSymbolDef "cc"
@@ -1495,6 +1507,14 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string; passC, 
               b.addIdent "cc"
               b.withTree "input":
                 b.addStrLit c.config.genFile(v.files[0], backend)
+              if c.config.backend == backendC:
+                # The project's own include path: per-node, because these are the
+                # TUs that include project headers, and because a cwd-relative
+                # path in the shared `ccFlags` would key the machine-wide
+                # `nimcache_static/` objects on the caller's cwd. See the comment
+                # where it used to live.
+                b.withTree "args":
+                  b.addStrLit "-I" & rootPath(c)
               b.withTree "output":
                 b.addStrLit obj
 

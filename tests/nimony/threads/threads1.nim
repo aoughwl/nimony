@@ -34,8 +34,10 @@ proc main =
       return
   echo "all threads found"
 
-when not defined(windows):
-  main()
-else:
-  echo "other"
-  echo "all threads found"
+# Windows used to be stubbed out here, because std/rawthreads did not COMPILE on
+# Windows (CreateThread arguments 3 and 6: DWORD is `unsigned long`, nimony's
+# `uint32` is `unsigned int`, and GCC 14 makes that an error rather than a
+# warning). The stub printed the expected output, so the lane was green while
+# nothing ran. With rawthreads using `culong` for the DWORD-typed arguments the
+# real thing runs here, so run it.
+main()

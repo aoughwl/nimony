@@ -73,7 +73,10 @@ proc main =
   else:
     echo "parfor FAIL"
 
-when not defined(windows):
-  main()
-else:
-  echo "parfor ok"
+# Windows used to be stubbed out here: std/rawthreads did not COMPILE on Windows
+# (CreateThread arguments 3 and 6 -- DWORD is `unsigned long`, nimony's `uint32`
+# is `unsigned int`, and GCC 14 makes that an error, not a warning). The stub
+# echoed this file's expected output, so the lane was green while nothing ran.
+# With rawthreads spelling the DWORD-typed arguments `culong`, the real thing
+# runs here and produces that output for the right reason.
+main()

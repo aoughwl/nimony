@@ -214,13 +214,22 @@ proc trFailed(c: var Context; dest: var TokenBuf; n: var Cursor) =
   c.nextRaiseIsSpecial = true
 
 proc trCall(c: var Context; dest: var TokenBuf; n: var Cursor; targetExpectsTuple: bool) =
-  var fnType = skipProcTypeToParams(getType(c.typeCache, n.firstSon))
-  assert fnType.tagEnum == ParamsTagId
-  var pragmas = fnType
-  skip pragmas
-  let retType = pragmas
-  skip pragmas
-  let canRaise = hasPragma(pragmas, RaisesP)
+  var fnType = skipProcTypeToParams(getType(c.typeCache, n.firstSon, {SkipAliases}))
+  # An indirect call through a closure-typed value (a stored `{.closure.}`
+  # proc) has no static `(params ...)` list - its runtime type is a
+  # (proc-pointer, environment-pointer) tuple. There is then no per-param
+  # mut/lent/const-ref/varargs info to consult, so fall back to the plain
+  # `tr` transform for every argument (the same thing this loop already
+  # does for an ordinary by-value parameter) instead of asserting.
+  let haveParams = fnType.tagEnum == ParamsTagId
+  var canRaise = false
+  var retType = fnType
+  if haveParams:
+    var pragmas = fnType
+    skip pragmas
+    retType = pragmas
+    skip pragmas
+    canRaise = hasPragma(pragmas, RaisesP)
   var needsTuple = (not targetExpectsTuple and canRaise) or
                    (targetExpectsTuple and not canRaise)
   if needsTuple:
@@ -230,8 +239,12 @@ proc trCall(c: var Context; dest: var TokenBuf; n: var Cursor; targetExpectsTupl
   inc n # skip `(call)`
   tr c, dest, n # handle `fn`
 
-  inc fnType
+  if haveParams:
+    inc fnType
   while n.hasMore:
+    if not haveParams:
+      tr c, dest, n
+      continue
     let previousFormalParam = fnType
     if fnType.kind == ParRi:
       tr c, dest, n # can happen for closure parameter

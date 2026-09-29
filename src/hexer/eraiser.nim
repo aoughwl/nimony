@@ -113,8 +113,16 @@ proc localsThatBecomeTuples*(n: Cursor): HashSet[SymId] =
   collectTupleLocals(n, hasRaisesPragma, result)
 
 proc callCanRaise*(typeCache: var TypeCache; n: Cursor): bool =
-  var fnType = skipProcTypeToParams(getType(typeCache, n.firstSon))
-  assert fnType.tagEnum == ParamsTagId
+  var fnType = skipProcTypeToParams(getType(typeCache, n.firstSon, {SkipAliases}))
+  if fnType.tagEnum != ParamsTagId:
+    # The callee's statically-known type isn't a routine-params list - e.g.
+    # calling through a `{.closure.}`-typed field/variable, whose runtime
+    # representation is a (proc-pointer, environment-pointer) tuple rather
+    # than a `(params ...)` type. We have no static params/pragma list to
+    # inspect in that case; conservatively report "cannot raise" rather than
+    # asserting - this only forgoes the raise-forwarding optimization for an
+    # indirect call, it does not affect correctness.
+    return false
   skip fnType # params
   skip fnType # return type
   # now pragmas follow:
@@ -124,13 +132,18 @@ proc trCall(c: var Context; dest: var TokenBuf; n: var Cursor; inhibit: bool) =
   let head = n.load()
   let info = n.info
   inc n # skip `(call)`
-  var fnType = skipProcTypeToParams(getType(c.typeCache, n))
-  assert fnType.tagEnum == ParamsTagId
-  skip fnType # params
-  let retType = fnType
-  skip fnType # return type
-  # now pragmas follow:
-  let canRaise = hasPragma(fnType, RaisesP)
+  var fnType = skipProcTypeToParams(getType(c.typeCache, n, {SkipAliases}))
+  var canRaise = false
+  var retType = fnType
+  if fnType.tagEnum == ParamsTagId:
+    skip fnType # params
+    retType = fnType
+    skip fnType # return type
+    # now pragmas follow:
+    canRaise = hasPragma(fnType, RaisesP)
+  # else: same situation as in callCanRaise - an indirect call through a
+  # closure-typed value has no static `(params ...)` list to consult, so
+  # conservatively report "cannot raise" rather than asserting.
   if canRaise and not inhibit:
     c.needsXelim = true
     let isVoid = retType.kind == DotToken or retType.typeKind == VoidT

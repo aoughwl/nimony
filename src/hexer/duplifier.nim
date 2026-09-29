@@ -798,24 +798,32 @@ proc trCall(c: var Context; n: var Cursor; e: Expects)
     ow = bindToTemp(c, retType, n.info)
 
   takeToken c.dest, n # take `(call)`
-  var fnType = skipProcTypeToParams(getType(c.typeCache, n))
+  var fnType = skipProcTypeToParams(getType(c.typeCache, n, {SkipAliases}))
+  # An indirect call through a closure-typed value (a stored `{.closure.}`
+  # proc, e.g. a manual-vtable field) has no static `(params ...)` list to
+  # walk - its runtime type is a (proc-pointer, environment-pointer) tuple,
+  # not a routine type. In that case we can't know each parameter's
+  # sink/varargs-ness, so fall back to the always-safe WantNonOwner for
+  # every argument instead of asserting.
+  let haveParams = fnType.substructureKind == ParamsU
 
   tr c, n, DontCare # transforms `fn` because it may be an expression that requires further handling
-  assert fnType.substructureKind == ParamsU
-  inc fnType
+  if haveParams:
+    inc fnType
   while n.hasMore:
-    let previousFormalParam = fnType
     var e2 = WantNonOwner
-    if fnType.kind == ParRi:
-      discard "this can happen for closure parameters"
-    else:
-      let param = takeLocal(fnType, SkipFinalParRi)
-      let pk = param.typ.typeKind
-      if pk == SinkT:
-        e2 = WantOwner
-      elif pk == VarargsT:
-        # do not advance formal parameter:
-        fnType = previousFormalParam
+    if haveParams:
+      let previousFormalParam = fnType
+      if fnType.kind == ParRi:
+        discard "this can happen for closure parameters"
+      else:
+        let param = takeLocal(fnType, SkipFinalParRi)
+        let pk = param.typ.typeKind
+        if pk == SinkT:
+          e2 = WantOwner
+        elif pk == VarargsT:
+          # do not advance formal parameter:
+          fnType = previousFormalParam
     tr c, n, e2
   takeParRi c.dest, n
   finishOwningTemp c.dest, ow

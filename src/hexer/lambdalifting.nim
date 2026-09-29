@@ -922,7 +922,18 @@ proc genCall(c: var Context; dest: var TokenBuf; n: var Cursor) =
           var t = typ
           tre c, dest, t
           tre c, dest, n # value
-      dest.addSymUse tmp, info
+      # the ExprX's result is the CALLEE, i.e. field 0 (the function
+      # pointer) of the closure tuple just stashed in `tmp` - not the
+      # whole tuple. The Symbol-callee branch above already does this
+      # (`TupatX(sym, 0)`); this generic branch (any other closure-typed
+      # callee expression, e.g. a dot-expression field access like
+      # `obj.field(...)`) omitted it, so the whole 2-field tuple value
+      # was emitted directly in callee position instead of just the fn
+      # pointer - the C backend then rejected it as "not a function or
+      # function pointer" at the call site.
+      copyIntoKind dest, TupatX, info:
+        dest.addSymUse tmp, info
+        dest.addIntLit 0, info
       dest.addParRi() # ExprX
   while n.hasMore:
     tre(c, dest, n)

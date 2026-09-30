@@ -982,6 +982,70 @@ proc treKv(c: var Context; dest: var TokenBuf; n: var Cursor) =
     while n.hasMore:
       tre(c, dest, n)
 
+proc isFlatObjectFields(n: Cursor): bool =
+  ## Peek-only (writes nothing): true iff an ObjectT body `n` is a plain
+  ## list of `fld`/`gfld` children (no `when`/`case`-in-object, which have
+  ## a nested shape `treFlatObjectFields` below doesn't attempt to handle).
+  var probe = n
+  inc probe # skip ObjectT opener
+  skip probe # base type usage
+  while probe.kind != ParRi:
+    if probe.substructureKind notin {FldU, GfldU}:
+      return false
+    inc probe # into (fld ...)
+    skip probe # symdef
+    skip probe # export marker
+    skip probe # pragmas
+    skip probe # type
+    skip probe # default value
+    skipParRi probe
+  result = true
+
+proc treFlatObjectFields(c: var Context; dest: var TokenBuf; n: var Cursor) =
+  ## Rewrites a flat ObjectT body's fields, `tre`-ing each field's TYPE
+  ## the same way `genObjectTypes` already does for its own
+  ## auto-generated env-frame fields (see there) - so a
+  ## `proc(...) {.closure.}`-typed field gets the same 2-word
+  ## (fn-ptr, env-ptr) tuple C representation a closure VALUE/CALL
+  ## already gets via `treProcType`/`genCall`, instead of silently
+  ## keeping its untransformed (collapses-to-bare-function-pointer)
+  ## type while values assigned into it go through the tuple rewrite -
+  ## a genuine field-type-vs-assigned-value mismatch at C-codegen.
+  ## Caller (`treTypeSection`) has already confirmed via
+  ## `isFlatObjectFields` that this shape applies.
+  dest.takeToken n # ObjectT opener
+  dest.takeTree n # base type usage
+  while n.kind != ParRi:
+    dest.takeToken n # (fld / (gfld opener
+    dest.takeTree n # symdef
+    dest.takeTree n # export marker
+    dest.takeTree n # pragmas
+    tre(c, dest, n) # TYPE - the actual rewrite
+    dest.takeTree n # default value
+    dest.takeParRi n # close (fld / (gfld
+  dest.takeParRi n # close ObjectT
+
+proc treTypeSection(c: var Context; dest: var TokenBuf; n: var Cursor) =
+  ## A `type` section is copied through UNCHANGED, except when its body
+  ## is a flat object type (see `isFlatObjectFields`) - there, each
+  ## field's type is rewritten via `treFlatObjectFields` so closure-typed
+  ## fields agree with how closure values/calls are lowered elsewhere in
+  ## this pass. Anything else (generics, distinct/enum/concept aliases,
+  ## or an object body with `when`/`case`) falls back to the old
+  ## verbatim-copy behaviour untouched.
+  var body = n
+  inc body # into TypeS
+  for i in 0 ..< 3: skip body # name, export marker, generic params
+  skip body # pragmas
+  if body.typeKind == ObjectT and isFlatObjectFields(body):
+    dest.takeToken n # TypeS opener
+    for i in 0 ..< 3: dest.takeTree n # name, export marker, generic params
+    dest.takeTree n # pragmas
+    treFlatObjectFields(c, dest, n)
+    dest.takeParRi n # close TypeS
+  else:
+    takeTree dest, n
+
 proc tre(c: var Context; dest: var TokenBuf; n: var Cursor) =
   case n.kind
   of Symbol:
@@ -1078,7 +1142,9 @@ proc tre(c: var Context; dest: var TokenBuf; n: var Cursor) =
         transformClosureIter c, dest, n
       else:
         takeTree dest, n
-    of MacroS, TemplateS, TypeS, EmitS, BreakS, ContinueS,
+    of TypeS:
+      treTypeSection(c, dest, n)
+    of MacroS, TemplateS, EmitS, BreakS, ContinueS,
       ForS, IncludeS, ImportS, FromimportS, ImportexceptS,
       ExportS, CommentS,
       PragmasS:

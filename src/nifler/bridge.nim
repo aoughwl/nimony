@@ -455,10 +455,10 @@ proc toNif*(n, parent: PNode; c: var TranslationContext; allowEmpty = false) =
     c.b.addTree(StmtsL)
     relLineInfo(n, parent, c)
     for i in 0..<n.len-1:
-      toNif(n[i], n, c)
+      toNif(n[i], n, c, allowEmpty = true)
     c.b.endTree()
     if n.len > 0:
-      toNif(n[n.len-1], n, c)
+      toNif(n[n.len-1], n, c, allowEmpty = true)
     else:
       c.b.addEmpty
     c.b.endTree()

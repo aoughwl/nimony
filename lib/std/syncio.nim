@@ -504,6 +504,10 @@ else:
         if buf[i] == '\n':
           done = true
           break
+        # fgets writes at most bufsize-1 chars and then a NUL. Copying past it
+        # appended '\0' into every line of >= 80 chars (and stale bytes after a
+        # short chunk), so a 120-char line read back as 121 with a "space".
+        if buf[i] == '\0': break
         s.add buf[i]
       if done: break
 

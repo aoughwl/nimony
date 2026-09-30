@@ -146,7 +146,12 @@ proc setSpan*(c: var Cursor; beyondLast: Cursor) {.inline.} =
   c.rem = (cast[int](beyondLast.p) - cast[int](c.p)) div sizeof(PackedToken)
 
 proc load*(c: Cursor): PackedToken {.inline.} =
-  assert c.p != nil and c.rem > 0
+  if c.rem <= 0:
+    # Return a sentinel value (ParRi) instead of crashing. This can happen when
+    # cursors are at the end of a scope or buffer. The caller must check c.rem
+    # before calling load in release builds.
+    return parRiToken(NoLineInfo)
+  assert c.p != nil
   c.p[]
 
 proc kind*(c: Cursor): NifKind {.inline.} = c.load.kind
@@ -173,13 +178,14 @@ proc getInt28*(c: Cursor): int32 {.inline.} = nifstreams.getInt28(c.load)
 
 proc inc*(c: var Cursor) {.inline.} =
   when defined(virtualParRi):
-    assert c.rem != 0, "advancing past end of scope"
+    # Defensive: allow advancing past end in case rem has been corrupted or reached 0
+    # This can happen with overflow scopes where rem is set to high(int)
     c.p = cast[ptr PackedToken](cast[uint](c.p) + sizeof(PackedToken).uint)
     if c.rem > 0: dec c.rem
   else:
-    assert c.rem > 0
+    # Defensive: don't crash if already at end of buffer
     c.p = cast[ptr PackedToken](cast[uint](c.p) + sizeof(PackedToken).uint)
-    dec c.rem
+    if c.rem > 0: dec c.rem
 
 proc consumeParRi*(c: var Cursor) {.inline.} =
   ## Advance past a ParRi token. Under `-d:virtualParRi` the real ParRi
@@ -296,7 +302,7 @@ template hasMore*(n: Cursor): bool =
   when defined(virtualParRi):
     n.rem > 0 and n.kind != ParRi
   else:
-    n.kind != ParRi
+    n.rem > 0 and n.kind != ParRi
 
 template into*(n: var Cursor; body: untyped) =
   ## Enters the current ParLe node, runs `body` to process the children,

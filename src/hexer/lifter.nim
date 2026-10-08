@@ -675,7 +675,9 @@ proc unravelArray(c: var LiftingCtx;
         let a = accessArrayAt(c, paramA, indexVar)
         #unravel c, fieldType, fieldType, a, paramB
         let fn = lift(c, baseType)
-        maybeCallHook c, fn, a, paramA
+        # =trace: the second argument is the visitor env, not the array
+        if c.op == attachedTrace: maybeCallHook c, fn, a, paramB
+        else: maybeCallHook c, fn, a, paramA
       of attachedCopy, attachedDup, attachedSink:
         let a = accessArrayAt(c, paramA, indexVar, 0)
         let b = accessArrayAt(c, paramB, indexVar, 1)

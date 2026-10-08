@@ -1,4 +1,6 @@
 import std/syncio
+when not defined(aowlgc):
+  proc GC_fullCollect() = discard
 
 type
   Node = ref object

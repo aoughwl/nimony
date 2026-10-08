@@ -1010,7 +1010,16 @@ proc tr(c: var Context; dest: var TokenBuf; n: var Cursor; isTopScope = false) =
         trLocal c, dest, n
       of ProcS, FuncS, MethodS, ConverterS:
         trProc c, dest, n
-      of MacroS, IteratorS, TemplateS, EmitS, BreakS, ContinueS,
+      of IteratorS:
+        # `.closure` iterators survive to lambdalifting/coro_transform and
+        # become real routines, so their bodies need desugaring like a proc
+        # body (`ddot` on refs, set ops, ...). Inline iterator decls are dead
+        # here (elimForLoops inlined every use) and stay untouched.
+        if hasPragma(asRoutine(n).pragmas, ClosureP):
+          trProc c, dest, n
+        else:
+          takeTree dest, n
+      of MacroS, TemplateS, EmitS, BreakS, ContinueS,
         ForS, IncludeS, ImportS, FromimportS, ImportexceptS,
         ExportS, CommentS,
         PragmasS:

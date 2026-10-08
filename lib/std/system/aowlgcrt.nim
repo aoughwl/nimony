@@ -205,12 +205,18 @@ proc rtNew(slot: ptr int32; size: int; trace, fin: pointer): pointer {.exportc: 
     if tid == TypeId(0): tid = registerSlot(slot, size, gFamRef, trace, fin)
   result = alloc(gHeap, tid)
 
-proc rtNewStore(slot: ptr int32; bytes: int; trace, fin: pointer): pointer {.exportc: "aowlgcNewStore", cdecl.} =
+proc rtNewStore(slot: ptr int32; bytes: int; trace: AowlgcTracer; fin: AowlgcFinalizer): pointer {.exportc: "aowlgcNewStore", cdecl.} =
+  # same C signature as system's importc declaration (one TU may see both)
   var tid = TypeId(slot[])
   if tid == TypeId(0) or isNilP(cast[pointer](gHeap)):
     if isNilP(cast[pointer](gHeap)): initHeap()
     tid = TypeId(slot[])
-    if tid == TypeId(0): tid = registerSlot(slot, 8, gFamStore, trace, fin)
+    if tid == TypeId(0):
+      var tp = cast[pointer](0)
+      var fp = cast[pointer](0)
+      if trace != nil: copyMem(addr tp, addr trace, sizeof(pointer))
+      if fin != nil: copyMem(addr fp, addr fin, sizeof(pointer))
+      tid = registerSlot(slot, 8, gFamStore, tp, fp)
   result = allocSized(gHeap, tid, bytes)
 
 proc rtMark(env, p: pointer) {.exportc: "aowlgcMark", cdecl.} =

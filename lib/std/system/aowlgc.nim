@@ -9,8 +9,17 @@
 #
 # The heap itself is `aowlgc_rt.c` until the `heap` library replaces it; only
 # this file and that one know which implementation is in use.
+#
+# `-d:aowlgcExtern` (aowlvm DESIGN §6 / P11 stage 3): do NOT compile the private
+# `aowlgc_rt.c` runtime into this module. The `aowlgc*` symbols below stay
+# `importc`-only (undefined in the object), so a single HOST (the titicaca join
+# binary, linked -rdynamic) provides them for the whole process over the shared
+# `agentwork/heap` instance. A post-build `nm` check (fail-closed) asserts a
+# module built with this flag DEFINES no `aowlgc*` symbol, so a second runtime
+# can never creep back in.
 
-{.compile("${path}/aowlgc_rt.c", "-O2").}
+when not defined(aowlgcExtern):
+  {.compile("${path}/aowlgc_rt.c", "-O2").}
 
 proc aowlgcNew*(size: int; trace, fin: pointer): pointer {.importc: "aowlgcNew".}
   ## Compiler hook: a zeroed heap object of `size` bytes whose type-info entry

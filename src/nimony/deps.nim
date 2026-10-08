@@ -1583,6 +1583,11 @@ proc initDepContext(config: sink NifConfig; project, nifler: string; isFinal, fo
   result.nodes.add root
   result.processedModules[p.modname] = 0
   traverseDeps result, p, root
+  if result.config.isDefined("aowlgc") and IsSystem notin moduleFlags:
+    # -d:aowlgc: system declares the heap entry points (system/aowlgc.nim);
+    # their implementation is a module system cannot import. Link it into
+    # every program.
+    importSingleFile result, stdlibFile("std/system/aowlgcrt.nim"), NoLineInfo, root, false
 
 proc buildGraphForEval*(config: NifConfig; mainNifFile: string; dependencyNifFiles: seq[string];
     flags: set[BuildFlag]; moduleFlags: set[ModuleFlag]) =

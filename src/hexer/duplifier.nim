@@ -29,7 +29,7 @@ It follows that we're only interested in Call expressions here, or similar
 
 ]##
 
-import std / [assertions, tables, hashes, sets, syncio]
+import std / [assertions, tables, hashes, sets, syncio, strutils]
 when defined(nimony):
   {.feature: "lenientnils".}
 include ".." / lib / nifprelude
@@ -841,8 +841,31 @@ proc finishOwningTemp(dest: var TokenBuf; ow: OwningTemp) =
     dest.copyIntoSymUse ow.s, ow.info
     dest.addParRi()  # finish the StmtListExpr
 
+proc isGcTraitsCall(n: Cursor): bool =
+  ## `system.aowlgcTraits(p: ptr T)` (any instance): replaced by a constant.
+  var fn = n
+  inc fn
+  result = fn.kind == Symbol and pool.syms[fn.symId].startsWith("aowlgcTraits.0.")
+
+proc trGcTraits(c: var Context; n: var Cursor) =
+  ## aowlgc: `aowlgcTraits(cast[ptr T](nil))` -> the lifter's verdict on T as
+  ## an int literal (see `gcTraits`), so `seqimpl` can branch on whether T
+  ## holds traced pointers / needs destruction and the C compiler folds it.
+  let info = n.info
+  inc n # (call
+  skip n # the routine
+  var t = getType(c.typeCache, n, {SkipAliases})
+  if t.typeKind == PtrT: inc t
+  let v = gcTraits(c.lifter[], t)
+  skip n # the argument
+  skipParRi n
+  c.dest.addIntLit v, info
+
 proc trCall(c: var Context; n: var Cursor; e: Expects)
     {.ensuresNif: addedAny(c.dest).} =
+  if aowlgcMode and isGcTraitsCall(n):
+    trGcTraits(c, n)
+    return
   var ow = owningTempDefault()
   let retType = getType(c.typeCache, n)
   if hasDestructor(c, retType) and e == WantNonOwner:
@@ -972,10 +995,13 @@ proc trNewobj(c: var Context; n: var Cursor; e: Expects; kind: ExprKind)
     # keyed by the (box tracer, box finalizer) pair. Memory comes back zeroed.
     let traceFn = getGcBoxHook(c.lifter[], 1, refType, info)
     let finFn = getGcBoxHook(c.lifter[], 2, refType, info)
+    let slot = getGcTypeSlot(c.lifter[], refType, info)
     copyIntoKind c.dest, CastX, info:
       c.dest.addSubtree refType
       copyIntoKind c.dest, CallX, info:
         c.dest.add symToken(pool.syms.getOrIncl("aowlgcNew.0." & SystemModuleSuffix), info)
+        copyIntoKind c.dest, AddrX, info:
+          c.dest.add symToken(slot, info)
         copyIntoKind c.dest, SizeofX, info:
           c.dest.add symToken(typeSym, info)
         for fn in [traceFn, finFn]:

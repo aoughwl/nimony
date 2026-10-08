@@ -58,6 +58,9 @@ type
     frontendHooks*: ptr Table[SymId, HooksPerType] # hooks from frontend, not yet in type pragmas
     gcBoxHooks: array[2, Table[string, SymId]] # aowlgc: per allocated ref type: tracer, finalizer
     gcBoxTypes: seq[TokenBuf] # aowlgc: owned copies of the requested ref types (cursor lifetime)
+    gcTypeSlots: Table[string, SymId] # aowlgc: per allocated ref type: its heap type-id slot (a global)
+    gcSlotDecls: TokenBuf # aowlgc: the slot globals, emitted with the generated hooks
+    gcInProgress: seq[SymId] # aowlgc: nominal types whose trace triviality is being decided
 
 var aowlgcMode* = false
   ## `-d:aowlgc`: refs live in the tracing heap. A `ref` is then trivial for
@@ -229,10 +232,39 @@ proc isTrivialTypeDecl(c: var LiftingCtx; n: Cursor): bool =
   else:
     result = true
 
+proc seqElemType(decl: Cursor; elem: var Cursor): bool =
+  ## Is `decl` an instance of the system `seq[T]`? Then `elem` = T.
+  let r = asTypeDecl(decl)
+  var tv = r.typevars
+  if tv.kind == ParLe and tv.exprKind == AtX:
+    inc tv
+    if tv.kind == Symbol and pool.syms[tv.symId] == "seq.0." & SystemModuleSuffix:
+      inc tv
+      elem = tv
+      return true
+  result = false
+
 proc isTrivial*(c: var LiftingCtx; typ: TypeCursor): bool =
   if typ.kind == Symbol:
     let res = tryLoadSym(typ.symId)
     if res.status == LacksNothing:
+      if aowlgcMode and c.op == attachedTrace:
+        # aowlgc: `=trace` is trivial iff the value holds no traced pointer.
+        # A `seq[T]` holds one iff T does (POD seqs keep malloc'd buffers),
+        # whatever its (system) hook says. Recursive types (`kids: seq[O]`)
+        # are decided co-inductively: a type being decided counts as trivial.
+        if typ.symId in c.gcInProgress: return true
+        var elem = default(Cursor)
+        if seqElemType(res.decl, elem):
+          c.gcInProgress.add typ.symId
+          result = isTrivial(c, elem)
+          discard c.gcInProgress.pop()
+          return result
+        if hasHook(c, typ.symId): return false
+        c.gcInProgress.add typ.symId
+        result = isTrivialTypeDecl(c, res.decl)
+        discard c.gcInProgress.pop()
+        return result
       if hasHook(c, typ.symId): return false
       return isTrivialTypeDecl(c, res.decl)
     else:
@@ -1006,13 +1038,14 @@ proc genGcBoxDecl(c: var LiftingCtx; sym: SymId; typ: TypeCursor; which: int) =
     addSymDef c.dest, sym, c.info
     c.dest.addEmpty3 c.info # export marker, pattern, generics
     c.dest.addParLe ParamsU, c.info
-    addParam c, paramA, typ
     if which == 1:
+      # the heap's `TraceProc(visitor, obj)` order: the env (visitor) first
       copyIntoKind(c.dest, ParamY, c.info):
         addSymDef c.dest, paramB, c.info
         c.dest.addEmpty2 c.info # export marker, pragmas
         copyIntoKind(c.dest, PointerT, c.info): discard
         c.dest.addEmpty c.info # value
+    addParam c, paramA, typ
     c.dest.addParRi()
     c.dest.addEmpty() # void return type
     copyIntoKind c.dest, PragmasS, c.info:
@@ -1022,7 +1055,16 @@ proc genGcBoxDecl(c: var LiftingCtx; sym: SymId; typ: TypeCursor; which: int) =
       let a = toTypeImpl typ
       assert a.typeKind == RefT
       c.op = if which == 1: attachedTrace else: attachedDestroy
-      unravel c, a.firstSon, c.derefInner(paramTreeA), paramTreeB
+      # The box hooks belong to the *allocated* (dynamic) type, so they call
+      # its hook statically: no vtable load. That is also required for
+      # correctness: a box is visible to the collector (conservatively, from
+      # the stack) between its allocation and the store of its constructor
+      # value, while it is still all zeros -- including the vtable field.
+      let payload = a.firstSon
+      if isTrivial(c, payload):
+        genTrivialOp c, c.derefInner(paramTreeA), paramTreeB
+      else:
+        maybeCallHook c, lift(c, payload), c.derefInner(paramTreeA), paramTreeB, forceStatic = true
   publishProc(sym, c.dest, procStart)
 
 proc getGcBoxHook*(c: var LiftingCtx; which: int; refType: TypeCursor; info: PackedLineInfo): SymId =
@@ -1055,6 +1097,43 @@ proc getGcBoxHook*(c: var LiftingCtx; which: int; refType: TypeCursor; info: Pac
     let typ = cursorAt(c.gcBoxTypes[^1], 0)
     c.requests.add GenHookRequest(sym: result, typ: typ, op: op, gcBox: which)
 
+proc getGcTypeSlot*(c: var LiftingCtx; refType: TypeCursor; info: PackedLineInfo): SymId =
+  ## aowlgc: the global `int32` that caches the heap type id of objects
+  ## allocated as `refType` in this module (0 until the first allocation
+  ## registers the type). One slot per type and module: allocation is one
+  ## load and a compare, never a lookup.
+  let key = mangle(refType, Frontend, c.bits)
+  result = c.gcTypeSlots.getOrDefault(key)
+  if result == SymId(0):
+    var name = "gcType_" & key
+    var counter = addr c.hookNames.mgetOrPut(name, -1)
+    counter[] += 1
+    name.add '.'
+    name.addInt counter[]
+    name.add '.'
+    name.add c.thisModuleSuffix
+    result = pool.syms.getOrIncl(name)
+    c.gcTypeSlots[key] = result
+    copyIntoKind(c.gcSlotDecls, GvarS, info):
+      addSymDef c.gcSlotDecls, result, info
+      c.gcSlotDecls.addEmpty2 info # export marker, pragmas
+      copyIntoKind(c.gcSlotDecls, IntT, info):
+        c.gcSlotDecls.addIntLit 32, info
+      c.gcSlotDecls.addEmpty info # value: zero-initialized, no init code
+
+proc gcTraits*(c: var LiftingCtx; typ: TypeCursor): int =
+  ## aowlgc: what the memory manager must do for values of `typ`, as the
+  ## value of `system.aowlgcTraits` (a compile-time constant after hexer):
+  ## bit 0 = holds traced pointers (non-trivial `=trace`), bit 1 = non-trivial
+  ## `=destroy` (owns non-GC resources).
+  let saved = c.op
+  result = 0
+  c.op = attachedTrace
+  if not isTrivial(c, typ): result = result or 1
+  c.op = attachedDestroy
+  if not isTrivial(c, typ): result = result or 2
+  c.op = saved
+
 proc genMissingHooks*(c: var LiftingCtx) =
   # remember that genProcDecl does mutate c.requests so be robust against that:
   while c.requests.len > 0:
@@ -1073,6 +1152,11 @@ proc genMissingHooks*(c: var LiftingCtx) =
       else:
         c.routineKind = ProcY
       genProcDecl(c, reqs[i].sym, reqs[i].typ)
+  if c.gcSlotDecls.len > 0:
+    # aowlgc: the type-id slot globals travel with the generated hooks
+    c.dest.add c.gcSlotDecls
+    c.gcSlotDecls = createTokenBuf(10)
+
 
 proc genMissingHooks*(c: var LiftingCtx; dest: var TokenBuf) =
   genMissingHooks(c)

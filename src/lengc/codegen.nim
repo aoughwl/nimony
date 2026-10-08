@@ -9,7 +9,7 @@
 
 # We produce C code as a list of tokens.
 
-import std / [assertions, syncio, tables, sets, intsets, formatfloat, packedsets]
+import std / [assertions, syncio, tables, sets, intsets, formatfloat, packedsets, strutils]
 from std / syncio import readFile, writeFile
 from std / os import changeFileExt, splitFile, extractFilename, fileExists
 import ".." / lib / vfs
@@ -516,7 +516,13 @@ proc genVarDecl(c: var GeneratedCode; n: var Cursor; vk: VarKind; toExtern = fal
       c.add "__thread "
     genType c, typ, name, isConst = vk == IsConst
     let flags = genVarPragmas(c, d.pragmas)
-    if not toExtern and (StaticP in flags or useStatic):
+    # A global declared inside a routine (`var x {.global.}`) keeps its
+    # local, module-less name (`x.1`): give it internal linkage, or two
+    # modules with such a global of the same name (two instances of one
+    # generic proc, say) collide at link time.
+    let routineLocal = vk in {IsGlobal, IsThreadlocal} and
+      c.m.pool.syms[lit].count('.') < 2
+    if not toExtern and (StaticP in flags or useStatic or routineLocal):
       c.code.insert(Token(StaticKeyword), beforeDecl)
     let beforeInit = c.code.len
 

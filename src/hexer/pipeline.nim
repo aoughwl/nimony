@@ -37,6 +37,12 @@ proc publishHooks*(n: var Cursor) =
       takeTree(dest, n)
       let sym = decl.name.symId
       publish sym, dest
+    of GvarS:
+      # aowlgc type-id slots (lifter.getGcTypeSlot)
+      let sym = asLocal(n).name.symId
+      var dest = createTokenBuf()
+      takeTree(dest, n)
+      publish sym, dest
     else:
       n.into:
         while n.hasMore: publishHooks(n)

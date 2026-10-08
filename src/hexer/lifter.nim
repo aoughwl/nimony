@@ -741,7 +741,25 @@ proc unravelRef(c: var LiftingCtx; n: Cursor; paramA, paramB: TokenBuf) =
   let baseType = n.firstSon
   case c.op
   of attachedDestroy:
-    emitRefDestructor c, paramA, baseType
+    # aowlgc: a ref is a plain traced pointer (isTrivialTypeDecl/isTrivial
+    # already say so for this op) -- the collector's own finalizer sweep is
+    # what frees a dead ref's payload, never an explicit mid-life =destroy
+    # of a live reference. Without this guard, `lift`'s hook-body builder
+    # (the `if a.typeKind == RefT: unravelRef(...)` branch that constructs a
+    # ref type's OWN dedicated =destroy proc) reaches this unconditionally,
+    # bypassing the isTrivial/genTrivialOp short-circuit that field-walkers
+    # use, and emits the ARC refcount-dec-and-conditional-free path on EVERY
+    # ref destroy under aowlgc -- decrementing a refcount field that carries
+    # no real count in this mode and then possibly freeing a payload the
+    # collector still considers live (or has already swept), a UAF/double-
+    # free. Confirmed by a minimal repro (titicaca P12; aowlvm/DESIGN.md
+    # section 23): a live gdb backtrace into the generated =destroy cascade
+    # of a GC-finalized object landed in exactly this emitRefDestructor
+    # body, at its `subq $1,(%rax)` refcount decrement.
+    if aowlgcMode:
+      discard "aowlgc: destroying a ref field/local does nothing; the GC owns freeing"
+    else:
+      emitRefDestructor c, paramA, baseType
   of attachedTrace:
     # aowlgc: report the edge to the collector. `dest` is the `var ref T`
     # slot, `src` the visitor env; the runtime ignores nil/non-heap pointers.

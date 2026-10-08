@@ -967,12 +967,31 @@ proc trNewobj(c: var Context; n: var Cursor; e: Expects; kind: ExprKind)
   let typeKey = takeMangle(refTypeCopy, Frontend, c.lifter.bits)
   let typeSym = pool.syms.getOrIncl(genericTypeName(typeKey, c.moduleSuffix))
 
-  copyIntoKind c.dest, CastX, info:
-    c.dest.addSubtree refType
-    copyIntoKind c.dest, CallX, info:
-      c.dest.add symToken(pool.syms.getOrIncl("allocFixed.0." & SystemModuleSuffix), info)
-      copyIntoKind c.dest, SizeofX, info:
-        c.dest.add symToken(typeSym, info)
+  if aowlgcMode:
+    # aowlgc: the object lives in the tracing heap; its type-info entry is
+    # keyed by the (box tracer, box finalizer) pair. Memory comes back zeroed.
+    let traceFn = getGcBoxHook(c.lifter[], 1, refType, info)
+    let finFn = getGcBoxHook(c.lifter[], 2, refType, info)
+    copyIntoKind c.dest, CastX, info:
+      c.dest.addSubtree refType
+      copyIntoKind c.dest, CallX, info:
+        c.dest.add symToken(pool.syms.getOrIncl("aowlgcNew.0." & SystemModuleSuffix), info)
+        copyIntoKind c.dest, SizeofX, info:
+          c.dest.add symToken(typeSym, info)
+        for fn in [traceFn, finFn]:
+          if fn == NoSymId:
+            copyIntoKind c.dest, NilX, info: discard
+          else:
+            copyIntoKind c.dest, CastX, info:
+              copyIntoKind c.dest, PointerT, info: discard
+              c.dest.add symToken(fn, info)
+  else:
+    copyIntoKind c.dest, CastX, info:
+      c.dest.addSubtree refType
+      copyIntoKind c.dest, CallX, info:
+        c.dest.add symToken(pool.syms.getOrIncl("allocFixed.0." & SystemModuleSuffix), info)
+        copyIntoKind c.dest, SizeofX, info:
+          c.dest.add symToken(typeSym, info)
   c.dest.addParRi() # finish temp declaration
 
   # map to OOM if the proc can raise an error:

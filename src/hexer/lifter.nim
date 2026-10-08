@@ -41,6 +41,7 @@ type
     sym: SymId
     typ: TypeCursor
     op: AttachedOp
+    gcBox: int ## 0: ordinary hook; 1: aowlgc box tracer; 2: aowlgc box finalizer
 
   LiftingCtx* = object
     dest*: TokenBuf
@@ -55,6 +56,15 @@ type
     thisModuleSuffix: string
     bits*: int
     frontendHooks*: ptr Table[SymId, HooksPerType] # hooks from frontend, not yet in type pragmas
+    gcBoxHooks: array[2, Table[string, SymId]] # aowlgc: per allocated ref type: tracer, finalizer
+    gcBoxTypes: seq[TokenBuf] # aowlgc: owned copies of the requested ref types (cursor lifetime)
+
+var aowlgcMode* = false
+  ## `-d:aowlgc`: refs live in the tracing heap. A `ref` is then trivial for
+  ## every hook but `=trace` (no refcounting, destroy never frees a target),
+  ## and `=trace` of a ref marks its target. Set by hexer (`AowlGc` in the
+  ## check flags) and by nimsem's derefs pass (`defined(aowlgc)`), which lift
+  ## hooks for nominal types in the frontend and must agree with hexer.
 
 # Phase 1: Determine if the =hook is trivial:
 
@@ -203,7 +213,7 @@ proc isTrivialTypeDecl(c: var LiftingCtx; n: Cursor): bool =
   of PtrT:
     result = true
   of RefT:
-    result = false
+    result = aowlgcMode and c.op != attachedTrace
   of ObjectT:
     result = isTrivialObjectBody(c, r.body)
     if result and c.op == attachedWasMoved and hasRtti(r.pragmas):
@@ -241,7 +251,8 @@ proc isTrivial*(c: var LiftingCtx; typ: TypeCursor): bool =
     # of this branch and flip to `result = false` so destructor hooks run.
     result = true
   of RefT:
-    result = false
+    # aowlgc: a ref is a plain (traced) pointer; only =trace has work to do.
+    result = aowlgcMode and c.op != attachedTrace
   of LentT:
     result = true # lent types are borrowed; no hooks needed
   of SinkT, ArrayT:
@@ -730,7 +741,18 @@ proc unravelRef(c: var LiftingCtx; n: Cursor; paramA, paramB: TokenBuf) =
   of attachedDestroy:
     emitRefDestructor c, paramA, baseType
   of attachedTrace:
-    discard "to implement"
+    # aowlgc: report the edge to the collector. `dest` is the `var ref T`
+    # slot, `src` the visitor env; the runtime ignores nil/non-heap pointers.
+    if not aowlgcMode:
+      discard "ARC has no cycle collector: nothing to trace"
+    else:
+      copyIntoKind c.dest, CallS, c.info:
+        copyIntoSymUse c.dest, getCompilerProc(c, "aowlgcMark"), c.info
+        copyTree c.dest, paramB
+        copyIntoKind c.dest, CastX, c.info:
+          copyIntoKind c.dest, PointerT, c.info: discard
+          copyIntoKind c.dest, DerefX, c.info:
+            copyTree c.dest, paramA
   of attachedWasMoved:
     copyIntoKind c.dest, AsgnS, c.info:
       copyIntoKind c.dest, DerefX, c.info:
@@ -957,6 +979,80 @@ proc genProcDecl(c: var LiftingCtx; sym: SymId; typ: TypeCursor) =
 
   publishProc(sym, c.dest, procStart)
 
+# --- aowlgc: per allocated type, the box tracer and the box finalizer ---------
+#
+# The heap's type-info entry for an object allocated as `ref T` holds two
+# routines that take the *box* (the `ptr {r, d: T}` the ref really is), so the
+# runtime never needs to know the payload offset:
+#
+#   gcTrace_<key>(dest: ref T; src: pointer)  = `=trace`(dest[], src)
+#   gcFin_<key>(dest: ref T)                  = `=destroy`(dest[])
+#
+# The finalizer is simply the payload's lifted `=destroy`; under aowlgc every
+# nested `ref` destroy is trivial, so it releases only non-GC resources
+# (strings, OS handles, seq buffers it owns) and never frees another object.
+
+proc genGcBoxDecl(c: var LiftingCtx; sym: SymId; typ: TypeCursor; which: int) =
+  let paramA = pool.syms.getOrIncl("dest.0")
+  var paramTreeA = createTokenBuf(4)
+  copyIntoSymUse paramTreeA, paramA, c.info
+  let paramB = pool.syms.getOrIncl("src.0")
+  var paramTreeB = createTokenBuf(4)
+  copyIntoSymUse paramTreeB, paramB, c.info
+  let procStart = c.dest.len
+  copyIntoKind(c.dest, ProcS, c.info):
+    addSymDef c.dest, sym, c.info
+    c.dest.addEmpty3 c.info # export marker, pattern, generics
+    c.dest.addParLe ParamsU, c.info
+    addParam c, paramA, typ
+    if which == 1:
+      copyIntoKind(c.dest, ParamY, c.info):
+        addSymDef c.dest, paramB, c.info
+        c.dest.addEmpty2 c.info # export marker, pragmas
+        copyIntoKind(c.dest, PointerT, c.info): discard
+        c.dest.addEmpty c.info # value
+    c.dest.addParRi()
+    c.dest.addEmpty() # void return type
+    copyIntoKind c.dest, PragmasS, c.info:
+      copyIntoKind c.dest, NodestroyP, c.info: discard
+    c.dest.addEmpty c.info # exc
+    copyIntoKind(c.dest, StmtsS, c.info):
+      let a = toTypeImpl typ
+      assert a.typeKind == RefT
+      c.op = if which == 1: attachedTrace else: attachedDestroy
+      unravel c, a.firstSon, c.derefInner(paramTreeA), paramTreeB
+  publishProc(sym, c.dest, procStart)
+
+proc getGcBoxHook*(c: var LiftingCtx; which: int; refType: TypeCursor; info: PackedLineInfo): SymId =
+  ## aowlgc: the box tracer (`which == 1`) or box finalizer (`which == 2`) for
+  ## objects allocated as `refType`. `NoSymId` when the payload has nothing to
+  ## trace (a leaf object) or nothing to finalize.
+  let op = if which == 1: attachedTrace else: attachedDestroy
+  c.op = op
+  c.calledErrorHook = NoLineInfo
+  c.info = info
+  let a = toTypeImpl refType
+  if a.typeKind != RefT or isTrivial(c, a.firstSon):
+    return NoSymId
+  let key = mangle(refType, Frontend, c.bits)
+  result = c.gcBoxHooks[which-1].getOrDefault(key)
+  if result == SymId(0):
+    var name = (if which == 1: "gcTrace_" else: "gcFin_") & key
+    var counter = addr c.hookNames.mgetOrPut(name, -1)
+    counter[] += 1
+    name.add '.'
+    name.addInt counter[]
+    name.add '.'
+    name.add c.thisModuleSuffix
+    result = pool.syms.getOrIncl(name)
+    c.gcBoxHooks[which-1][key] = result
+    # The request outlives the pass buffer `refType` points into: own a copy.
+    var buf = createTokenBuf(8)
+    buf.addSubtree refType
+    c.gcBoxTypes.add ensureMove(buf)
+    let typ = cursorAt(c.gcBoxTypes[^1], 0)
+    c.requests.add GenHookRequest(sym: result, typ: typ, op: op, gcBox: which)
+
 proc genMissingHooks*(c: var LiftingCtx) =
   # remember that genProcDecl does mutate c.requests so be robust against that:
   while c.requests.len > 0:
@@ -964,6 +1060,10 @@ proc genMissingHooks*(c: var LiftingCtx) =
     for i in 0 ..< reqs.len:
       c.op = reqs[i].op
       c.calledErrorHook = NoLineInfo
+      if reqs[i].gcBox != 0:
+        c.routineKind = ProcY
+        genGcBoxDecl(c, reqs[i].sym, reqs[i].typ, reqs[i].gcBox)
+        continue
       # For RTTI types (inheritable objects), hooks need to be methods for vtable dispatch
       let t = reqs[i].typ
       if t.kind in {Symbol, SymbolDef} and hasRtti(t.symId) and reqs[i].op in {attachedDestroy, attachedTrace}:

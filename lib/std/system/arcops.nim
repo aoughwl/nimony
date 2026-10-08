@@ -17,17 +17,28 @@ func arcIsUnique*(memLoc: var int): bool {.inline.} =
   {.cast(noSideEffect).}:
     result = atomicLoadN(memLoc.addr, ATOMIC_ACQUIRE) == 0
 
-proc GC_ref*[T](x: ref T) {.nodestroy, inline.} =
-  ## Manually increments the reference count of `x`. Pairs with `GC_unref`.
-  ## For raw `alloc`'d memory that holds `ref` fields ARC cannot trace, this
-  ## keeps the referenced object alive past the lifetime of the `ref` variable.
-  ## `nodestroy` is essential: it suppresses the destructor the compiler would
-  ## otherwise inject on the `=dup` result, so the extra reference deliberately
-  ## leaks (no-op when `x` is nil — the `=dup` hook guards it).
-  discard `=dup`(x)
+when defined(aowlgc):
+  proc GC_ref*[T](x: ref T) {.inline.} =
+    ## aowlgc: pins `x` (a root until the matching `GC_unref`), for refs kept
+    ## where the collector cannot see them (raw `alloc`'d memory, C heap).
+    aowlgcPin(cast[pointer](x))
 
-proc GC_unref*[T](x: ref T) {.inline.} =
-  ## Manually decrements the reference count of `x`, freeing it at zero.
-  ## Inverse of `GC_ref`. `x` is a borrowed (non-`sink`) parameter, so the
-  ## only effect is the `=destroy` hook's `arcDec` (nil-safe).
-  `=destroy`(x)
+  proc GC_unref*[T](x: ref T) {.inline.} =
+    ## aowlgc: drops one pin taken by `GC_ref`.
+    aowlgcUnpin(cast[pointer](x))
+
+else:
+  proc GC_ref*[T](x: ref T) {.nodestroy, inline.} =
+    ## Manually increments the reference count of `x`. Pairs with `GC_unref`.
+    ## For raw `alloc`'d memory that holds `ref` fields ARC cannot trace, this
+    ## keeps the referenced object alive past the lifetime of the `ref` variable.
+    ## `nodestroy` is essential: it suppresses the destructor the compiler would
+    ## otherwise inject on the `=dup` result, so the extra reference deliberately
+    ## leaks (no-op when `x` is nil — the `=dup` hook guards it).
+    discard `=dup`(x)
+
+  proc GC_unref*[T](x: ref T) {.inline.} =
+    ## Manually decrements the reference count of `x`, freeing it at zero.
+    ## Inverse of `GC_ref`. `x` is a borrowed (non-`sink`) parameter, so the
+    ## only effect is the `=destroy` hook's `arcDec` (nil-safe).
+    `=destroy`(x)

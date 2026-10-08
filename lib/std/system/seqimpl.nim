@@ -7,16 +7,69 @@ type
     len: int
     data: ptr UncheckedArray[T]
 
-func capInBytes[T](s: seq[T]): int {.inline.} =
-  result = if s.data != nil: allocatedSize(s.data) else: 0
-
-func `=destroy`*[T](s: seq[T]) =
-  if s.data != nil:
+when defined(aowlgc):
+  # aowlgc: seq buffers are *traced backing stores* in the GC heap. A buffer
+  # traces its elements itself (all `usable div sizeof(T)` slots; slots past
+  # `len` are kept zeroed), so a seq held anywhere the collector only scans
+  # conservatively -- a native stack frame, a global -- keeps its elements
+  # alive through the one `data` word. The seq still owns its buffer: destroy
+  # and realloc free it explicitly.
+  proc traceSeqBuf[T](p: pointer; env: pointer) {.nimcall.} =
+    let a = cast[ptr UncheckedArray[T]](p)
+    let n = aowlgcUsableSize(p) div sizeof(T)
     var i = 0
-    while i < s.len:
-      `=destroy`(s.data[i])
+    while i < n:
+      `=trace`(a[i], env)
       inc i
-    dealloc s.data
+
+  func seqAlloc[T](bytes: int): pointer {.inline.} =
+    let tracer: AowlgcTracer = traceSeqBuf[T]
+    {.cast(noSideEffect).}:
+      result = aowlgcNewTraced(bytes, tracer)
+
+  func seqRealloc[T](old: pointer; usedBytes, bytes: int): pointer =
+    result = seqAlloc[T](bytes)
+    if result != nil and old != nil:
+      copyMem(result, old, min(usedBytes, bytes))
+      {.cast(noSideEffect).}:
+        aowlgcFree(old)
+
+  func seqZero[T](s: seq[T]; a, b: int) {.inline.} =
+    ## zero the vacated slots `a ..< b` (their contents were destroyed or moved)
+    if b > a and s.data != nil:
+      zeroMem(addr s.data[a], (b - a) * sizeof(T))
+
+  func capInBytes[T](s: seq[T]): int {.inline.} =
+    {.cast(noSideEffect).}:
+      result = if s.data != nil: aowlgcUsableSize(s.data) else: 0
+
+  proc `=trace`*[T](s: var seq[T]; env: pointer) =
+    if s.data != nil:
+      aowlgcMark(env, s.data)
+
+  func `=destroy`*[T](s: seq[T]) =
+    if s.data != nil:
+      var i = 0
+      while i < s.len:
+        `=destroy`(s.data[i])
+        inc i
+      {.cast(noSideEffect).}:
+        aowlgcFree(s.data)
+else:
+  template seqAlloc[T](bytes: int): pointer = alloc(bytes)
+  template seqRealloc[T](old: pointer; usedBytes, bytes: int): pointer = realloc(old, bytes)
+  template seqZero[T](s: seq[T]; a, b: int) = discard
+
+  func capInBytes[T](s: seq[T]): int {.inline.} =
+    result = if s.data != nil: allocatedSize(s.data) else: 0
+
+  func `=destroy`*[T](s: seq[T]) =
+    if s.data != nil:
+      var i = 0
+      while i < s.len:
+        `=destroy`(s.data[i])
+        inc i
+      dealloc s.data
 
 func `=wasMoved`*[T](s: var seq[T]) {.inline.} =
   s.len = 0
@@ -35,7 +88,7 @@ func newSeq*[T: HasDefault](size: int = 0): seq[T] {.nodestroy.} =
     result = seq[T](len: size, data: nil)
   else:
     let memSize = memSizeInBytes[T](size)
-    result = seq[T](len: size, data: cast[ptr UncheckedArray[T]](alloc(memSize)))
+    result = seq[T](len: size, data: cast[ptr UncheckedArray[T]](seqAlloc[T](memSize)))
     if result.data != nil:
       var i = 0
       while i < size:
@@ -52,7 +105,7 @@ func newSeqOf*[T](size: int; initValue: T): seq[T] {.nodestroy.} =
     result = seq[T](len: size, data: nil)
   else:
     let memSize = memSizeInBytes[T](size)
-    result = seq[T](len: size, data: cast[ptr UncheckedArray[T]](alloc(memSize)))
+    result = seq[T](len: size, data: cast[ptr UncheckedArray[T]](seqAlloc[T](memSize)))
     if result.data != nil:
       var i = 0
       while i < size:
@@ -69,7 +122,7 @@ func newSeqUninit*[T](size: int): seq[T] {.nodestroy, inline.} =
     result = seq[T](len: size, data: nil)
   else:
     let memSize = memSizeInBytes[T](size)
-    result = seq[T](len: size, data: cast[ptr UncheckedArray[T]](alloc(memSize)))
+    result = seq[T](len: size, data: cast[ptr UncheckedArray[T]](seqAlloc[T](memSize)))
     if result.data != nil:
       discard "leave uninitialized"
     else:
@@ -82,7 +135,7 @@ func newSeqOfCap*[T](cap: int): seq[T] {.nodestroy, inline.} =
     result = seq[T](len: 0, data: nil)
   else:
     let memSize = memSizeInBytes[T](cap)
-    result = seq[T](len: 0, data: cast[ptr UncheckedArray[T]](alloc(memSize)))
+    result = seq[T](len: 0, data: cast[ptr UncheckedArray[T]](seqAlloc[T](memSize)))
     if result.data == nil:
       {.cast(noSideEffect).}:
         oomHandler memSize
@@ -112,7 +165,7 @@ func resize[T](dest: var seq[T]; addedElements: int): bool {.nodestroy.} =
   let oldCap = dest.capInBytes div sizeof(T)
   let newCap = recalcCap(oldCap, addedElements)
   let memSize = memSizeInBytes[T](newCap)
-  dest.data = cast[ptr UncheckedArray[T]](realloc(dest.data, memSize))
+  dest.data = cast[ptr UncheckedArray[T]](seqRealloc[T](dest.data, dest.len * sizeof(T), memSize))
   if dest.data == nil:
     dest.len = 0
     {.cast(noSideEffect).}:
@@ -128,11 +181,12 @@ func `=copy`*[T](dest: var seq[T]; src: seq[T]) {.nodestroy.} =
     while i < dest.len:
       `=destroy`(dest.data[i])
       inc i
+    seqZero(dest, src.len, dest.len)
   elif dest.capInBytes < src.len * sizeof(T):
     let oldCap = dest.capInBytes div sizeof(T)
     let newCap = recalcCap(oldCap, src.len - oldCap)
     let memSize = memSizeInBytes[T](newCap)
-    dest.data = cast[ptr UncheckedArray[T]](realloc(dest.data, memSize))
+    dest.data = cast[ptr UncheckedArray[T]](seqRealloc[T](dest.data, dest.len * sizeof(T), memSize))
     if dest.data == nil:
       dest.len = 0
       {.cast(noSideEffect).}:
@@ -194,6 +248,7 @@ func del*[T](s: var seq[T]; idx: int) {.nodestroy.} =
   `=destroy`(s.data[idx])
   if idx != L-1:
     (s.data[idx]) = s.data[L-1]
+  seqZero(s, L-1, L)
   dec s.len
 
 func addUnique*[T: Equatable](s: var seq[T]; x: sink T) =
@@ -208,6 +263,7 @@ func shrink*[T](s: var seq[T]; newLen: int) =
   while i >= newLen:
     `=destroy`(s.data[i])
     dec i
+  seqZero(s, newLen, s.len)
   s.len = newLen
 
 func growUnsafe*[T](s: var seq[T]; newLen: int) =
@@ -257,6 +313,7 @@ func pop*[T](s: var seq[T]): T {.requires: (s.len > 0), inline, nodestroy.} =
   ## Removes and returns the last element.
   let L = s.len-1
   result = s[L]
+  seqZero(s, L, L+1)
   s.len = L
 
 func delete*[T](s: var seq[T]; idx: int) {.requires: (idx >= 0 and idx < s.len), nodestroy.} =
@@ -268,4 +325,5 @@ func delete*[T](s: var seq[T]; idx: int) {.requires: (idx >= 0 and idx < s.len),
   while i < L-1:
     (s.data[i]) = s.data[i+1]
     inc i
+  seqZero(s, L-1, L)
   dec s.len

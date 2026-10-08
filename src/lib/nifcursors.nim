@@ -116,11 +116,11 @@ template decRcAndFree(owner: CursorOwner) =
       dealloc(owner)
 
 when defined(aowlgc):
-  proc cursorOwnerFinalizer(p: pointer) {.nimcall.} =
+  proc cursorOwnerFinalizer(p: pointer) {.cdecl.} =
     let owner = cast[CursorOwner](p)
     if owner.data != nil: dealloc(owner.data)
 
-  proc cursorOwnerTracer(p: pointer; env: pointer) {.nimcall.} =
+  proc cursorOwnerTracer(p: pointer; env: pointer) {.cdecl.} =
     discard p
     discard env
     ## `data` is a raw token buffer, not aowlgc-managed memory -- nothing
@@ -128,7 +128,7 @@ when defined(aowlgc):
 
   proc newCursorOwner(): CursorOwner {.inline.} =
     cast[CursorOwner](aowlgcNew(sizeof(CursorOwnerObj),
-      cast[pointer](cursorOwnerTracer), cast[pointer](cursorOwnerFinalizer)))
+      cursorOwnerTracer, cursorOwnerFinalizer))
 
   proc `=trace`*(c: var Cursor; env: pointer) {.inline.} =
     if c.owner != nil: aowlgcMark(env, cast[pointer](c.owner))

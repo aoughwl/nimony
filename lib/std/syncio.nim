@@ -501,6 +501,13 @@ else:
       result = true
       var done = false
       for i in 0 ..< bufsize:
+        # `fgets` stores at most `bufsize-1` characters and always NUL-terminates,
+        # so the NUL marks the end of THIS CHUNK, not the end of the line. The
+        # loop used to run the full `bufsize` and copy that terminator in as
+        # data: every line longer than 79 characters came back with a stray NUL
+        # byte every 79 characters, and a length inflated by one per chunk.
+        # Stop at the NUL and let the `while` fetch the next chunk instead.
+        if buf[i] == '\0': break
         if buf[i] == '\n':
           done = true
           break

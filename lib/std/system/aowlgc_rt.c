@@ -56,7 +56,8 @@ typedef void (*AgFinFn)(void *box);
 #define AG_MAX_PAGES (AG_RESERVE >> AG_PAGE_SHIFT)
 #define AG_HDR 8
 
-enum { F_ALLOC = 1, F_MARK = 2, F_PINNED = 4, F_CONSERVATIVE = 8 };
+enum { F_ALLOC = 1, F_MARK = 2, F_PINNED = 4, F_CONSERVATIVE = 8,
+       F_XFREED = 16 /* free slot, released by aowlgcFree (not by the sweep) */ };
 enum { P_FREE = 0, P_SMALL = 1, P_LARGE = 2, P_CONT = 3 };
 
 typedef struct {
@@ -124,6 +125,7 @@ typedef struct {
   uint8_t *tlsLo, *tlsHi;
   /* statistics */
   size_t collections, allocs, frees, finalized, verifiedEdges;
+  size_t staleEdges;   /* verifier: edges into explicitly freed slots */
 } AgState;
 
 static AgState *agS;
@@ -374,7 +376,20 @@ static void agDrain(AgState *s) {
   }
 }
 
-static AgHeader *agVerifySrc;   /* the object whose edges are being verified */
+static AgHeader *agVerifySrc;
+
+/* Was the small-page slot starting at `a` released by aowlgcFree? */
+static int agXFreed(AgState *s, uintptr_t a) {
+  uintptr_t b = (uintptr_t)s->base;
+  if (a < b + AG_PAGE_SIZE || a >= b + (s->top << AG_PAGE_SHIFT)) return 0;
+  size_t idx = (a - b) >> AG_PAGE_SHIFT;
+  AgPage *pg = agPageOf(s, idx);
+  if (pg->kind != P_SMALL) return 0;
+  uintptr_t start = (uintptr_t)agPageAddr(s, idx);
+  uint32_t slot = (uint32_t)((a - start) / pg->slotSize);
+  AgHeader *h = (AgHeader *)(start + (uintptr_t)slot * pg->slotSize);
+  return (uint8_t *)h + AG_HDR == (uint8_t *)a && (h->flags & F_XFREED) != 0;
+}   /* the object whose edges are being verified */
 
 void aowlgcMark(void *env, void *p) {
   AgState *s = agS;
@@ -384,6 +399,13 @@ void aowlgcMark(void *env, void *p) {
     s->verifiedEdges++;
     if (h == NULL || !(h->flags & F_MARK) || (uint8_t *)h + AG_HDR != (uint8_t *)p) {
       uintptr_t b = (uintptr_t)s->base;
+      /* `lhs = rhs` lowers to `=destroy(lhs); lhs = rhs` with rhs evaluated in
+         between: a seq field briefly holds its just-freed buffer, and an
+         allocation in rhs can collect right then. That is a stale word, not a
+         lost edge: the slot was released by aowlgcFree (F_XFREED), never swept.
+         A slot freed by the SWEEP while still referenced is the real bug, and
+         it still aborts. */
+      if (h == NULL && agXFreed(s, (uintptr_t)p)) { s->staleEdges++; return; }
       if ((uintptr_t)p >= b && (uintptr_t)p < b + AG_RESERVE) {
         fprintf(stderr, "aowlgc verify: live object has an edge to %p which is %s\n", p,
                 h == NULL ? "not a live heap object" :
@@ -616,7 +638,10 @@ void aowlgcFree(void *p) {
      from a finalizer is redundant (and could double-free). */
   if (s->inGc) return;
   AgHeader *h = agExact(s, p);
-  if (h) agFreeSlot(s, h);
+  if (h) {
+    agFreeSlot(s, h);
+    h->flags |= F_XFREED;   /* small slots keep their header; see agXFreed */
+  }
 }
 
 void aowlgcFreePinned(void *p) { aowlgcFree(p); }

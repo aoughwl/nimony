@@ -374,6 +374,8 @@ static void agDrain(AgState *s) {
   }
 }
 
+static AgHeader *agVerifySrc;   /* the object whose edges are being verified */
+
 void aowlgcMark(void *env, void *p) {
   AgState *s = agS;
   if (p == NULL || s == NULL) return;
@@ -386,6 +388,17 @@ void aowlgcMark(void *env, void *p) {
         fprintf(stderr, "aowlgc verify: live object has an edge to %p which is %s\n", p,
                 h == NULL ? "not a live heap object" :
                 !(h->flags & F_MARK) ? "unmarked" : "an interior pointer");
+        if (agVerifySrc) {
+          AgHeader *src = agVerifySrc;
+          uint8_t *pl = (uint8_t *)src + AG_HDR;
+          size_t n = agSlotBytes(s, src) - AG_HDR;
+          long off = -1;
+          for (size_t i = 0; i + sizeof(void *) <= n; i += sizeof(void *))
+            if (*(void **)(pl + i) == p) { off = (long)i; break; }
+          fprintf(stderr, "aowlgc verify:   source object %p tid=%u trace=%p fin=%p slot=%zu edge-offset=%ld\n",
+                  (void *)pl, (unsigned)src->tid, s->types[src->tid].trace,
+                  s->types[src->tid].fin, n, off);
+        }
         abort();
       }
     }
@@ -421,7 +434,9 @@ static void agRootPinned(AgState *s, AgHeader *h) {
 static void agVerifyOne(AgState *s, AgHeader *h) {
   if ((h->flags & F_MARK) && !(h->flags & F_CONSERVATIVE)) {
     AgTraceFn t = s->types[h->tid].trace;
+    agVerifySrc = h;
     if (t) t((uint8_t *)h + AG_HDR, (void *)s);
+    agVerifySrc = NULL;
   }
 }
 

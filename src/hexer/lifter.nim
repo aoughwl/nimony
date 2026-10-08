@@ -1022,7 +1022,18 @@ proc genGcBoxDecl(c: var LiftingCtx; sym: SymId; typ: TypeCursor; which: int) =
       let a = toTypeImpl typ
       assert a.typeKind == RefT
       c.op = if which == 1: attachedTrace else: attachedDestroy
-      unravel c, a.firstSon, c.derefInner(paramTreeA), paramTreeB
+      # STATIC dispatch: a box hook belongs to the exact ALLOCATED type, so the
+      # payload's own hook is the right one by construction. Dispatching through
+      # the vtable (what `unravel` does for inheritable payloads) read the rtti
+      # word, which is still nil while the constructor is running — and a
+      # collection triggered by an allocation inside that constructor then
+      # called through a nil vtable (found by aowli P4 on threads/tparfib: a
+      # `Coro` traced between its allocation and its vtable store).
+      if isTrivial(c, a.firstSon):
+        genTrivialOp c, c.derefInner(paramTreeA), paramTreeB
+      else:
+        let fn = lift(c, a.firstSon)
+        maybeCallHook c, fn, c.derefInner(paramTreeA), paramTreeB, forceStatic = true
   publishProc(sym, c.dest, procStart)
 
 proc getGcBoxHook*(c: var LiftingCtx; which: int; refType: TypeCursor; info: PackedLineInfo): SymId =

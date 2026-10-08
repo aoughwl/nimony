@@ -101,10 +101,37 @@ type
     rem: int
 
 template decRcAndFree(owner: CursorOwner) =
+  ## `rc` stays live/accurate in BOTH modes -- the COW "am I exclusively
+  ## owned?" checks below (`rc == 1`) need it regardless of who frees the
+  ## owner. Under `-d:aowlgc` the owner is a GC-traced heap object (see
+  ## `newCursorOwner`/`'=trace'*(c: var Cursor)` below): freeing is the
+  ## collector's job once nothing reachable points at it -- a Cursor this
+  ## local count has lost track of (stored deep inside e.g. `Interp.
+  ## procBodies: seq[Cursor]`) still keeps the owner correctly alive. Plain
+  ## ARC mode frees synchronously at rc==0, exactly as before.
   dec owner.rc
-  if owner.rc == 0:
+  when not defined(aowlgc):
+    if owner.rc == 0:
+      if owner.data != nil: dealloc(owner.data)
+      dealloc(owner)
+
+when defined(aowlgc):
+  proc cursorOwnerFinalizer(p: pointer) {.nimcall.} =
+    let owner = cast[CursorOwner](p)
     if owner.data != nil: dealloc(owner.data)
-    dealloc(owner)
+
+  proc cursorOwnerTracer(p: pointer; env: pointer) {.nimcall.} =
+    discard p
+    discard env
+    ## `data` is a raw token buffer, not aowlgc-managed memory -- nothing
+    ## to report.
+
+  proc newCursorOwner(): CursorOwner {.inline.} =
+    cast[CursorOwner](aowlgcNew(sizeof(CursorOwnerObj),
+      cast[pointer](cursorOwnerTracer), cast[pointer](cursorOwnerFinalizer)))
+
+  proc `=trace`*(c: var Cursor; env: pointer) {.inline.} =
+    if c.owner != nil: aowlgcMark(env, cast[pointer](c.owner))
 
 when defined(nimAllowNonVarDestructor) and defined(gcDestructors):
   proc `=destroy`*(c: Cursor) {.inline.} =
@@ -516,7 +543,10 @@ proc beginRead*(b: var TokenBuf): Cursor =
   ## Returns a Cursor into the buffer. Creates a CursorOwner on first call
   ## (rc=2: one for TokenBuf, one for the returned Cursor).
   if b.owner == nil:
-    b.owner = cast[CursorOwner](alloc0(sizeof(CursorOwnerObj)))
+    when defined(aowlgc):
+      b.owner = newCursorOwner()
+    else:
+      b.owner = cast[CursorOwner](alloc0(sizeof(CursorOwnerObj)))
     b.owner.data = b.data
     b.owner.rc = 1  # 1 for TokenBuf
   inc b.owner.rc  # + 1 for the returned Cursor
@@ -614,7 +644,10 @@ proc `[]=`*(b: TokenBuf; i: int; val: PackedToken) {.inline.} =
 proc cursorAt*(b: var TokenBuf; i: int): Cursor {.inline.} =
   assert i >= 0 and i < b.len
   if b.owner == nil:
-    b.owner = cast[CursorOwner](alloc0(sizeof(CursorOwnerObj)))
+    when defined(aowlgc):
+      b.owner = newCursorOwner()
+    else:
+      b.owner = cast[CursorOwner](alloc0(sizeof(CursorOwnerObj)))
     b.owner.data = b.data
     b.owner.rc = 1  # 1 for TokenBuf
   inc b.owner.rc  # + 1 for the returned Cursor

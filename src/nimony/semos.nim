@@ -119,10 +119,20 @@ proc requiresTool*(tool, src: string; forceRebuild: bool) =
 
 proc resolveFile*(paths: openArray[string]; origin: string; toResolve: string): string =
   let nimFile = toResolve.addFileExt(".nim")
+  # `.aowl` is the same language under the name the toolchain owns, rather
+  # than Nim's; an import with no extension of its own resolves to `.nim`
+  # first (unchanged, so an ordinary import pays nothing extra) and only
+  # tries `.aowl` once every `.nim` candidate has been ruled out.
+  let aowlFile = toResolve.addFileExt(".aowl")
+  template tryAowl(nimResult: string): string =
+    if os.fileExists(nimResult): nimResult
+    else:
+      let aowlResult = nimResult[0 ..< nimResult.len - ".nim".len] & ".aowl"
+      if os.fileExists(aowlResult): aowlResult else: nimResult
   #if toResolve.startsWith("std/") or toResolve.startsWith("ext/"):
   #  result = stdFile nimFile
   if toResolve.isAbsolute:
-    result = nimFile
+    result = tryAowl(nimFile)
   elif toResolve.len > 0 and toResolve[0] == '$':
     var key = ""
     var i = 1
@@ -133,15 +143,25 @@ proc resolveFile*(paths: openArray[string]; origin: string; toResolve: string): 
       inc i
     let val = getEnv(key)
     if val.len == 0:
-      result = nimFile
+      result = tryAowl(nimFile)
     else:
-      result = val / nimFile.substr(i)
+      result = tryAowl(val / nimFile.substr(i))
   else:
     result = splitFile(origin).dir / nimFile
     var i = 0
     while not os.fileExists(result) and i < paths.len:
       result = paths[i] / nimFile
       inc i
+    if not os.fileExists(result):
+      # None of the above was a real .nim file; walk the same candidates
+      # again, this time for .aowl, before giving up and returning the
+      # (non-existent) .nim guess the caller will report as "not found".
+      var aowlResult = splitFile(origin).dir / aowlFile
+      var j = 0
+      while not os.fileExists(aowlResult) and j < paths.len:
+        aowlResult = paths[j] / aowlFile
+        inc j
+      if os.fileExists(aowlResult): result = aowlResult
 
 type
   ImportedFilename* = object

@@ -25,3 +25,11 @@ proc findTool*(name: string): string =
     let t = toolDir(result)
     if fileExists(t):
       result = t
+
+proc findDriver*(): string =
+  ## The compiler driver, for the sub-compiles it starts on itself (plugins,
+  ## macros, `writenif`). An aowlmony root ships it as `aowlmony`; the
+  ## older name is the fallback so a root built before the rename still works.
+  result = findTool("aowlmony")
+  if not fileExists(result):
+    result = findTool("nimony")

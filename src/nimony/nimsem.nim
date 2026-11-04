@@ -82,7 +82,7 @@ proc executeNif(files: seq[string]; config: sink NifConfig) =
   # the outer's `--cc` profile) as stale for its own profile and tries
   # to rewrite it — and on Windows that write open fails because the
   # outer nimsem still has the file mmap'd.
-  exec quoteShell(findTool("nimony")) & " --nimcache:" & quoteShell(config.nifcachePath) &
+  exec quoteShell(findDriver()) & " --nimcache:" & quoteShell(config.nifcachePath) &
     " c " & quoteShell(stdlibFile("std/writenif.nim"))
 
   var dependencyFiles: seq[string] = @[]

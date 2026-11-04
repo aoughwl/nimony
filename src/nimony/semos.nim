@@ -348,7 +348,7 @@ proc getFile*(info: PackedLineInfo): string =
     result = ""
 
 proc selfExec*(c: var SemContext; file: string; moreArgs: string) =
-  let nimonyExe = findTool("nimony")
+  let nimonyExe = findDriver()
   exec quoteShell(nimonyExe) & c.commandLineArgs & moreArgs & " --ischild m " & quoteShell(file)
   #exec os.getAppFilename() & c.commandLineArgs & moreArgs & " --ischild m " & quoteShell(file)
 
@@ -389,7 +389,7 @@ proc compilePlugin(c: var SemContext; info: PackedLineInfo; nf, exefile: string)
   # supplied below and deliberately not forwarded from the caller's path file.
   # Do not forward the raw command line: it can contain `--base`, which would
   # make plugin child compiles read caller-local nimony.paths files.
-  let nimonyExe = findTool("nimony")
+  let nimonyExe = findDriver()
   let srcLibPath = nimonyDir() / "src" / "lib"
   var cmd = quoteShell(nimonyExe) &
     " --nimcache:" & quoteShell(pluginCache) &
@@ -493,7 +493,7 @@ proc runProgram(file: string; nimcachePath: string; usedModules: HashSet[string]
   # binary. Compilation must keep the outer cwd (nimcache paths are relative
   # to the invoking compile). Only the execution step uses `workingDir` so
   # relative paths like `doc/version.md` resolve next to the caller module.
-  let nimonyExe = findTool("nimony")
+  let nimonyExe = findDriver()
   let compileCmd = quoteShell(nimonyExe) & commandLineArgs &
     " --nimcache:" & quoteShell(nimcachePath) &
     " s " & quoteShell(file)
@@ -535,7 +535,7 @@ proc prepareEval*(c: var SemContext): string =
       # stale, and tries to overwrite it — which on Windows fails because
       # the outer nimsem (currently paused waiting on this exec) still
       # has it mmap'd. The outer's args live on `c.commandLineArgs`.
-      let nimonyExe = findTool("nimony")
+      let nimonyExe = findDriver()
       var cmd = quoteShell(nimonyExe) & c.commandLineArgs &
         " --nimcache:" & quoteShell(c.g.config.nifcachePath) &
         " c " & quoteShell(stdlibFile("std/writenif.nim"))

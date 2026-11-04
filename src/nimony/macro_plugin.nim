@@ -13,6 +13,7 @@ import std/[syncio, os, osproc, tables, hashes, assertions, strutils]
 import ".." / lib / [nifstreams, nifcursors, lineinfos, bitabs, nifindexes, symparser]
 import ".." / models / [tags]
 import nimony_model, decls, programs
+from ".." / lib / tooldirs import findDriver
 
 type
   MacroPlugin* = object
@@ -353,7 +354,7 @@ proc compileMacroPlugin*(nifcachePath: string; macroDecl: Cursor; macroSym: SymI
     echo "Macro plugin: failed to write ", depsFile
     return ""
 
-  let nimonyExe = getAppDir() / "nimony"
+  let nimonyExe = findDriver()
   let srcLibPath = getAppDir().parentDir() / "src" / "lib"
 
   # Pre-populate the isolated plugin cache with a HOST-bits stdlib. `nimony s`

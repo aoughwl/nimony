@@ -19,7 +19,7 @@
 
 import std / assertions
 include "../../lib" / nifprelude
-import nifstreams, nifcursors
+import "../../lib" / [nifstreams, nifcursors]
 import intermodinliner   # runInterModuleInliner (nifcursors)
 
 proc runImi*(input, suffix, xnifDir: string; changed: var bool): string =

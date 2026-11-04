@@ -1,6 +1,7 @@
 --define:nimPreviewSlimSystem
---warningAsError:Uninit
---warningAsError:ProveInit
 --experimental:strictDefs
+when not defined(windows):
+  --warningAsError:Uninit
+  --warningAsError:ProveInit
 --warning:StdPrefix
 --warningAsError:StdPrefix

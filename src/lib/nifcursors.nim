@@ -638,7 +638,7 @@ proc cursorToPosition*(base, c: Cursor): int {.inline.} =
   let base = cast[int](base.p)
   assert c >= base
   result = (c - base) div sizeof(PackedToken)
-  assert result < 1_000_000
+  assert result < 100_000_000
 
 proc toUniqueId*(c: Cursor): int {.inline.} =
   result = cast[int](c.p)

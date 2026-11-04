@@ -16,7 +16,7 @@
 
 import std / assertions
 include "../../lib" / nifprelude
-import nifstreams, nifcursors, nifbuilder
+import "../../lib" / [nifstreams, nifcursors, nifbuilder]
 
 proc emit(c: var Cursor; b: var Builder) =
   case c.kind

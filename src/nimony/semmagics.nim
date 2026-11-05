@@ -112,9 +112,11 @@ proc semDeclared*(c: var SemContext; dest: var TokenBuf; it: var Item) =
     it.typ = c.types.boolType
     commonType c, dest, it, beforeExpr, expected
 
-proc hasError(dest: TokenBuf): bool =
+proc hasError(dest: TokenBuf; start: int): bool =
+  ## Only the tokens `compiles` itself produced: an error earlier in the
+  ## module must not make every later `compiles` answer false.
   let errTag = pool.tags.getOrIncl("err")
-  var i = 0
+  var i = start
   result = false
   while i < dest.len:
     if dest[i].kind == ParLe and dest[i].tagId == errTag:
@@ -146,7 +148,7 @@ proc semCompiles*(c: var SemContext; dest: var TokenBuf; it: var Item) =
 
   c.currentScope = oldScope
 
-  let hasError = hasError(dest)
+  let hasError = hasError(dest, beforeExpr)
   shrink dest, beforeExpr
   c.currentScope = oldScope
   c.procRequests.setLen(oldProcRequestsLen)

@@ -2,8 +2,10 @@
 
 The authoritative ledger of what **our** `aoughwl/nimony` tree fixes/adds over
 stock upstream `nim-lang/nimony`. This branch (`master`) is the canonical one we
-use internally and share: it stays current with upstream and carries our own
-fixes and features on top.
+use internally and share. It is synced from upstream by hand and rarely (last sync
+2026-11-06, upstream 38dadf84; see SYNC-LEDGER.md), NOT continuously, and it carries
+our own fixes and features on top. Some rows below may already be fixed upstream;
+see SYNC-LEDGER.md for which ones the last sync found redundant.
 
 **Keep this file current: every time we fix an issue or add a feature, add a row
 here** with what, why, the files, and how it's verified.

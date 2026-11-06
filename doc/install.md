@@ -1,5 +1,7 @@
 # Installation
 
+> **aoughwl/nimony fork:** clone https://github.com/aoughwl/nimony.git instead of the upstream URL below, and use Nim **2.2.2** with a MinGW gcc on Windows (that is what the bootstrap binaries are built with). See the repository README for the fork's sync policy; this fork is not kept current with upstream.
+
 Nimony must be built from source. You need to have Nim version 2.0 or later. For example:
 
 ```

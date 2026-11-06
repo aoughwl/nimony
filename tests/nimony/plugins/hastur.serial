@@ -1,0 +1,1 @@
+# Plugin subprocess tests: run serially even under --jobs (see hastur.nim SerialMarker).

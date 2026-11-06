@@ -251,7 +251,16 @@ proc findLocal(file: string; sym: SymId; toTrack: PackedLineInfo; mode: TrackMod
 proc usages*(files: openArray[string]; config: NifConfig) =
   # This is comparable to a linking step: We iterate over all `.idetools.nif` files to see
   # what symbol is meant by the `file,line,col` tracking information.
-  let requestedInfo = lineinfos.pack(pool.man, pool.files.getOrIncl(config.toTrack.filename),
+  # Editors always hand us absolute paths, but the NIF line-info tables store the
+  # module path as `relativePath(fullPath, getCurrentDir(), '/')` (see nifler's
+  # `--portablePaths`). Interning a different string form would yield a different
+  # FileId and the `file,line,col` lookup would silently miss (`symbol not found`).
+  # Normalize an absolute query path to that exact relative form so both absolute
+  # and relative arguments resolve. `moduleSuffix` already relativizes internally.
+  var trackFilename = config.toTrack.filename
+  if isAbsolute(trackFilename):
+    trackFilename = relativePath(trackFilename, getCurrentDir(), '/')
+  let requestedInfo = lineinfos.pack(pool.man, pool.files.getOrIncl(trackFilename),
                                      config.toTrack.line, config.toTrack.col)
   # first pass: search for the symbol at `file,line,col`:
   var isLocalSym = false

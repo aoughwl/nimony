@@ -28,6 +28,16 @@ proc update(c: var SizeofValue; size, align: int) =
 proc combine(c: var SizeofValue; inner: SizeofValue) =
   if c.maxAlign != 0:
     c.maxAlign = max(c.maxAlign, inner.maxAlign)
+    # An aggregate field has to start on its own alignment, exactly as a
+    # scalar one does in `update`. Adding `inner.size` to an unaligned
+    # `c.size` loses the padding in front of it, and every field after it
+    # then sits too low: `object (a: char, b: <16-byte, align 8>, c: char)`
+    # came out 24 instead of 32. `finish`'s tail round-up hides it whenever
+    # the aggregate is the LAST field, which is why it survived.
+    # `inner.maxAlign == 0` is the `{.packed.}` sentinel — a packed aggregate
+    # imposes no alignment on its container.
+    if inner.maxAlign != 0:
+      c.size = align(c.size, inner.maxAlign)
   c.size = c.size + inner.size
   c.overflow = c.overflow or inner.overflow
 

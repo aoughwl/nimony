@@ -315,6 +315,9 @@ proc parseProcPragmas(c: var GeneratedCode; n: var Cursor): PragmaInfo =
             result.attr = n.litId
           inc n
           while n.hasMore: skip n
+      of VariantP:
+        # variant-object discriminator annotation (#2068); never valid on a proc.
+        error c.m, "invalid proc pragma: ", n
   else:
     error c.m, "expected proc pragmas but got: ", n
 

@@ -213,11 +213,19 @@ proc consumeParRi*(c: var Cursor) {.inline.} =
   ## may sit at the bounded scope's tail without being counted in `rem`,
   ## so plain `inc` would trip its `rem != 0` guard — we accept rem == 0
   ## and just advance the pointer.
-  assert c.kind == ParRi, "consumeParRi: cursor not at ParRi"
+  # AN EXHAUSTED CURSOR HAS NOTHING TO CONSUME. `c.kind` calls `load`, whose
+  # first statement is `assert c.p != nil and c.rem > 0`, so the assertion below
+  # was itself crashing on the very case it exists to describe. Reached from the
+  # error path, where the cursor has run out precisely because the tree being
+  # rendered is the unusual one.
+  if c.p == nil: return
   when defined(virtualParRi):
+    if c.rem > 0: assert c.kind == ParRi, "consumeParRi: cursor not at ParRi"
     c.p = cast[ptr PackedToken](cast[uint](c.p) + sizeof(PackedToken).uint)
     if c.rem > 0: dec c.rem
   else:
+    if c.rem <= 0: return
+    assert c.kind == ParRi, "consumeParRi: cursor not at ParRi"
     inc c
 
 # `setTag(PackedToken, TagId)` lives in nifstreams now (gated by `-d:virtualParRi`)
@@ -323,7 +331,18 @@ template hasMore*(n: Cursor): bool =
   when defined(virtualParRi):
     n.rem > 0 and n.kind != ParRi
   else:
-    n.kind != ParRi
+    # The `rem > 0` guard belongs in BOTH branches. Without it this contradicts
+    # the contract two lines up: `n.kind` calls `load`, whose first statement is
+    # `assert c.p != nil and c.rem > 0`, so an exhausted cursor DIES here instead
+    # of answering `false`.
+    #
+    # It is reached from the ERROR PATH. `resolveOverloads` renders the call it
+    # could not resolve, via `asNimCode` -> `renderTree` -> `gcallComma`, and a
+    # cursor that has run out is exactly what an unresolvable call hands it. The
+    # compiler then dies while REPORTING an error instead of reporting it, which
+    # is strictly worse than a bad message -- nothing downstream can see the
+    # diagnosis at all.
+    n.rem > 0 and n.kind != ParRi
 
 template into*(n: var Cursor; body: untyped) =
   ## Enters the current ParLe node, runs `body` to process the children,

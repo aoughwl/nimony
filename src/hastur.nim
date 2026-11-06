@@ -266,9 +266,15 @@ var nimcacheDir* = "nimcache"
   ## race on the same `nimcache/` artifacts.
 
 var parallelJobs* = 1
-  ## How many tests `testDir` runs concurrently. 1 = serial (current
-  ## behavior). `--jobs:N` on the command line overrides; `--jobs:auto`
-  ## uses `countProcessors()`.
+  ## How many tests `testDir` runs concurrently. `--jobs:N` overrides;
+  ## `--jobs:auto` uses `countProcessors()`. A bare `hastur <dir>` tree walk
+  ## defaults to all cores (see `jobsExplicit`); everything else (the internal
+  ## `test <file>` worker invocations, boot/selfcheck) stays serial unless a
+  ## `--jobs` is passed, so there is no accidental nested parallelism.
+
+var jobsExplicit = false
+  ## Set once the user passes `--jobs` on the command line. When false, the
+  ## top-level tree-walk test command defaults `parallelJobs` to all cores.
 
 var skipBuild* = false
   ## Set by the parallel test runner on its worker invocations: the
@@ -771,6 +777,23 @@ proc parallelTestDir(c: var TestCounters; files: openArray[string];
          "parallel run: ",
          formatFloat(epochTime() - parallelStart, ffDecimal, precision=2), "s."
 
+const SerialMarker = "hastur.serial"
+  ## A test directory may drop an empty `hastur.serial` file to opt itself
+  ## (and everything beneath it) out of parallel execution even when `--jobs`
+  ## > 1. Used for load-sensitive suites that flake under heavy CPU
+  ## oversubscription but pass serially: `threads/` (race tests) and
+  ## `plugins/` (plugin subprocess contention).
+
+proc isParallelUnsafe(dir: string): bool =
+  ## True if `dir` or an ancestor carries a `SerialMarker` file.
+  var d = dir
+  while d.len > 0:
+    if fileExists(d / SerialMarker): return true
+    let parent = d.parentDir
+    if parent == d: break
+    d = parent
+  return false
+
 proc testDir(c: var TestCounters; dir: string; overwrite: bool; cat: Category; forward: string) =
   var files: seq[string] = @[]
   for x in walkDir(dir):
@@ -779,7 +802,7 @@ proc testDir(c: var TestCounters; dir: string; overwrite: bool; cat: Category; f
   sort files
   if cat in {Compat, Basics}:
     removeDir "nimcache"
-  if parallelJobs > 1 and canRunParallel(cat):
+  if parallelJobs > 1 and canRunParallel(cat) and not isParallelUnsafe(dir):
     parallelTestDir(c, files, overwrite, cat, forward, parallelJobs)
   else:
     for f in items files:
@@ -1242,7 +1265,85 @@ proc validatePassesFlag(): string =
   else:
     ""
 
+proc ensureNiflerParserOverlay() =
+  ## Nifler compiles Nim's own `compiler/parser.nim` (resolved through
+  ## `--path:$nim`, see src/nifler/nim.cfg). Support for the new-styled
+  ## `type C = concept of D` inheritance syntax (used by nimony's concept
+  ## tests and lowered by src/nifler/bridge.nim's `nkTypeClassTy` handler)
+  ## landed in Nim `devel`'s parser *after* the frozen nightly that
+  ## `alaviss/setup-nim` installs. On such a stale host Nim, `parseTypeClass`
+  ## treats the `of` after `concept` as a concept parameter and dies with
+  ## "identifier expected, but got 'keyword of'", so every inheriting concept
+  ## fails the nifler pre-pass.
+  ##
+  ## CI works around this by overlaying fresh `devel` compiler sources onto
+  ## the host Nim (see .github/workflows/ci.yml). We do the equivalent for
+  ## local builds without mutating the shared host Nim: generate a private
+  ## copy of the host `compiler/` dir with the one parser fix applied, and
+  ## point nifler's nim.cfg at it (searched last, so it wins). The overlay is
+  ## regenerated whenever the host parser is newer than our copy.
+  let nimExe = findExe("nim")
+  if nimExe.len == 0: return
+  let nimPrefix = nimExe.parentDir.parentDir      # <prefix>/bin/nim -> <prefix>
+  let srcCompiler = nimPrefix / "compiler"
+  let srcParser = srcCompiler / "parser.nim"
+  if not fileExists(srcParser): return
+  let overlayDir = getCurrentDir() / ".nim_overlay"
+  let dstCompiler = overlayDir / "compiler"
+  let dstParser = dstCompiler / "parser.nim"
+
+  const marker = "new-styled `concept of A, B`"
+  let upToDate = fileExists(dstParser) and
+    readFile(dstParser).contains(marker) and
+    getLastModificationTime(dstParser) >= getLastModificationTime(srcParser)
+  if upToDate: return
+
+  removeDir overlayDir
+  createDir overlayDir
+  copyDir srcCompiler, dstCompiler
+  # `compiler/extccomp.nim` imports `../dist/checksums/...`; make that sibling
+  # reachable from the overlay too.
+  let srcDist = nimPrefix / "dist"
+  if dirExists(srcDist):
+    let dstDist = overlayDir / "dist"
+    when defined(windows):
+      copyDir srcDist, dstDist
+    else:
+      createSymlink srcDist, dstDist
+
+  # Apply the parser fix: don't consume the `of` that starts concept
+  # inheritance as a concept parameter, and allow an empty body when the
+  # concept only inherits requirements from its parents.
+  var src = readFile(dstParser)
+  src = src.replace(
+    "  if p.tok.indent < 0:\n" &
+    "    var args = newNodeP(nkArgList, p)\n" &
+    "    result.add(args)\n" &
+    "    args.add(p.parseTypeClassParam)",
+    "  if p.tok.tokType == tkOf and p.tok.indent < 0:\n" &
+    "    # " & marker & " on the same line as `concept`\n" &
+    "    result.add(p.emptyNode)\n" &
+    "  elif p.tok.indent < 0:\n" &
+    "    var args = newNodeP(nkArgList, p)\n" &
+    "    result.add(args)\n" &
+    "    args.add(p.parseTypeClassParam)")
+  src = src.replace(
+    "  if not realInd(p):\n" &
+    "    if result.isNewStyleConcept:\n" &
+    "      parMessage(p, \"routine expected, but found '$1' (empty new-styled concepts are not allowed)\", p.tok)\n" &
+    "    result.add(p.emptyNode)",
+    "  if not realInd(p):\n" &
+    "    let hasParents = result[2].kind != nkEmpty\n" &
+    "    if result.isNewStyleConcept and not hasParents:\n" &
+    "      parMessage(p, \"routine expected, but found '$1' (empty new-styled concepts are not allowed)\", p.tok)\n" &
+    "    result.add(p.emptyNode)")
+  if not src.contains(marker):
+    quit "FAILURE: could not apply concept-of parser overlay to " & srcParser &
+      "\n(host Nim parser layout changed; update ensureNiflerParserOverlay)"
+  writeFile(dstParser, src)
+
 proc buildNifler(showProgress = false) =
+  ensureNiflerParserOverlay()
   exec nimcPrefix() & "src/nifler/nifler.nim", showProgress
   let exe = "nifler".addFileExt(ExeExt)
   robustMoveFile "src/nifler/" & exe, binDir() / exe
@@ -2058,6 +2159,7 @@ proc handleCmdLine =
         toolchainDir = val
         skipBuild = true
       of "jobs", "j":
+        jobsExplicit = true
         if val == "auto" or val.len == 0:
           parallelJobs = countProcessors()
         else:
@@ -2148,6 +2250,10 @@ proc handleCmdLine =
     of "nifler":
       buildNifler(showProgress)
     of "nimony":
+      # nifler carries the concept-of parser overlay (ensureNiflerParserOverlay);
+      # `build nimony` must (re)build it too or inheriting concepts fail to parse
+      # against a stale host Nim. Cheap once the overlay is up to date.
+      buildNifler(showProgress)
       buildNimsem(showProgress)
       buildNimony(showProgress)
       buildHexer(showProgress)
@@ -2238,6 +2344,11 @@ proc handleCmdLine =
     pullpush("push")
   else:
     if dirExists(rawPrimary):
+      # A bare `hastur <dir>` tree walk defaults to all cores unless the user
+      # pinned `--jobs`. Dirs that flake under oversubscription opt out via a
+      # `hastur.serial` marker (isParallelUnsafe), so this stays deterministic.
+      if not jobsExplicit and parallelJobs <= 1:
+        parallelJobs = max(1, countProcessors())
       walkCmd(rawPrimary, forward, overwrite)
     else:
       quit "invalid command: " & primaryCmd

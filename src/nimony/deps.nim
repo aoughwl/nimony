@@ -930,13 +930,13 @@ proc harvestImport(c: DepContext; it: var Cursor; origin: string;
       skip x, SkipCond
     while x.hasMore:
       var isCyclic = false
-      if x.kind == ParLe and x.exprKind == PragmaxX:
+      if x.isTagLit and x.exprKind == PragmaxX:
         var y = x
         inc y
         skip y
         if y.substructureKind == PragmasU:
           inc y
-          if y.kind == Ident and pool.strings[y.litId] == "cyclic":
+          if y.isIdent and pool.strings[y.strId] == "cyclic":
             isCyclic = true
       var files: seq[ImportedFilename] = @[]
       var hasError = false
@@ -977,23 +977,18 @@ proc harvestDepImports(c: DepContext; p: FilePair;
   ## is missing (harvest miss), the DFS self-heals.
   let depsFile = c.config.depsFile(p, c.cmd == DoDoc)
   if not semos.fileExists(depsFile): return
-  var stream = nifstreams.open(depsFile)
-  try:
-    discard processDirectives(stream.r)
-    var buf = fromStream(stream)
-    var n = beginRead(buf)
-    if n.kind == ParLe and pool.tags[n.tagId] == "stmts":
-      n.into:
-        while n.hasMore:
-          case stmtKind(n)
-          of ImportS:
-            harvestImport(c, n, p.nimFile, res, seen)
-          of FromimportS, ImportexceptS:
-            harvestSingleImport(c, n, p.nimFile, res, seen)
-          else:
-            skip n
-  finally:
-    nifstreams.close(stream)
+  var buf = loadDepsFile(depsFile)
+  var n = beginRead(buf)
+  if n.isTagLit and globalTags.tags[n.cursorTagId] == "stmts":
+    n.into:
+      while n.hasMore:
+        case stmtKind(n)
+        of ImportS:
+          harvestImport(c, n, p.nimFile, res, seen)
+        of FromimportS, ImportexceptS:
+          harvestSingleImport(c, n, p.nimFile, res, seen)
+        else:
+          skip n
 
 proc preNifle(c: var DepContext; root: FilePair) =
   ## BFS over the import closure, running nifler in parallel per round.

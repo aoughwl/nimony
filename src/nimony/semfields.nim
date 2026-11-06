@@ -91,6 +91,67 @@ proc buildTupleFieldIter(buf: var TokenBuf; iter: FieldsIter; i: int; name: StrI
   buf.addParRi() # (elif)
   buf.addParRi() # (if)
 
+proc buildObjectFieldIter(buf: var TokenBuf; iter: FieldsIter; isInternalSym: bool;
+                          n: var Cursor; body: Cursor) =
+  ## Emit the loop body for ONE object-record component at `n`, advancing `n`
+  ## past it. Handles plain fields, nested `(stmts …)` groups, empty `(nil)`
+  ## branches, and object-variant `(case …)` records. For a variant the
+  ## generated code visits the discriminant field, then dispatches on it with a
+  ## `case` statement so that only the ACTIVE branch's fields are visited at
+  ## runtime — mirroring Nim's `system.fields`/`fieldPairs` on variant objects.
+  case n.substructureKind
+  of FldU, GfldU:
+    let field = takeLocal(n, SkipFinalParRi)
+    let fieldSym = if isInternalSym: field.name.symId else: SymId(0)
+    buildNamedFieldIter(buf, iter, getIdent(field.name), fieldSym, body)
+  of StmtsU:
+    n.into:
+      while n.hasMore:
+        buildObjectFieldIter(buf, iter, isInternalSym, n, body)
+  of NilU:
+    skip n  # empty variant branch body: nothing to visit
+  of CaseU:
+    n.into:
+      # The discriminant selector is visited like any other named field:
+      let disc = takeLocal(n, SkipFinalParRi)
+      let discIdent = getIdent(disc.name)
+      let discSym = if isInternalSym: disc.name.symId else: SymId(0)
+      buildNamedFieldIter(buf, iter, discIdent, discSym, body)
+      # Then dispatch on the discriminant's runtime value so only the fields of
+      # the active branch are visited. The `of` labels are copied verbatim from
+      # the (already exhaustive) variant declaration, so the generated `case`
+      # is exhaustive too.
+      buf.addParLe(CaseS, body.info)
+      buf.addParLe(DotX, body.info)
+      buf.addSubtree iter.obj1
+      buf.add identToken(discIdent, body.info)
+      buf.addParRi()  # (dot obj1 disc)
+      while n.hasMore:
+        case n.substructureKind
+        of OfU:
+          buf.addParLe(OfU, body.info)
+          n.into:
+            buf.addSubtree n  # (ranges …) verbatim
+            skip n
+            buf.addParLe(StmtsS, body.info)
+            while n.hasMore:
+              buildObjectFieldIter(buf, iter, isInternalSym, n, body)
+            buf.addParRi()  # (stmts)
+          buf.addParRi()    # (of)
+        of ElseU:
+          buf.addParLe(ElseU, body.info)
+          n.into:
+            buf.addParLe(StmtsS, body.info)
+            while n.hasMore:
+              buildObjectFieldIter(buf, iter, isInternalSym, n, body)
+            buf.addParRi()  # (stmts)
+          buf.addParRi()    # (else)
+        else:
+          error "illformed AST inside case object: ", n
+      buf.addParRi()  # (case)
+  else:
+    error "illformed AST inside object: ", n
+
 proc semForFields(c: var SemContext; dest: var TokenBuf; it: var Item; call, orig: Cursor) =
   let fieldPairs = call.exprKind in {FieldpairsX, InternalFieldPairsX}
   let isInternalSym = call.exprKind == InternalFieldPairsX
@@ -212,10 +273,8 @@ proc semForFields(c: var SemContext; dest: var TokenBuf; it: var Item; call, ori
         if obj.kind == ObjectT:
           skip currentField, AnyType  # parent type / inheritance slot
         while currentField.hasMore:
-          let field = takeLocal(currentField, SkipFinalParRi)
-          let fieldSym = if isInternalSym: field.name.symId else: SymId(0)
-          # field name is enough:
-          buildNamedFieldIter(iterBuf, iter, getIdent(field.name), fieldSym, body)
+          # handles plain fields as well as object-variant `case` records:
+          buildObjectFieldIter(iterBuf, iter, isInternalSym, currentField, body)
       objType = obj.parentType
       if objType.kind == DotToken:
         break

@@ -297,10 +297,11 @@ proc singlePath(pc: Cursor; nested: int; x: Cursor; pcs: var seq[Cursor];
           # restored an emptied field. `containsRoot` is sound (it also catches
           # deref-of-root) and lets a disjoint sibling read `a.other` through
           # (see `disjointDirectField`).
+          let usageAt = pc # capture the use site before containsRoot advances pc
           if containsRoot(pc, x):
             # only partially writes to 's' --> can't sink 's', so this def reads 's'
             # or maybe writes to 's' --> can't sink 's'
-            otherUsage = pc # XXX Fixme: pc advanced to ')'
+            otherUsage = usageAt
             return false
           skipParRi pc
         of RetS:
@@ -324,8 +325,9 @@ proc singlePath(pc: Cursor; nested: int; x: Cursor; pcs: var seq[Cursor];
           inc nested
           # proceed with its value here
         of NoStmt, CallKindsS, DiscardS, EmitS, InclS, ExclS:
+          let usageAt = pc # capture the use site before containsRoot advances pc
           if containsRoot(pc, x):
-            otherUsage = pc # XXX Fixme: pc advanced to ')'
+            otherUsage = usageAt
             return false
         of YldS:
           # bare `(yld .)` from closure-iter rewrite: a control-flow marker

@@ -304,6 +304,8 @@ proc compileProgram(c: var CmdOptions) =
   elif c.args.len > 2 - int(c.cmd in {FullProject, CheckProject, DocProject}):
     quit "too many command line arguments"
 
+  if c.config.isDefined("aowlgc"):
+    c.checkModes.incl AowlGc
   if c.checkModes != DefaultSettings:
     let flags = genFlags(c.checkModes)
     # Emit a bare `--flags` when no checks are active (e.g. `-d:danger`): a

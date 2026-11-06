@@ -101,13 +101,47 @@ func readRawData*(s {.byref.}: string; start = 0): ptr UncheckedArray[char]
 
 # ---- lifecycle hooks ----
 
+when defined(aowlgc):
+  ## A LongString's heap block is otherwise a plain refcounted ARC
+  ## allocation (`alloc`/`dealloc`, `s.more.rc`). Under `-d:aowlgc` a string
+  ## embedded in a GC-managed container is only reachable for as long as the
+  ## collector decides to keep that container alive -- not for as long as
+  ## some local-scope rc bookkeeping assumed -- so freeing the block
+  ## eagerly at rc==0 can race the collector finalizing the container later
+  ## and still reading/decrementing this same block. Fix (same shape as
+  ## nifcursors' CursorOwner): the block becomes a GC-traced heap object.
+  ## `rc` stays live/accurate in BOTH modes -- `arcIsUnique` (the COW "am I
+  ## exclusively owned?" check) still needs it -- only the free-at-zero
+  ## ACTION becomes the collector's job (via the finalizer below) instead
+  ## of an immediate `dealloc`. Plain ARC mode (every other nimony
+  ## program/branch) is unchanged byte-for-byte.
+  proc longStringTracer(p: pointer; env: pointer) {.cdecl.} =
+    discard p
+    discard env
+    ## `data` is raw char bytes, not aowlgc-managed memory -- nothing
+    ## further to report.
+
+  proc longStringFinalizer(p: pointer) {.cdecl.} =
+    discard p
+    ## No nested allocation to free: the traced block IS the LongString's
+    ## storage; the collector reclaims the block's own memory after this
+    ## finalizer returns.
+
+  proc allocLongStringMem(nbytes: int): pointer {.inline, noSideEffect, raises: [], tags: [].} =
+    {.cast(noSideEffect).}:
+      result = aowlgcNew(nbytes, longStringTracer, longStringFinalizer)
+
+
 func `=wasMoved`*(s: var string) {.exportc: "nimStrWasMoved", inline.} =
   s.bytes = 0
 
 func `=destroy`*(s: string) {.exportc: "nimStrDestroy", inline.} =
   if ssLen(s) == HeapSlen:
     if arcDec(s.more.rc):
-      dealloc(s.more)
+      when defined(aowlgc):
+        discard "the collector frees this traced block once unreachable"
+      else:
+        dealloc(s.more)
 
 func `=copy`*(dest: var string; src: string) {.exportc: "nimStrCopy", nodestroy.} =
   let ssrc = ssLen(src)
@@ -116,7 +150,10 @@ func `=copy`*(dest: var string; src: string) {.exportc: "nimStrCopy", nodestroy.
     let sdest = ssLen(dest)
     if sdest == HeapSlen:
       if arcDec(dest.more.rc):
-        dealloc(dest.more)
+        when defined(aowlgc):
+          discard "the collector frees this traced block once unreachable"
+        else:
+          dealloc(dest.more)
     copyMem(addr dest.bytes, addr src.bytes, sizeof(string))
   else:
     # long or static: COW share
@@ -124,7 +161,10 @@ func `=copy`*(dest: var string; src: string) {.exportc: "nimStrCopy", nodestroy.
     let sdest = ssLen(dest)
     if sdest == HeapSlen:
       if arcDec(dest.more.rc):
-        dealloc(dest.more)
+        when defined(aowlgc):
+          discard "the collector frees this traced block once unreachable"
+        else:
+          dealloc(dest.more)
     if ssrc == HeapSlen:
       arcInc(src.more.rc)
     copyMem(addr dest.bytes, addr src.bytes, sizeof(string))
@@ -133,6 +173,15 @@ func `=dup`*(s: string): string {.exportc: "nimStrDup", inline, nodestroy.} =
   if ssLenOf(s.bytes) == HeapSlen:
     arcInc(s.more.rc)
   result = string(bytes: s.bytes, more: s.more)
+
+when defined(aowlgc):
+  proc `=trace`*(s: var string; env: pointer) {.inline.} =
+    ## Reports the string's heap block to the collector so it survives for
+    ## as long as this string (or any string sharing its block) is
+    ## reachable, independent of local-scope rc bookkeeping. Short/medium/
+    ## static strings own no separate heap block -- nothing to report.
+    if ssLenOf(s.bytes) == HeapSlen:
+      aowlgcMark(env, s.more)
 
 # ---- cstring length ----
 
@@ -167,7 +216,7 @@ func ensureUniqueLong(s: var string; oldLen, newLen: int) =
     copyMem(inlinePtrV(s), addr s.more.data[0], min(oldLen, AlwaysAvail))
   else:
     let newCap = if newLen > cap: max(newLen, ssResize(cap)) else: cap
-    let p = cast[ptr LongString](alloc(LongStringDataOffset + newCap))
+    let p = cast[ptr LongString]((when defined(aowlgc): allocLongStringMem(LongStringDataOffset + newCap) else: alloc(LongStringDataOffset + newCap)))
     if p != nil:
       p.rc = 0
       p.fullLen = newLen
@@ -176,7 +225,10 @@ func ensureUniqueLong(s: var string; oldLen, newLen: int) =
         let old = s.more
         copyMem(addr p.data[0], addr old.data[0], min(oldLen, newCap))
         if arcDec(old.rc):
-          dealloc(old)
+          when defined(aowlgc):
+            discard "the collector frees this traced block once unreachable"
+          else:
+            dealloc(old)
       else:
         # Static long string: full data lives in s.more.data; the inline
         # cache only holds the first AlwaysAvail bytes, so reading from it
@@ -192,7 +244,7 @@ func ensureUniqueLong(s: var string; oldLen, newLen: int) =
 
 func transitionToLong(s: var string; sl: int; newLen: int) =
   let newCap = max(newLen, ssResize(newLen))
-  let p = cast[ptr LongString](alloc(LongStringDataOffset + newCap))
+  let p = cast[ptr LongString]((when defined(aowlgc): allocLongStringMem(LongStringDataOffset + newCap) else: alloc(LongStringDataOffset + newCap)))
   if p != nil:
     p.rc = 0
     p.fullLen = newLen
@@ -229,7 +281,7 @@ func prepareMutation*(s: var string) =
       discard arcDec(s.more.rc)
     let old = s.more
     let oldLen = old.fullLen
-    let p = cast[ptr LongString](alloc(LongStringDataOffset + oldLen))
+    let p = cast[ptr LongString]((when defined(aowlgc): allocLongStringMem(LongStringDataOffset + oldLen) else: alloc(LongStringDataOffset + oldLen)))
     if p != nil:
       p.rc = 0
       p.fullLen = oldLen
@@ -431,7 +483,7 @@ func substr*(s: string; first, last: int): string =
     setSSLen(result, newLen)
     copyMem(inlinePtrV(result), cast[pointer](cast[uint](src) + uint(f)), newLen)
   else:
-    let p = cast[ptr LongString](alloc(LongStringDataOffset + newLen))
+    let p = cast[ptr LongString]((when defined(aowlgc): allocLongStringMem(LongStringDataOffset + newLen) else: alloc(LongStringDataOffset + newLen)))
     if p != nil:
       p.rc = 0
       p.fullLen = newLen
@@ -649,7 +701,7 @@ func newString*(len: int): string =
     setSSLen(result, len)
     zeroMem(inlinePtrV(result), len)
   else:
-    let p = cast[ptr LongString](alloc(LongStringDataOffset + len))
+    let p = cast[ptr LongString]((when defined(aowlgc): allocLongStringMem(LongStringDataOffset + len) else: alloc(LongStringDataOffset + len)))
     if p != nil:
       zeroMem(p, LongStringDataOffset + len)
       p.rc = 0
@@ -664,7 +716,7 @@ func newStringOfCap*(len: int): string =
   ## Returns a new empty string with capacity reserved for `len` chars.
   result = string(bytes: 0'u, more: nil)
   if len <= PayloadSize: return  # inline capacity always available
-  let p = cast[ptr LongString](alloc(LongStringDataOffset + len))
+  let p = cast[ptr LongString]((when defined(aowlgc): allocLongStringMem(LongStringDataOffset + len) else: alloc(LongStringDataOffset + len)))
   if p != nil:
     zeroMem(p, LongStringDataOffset + len)
     p.rc = 0
@@ -687,7 +739,7 @@ func `&`*(a, b: string): string {.semantics: "string.&".} =
     if al > 0: copyMem(inlinePtrV(result), rawData(a), al)
     if b.len > 0: copyMem(inlinePtrAt(result, al), rawData(b), b.len)
   else:
-    let p = cast[ptr LongString](alloc(LongStringDataOffset + rlen))
+    let p = cast[ptr LongString]((when defined(aowlgc): allocLongStringMem(LongStringDataOffset + rlen) else: alloc(LongStringDataOffset + rlen)))
     if p != nil:
       p.rc = 0
       p.fullLen = rlen
@@ -727,7 +779,7 @@ func borrowCStringUnsafe*(s: cstring; l: int): string =
     setSSLen(result, l)
     copyMem(inlinePtrV(result), s, l)
   else:
-    let p = cast[ptr LongString](alloc(LongStringDataOffset + l))
+    let p = cast[ptr LongString]((when defined(aowlgc): allocLongStringMem(LongStringDataOffset + l) else: alloc(LongStringDataOffset + l)))
     if p != nil:
       p.rc = 0
       p.fullLen = l
@@ -764,7 +816,7 @@ func fromCString*(s: cstring): string =
     setSSLen(result, l)
     copyMem(inlinePtrV(result), s, l)
   else:
-    let p = cast[ptr LongString](alloc(LongStringDataOffset + l))
+    let p = cast[ptr LongString]((when defined(aowlgc): allocLongStringMem(LongStringDataOffset + l) else: alloc(LongStringDataOffset + l)))
     if p != nil:
       p.rc = 0
       p.fullLen = l

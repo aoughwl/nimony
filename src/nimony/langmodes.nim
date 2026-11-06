@@ -10,6 +10,7 @@ type
   CheckMode* = enum
     BoundCheck
     RangeCheck
+    AowlGc     ## not a check: the aowlgc memory mode (refs in the tracing heap)
 
   ModuleFlag* = enum
     IsSystem, IsMain, SkipSystem
@@ -20,7 +21,8 @@ const
 const
   shortcuts: array[CheckMode, char] = [
     BoundCheck: 'b',
-    RangeCheck: 'r'
+    RangeCheck: 'r',
+    AowlGc: 'g'
   ]
 
 proc genFlags*(s: set[CheckMode]): string =

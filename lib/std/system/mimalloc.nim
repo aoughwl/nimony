@@ -6,7 +6,28 @@
 # via `--passC` (see hastur's `testFile`, `prebuildSharedObjects`, and
 # `boot --valgrind`); that flag flows into the same `cc` command that compiles
 # `static.c`, so tracking is preserved exactly where it's wanted.
-{.compile("${path}/../../../vendor/mimalloc/src/static.c", "-DMI_STATS=1 -I${path}/../../../vendor/mimalloc/include").}
+# `MI_STAT` (not `MI_STATS`) is the macro mimalloc actually tests — see
+# `vendor/mimalloc/include/mimalloc/types.h:653`. `-DMI_STATS=1` defined a name
+# nothing reads; the counters `getOccupiedMem`/`getTotalMem`/`getFreeMem` below
+# depend on were on only as a side effect of `MI_DEBUG>0`, i.e. only because the
+# allocator was being built in DEBUG mode. Ask for them explicitly instead, so
+# the three procs report the same thing in every build mode.
+#
+# `MI_BUILD_RELEASE` turns off `MI_DEBUG` (types.h:69-75) and with it
+# `MI_PADDING`, `MI_PADDING_CHECK`, `MI_ENCODE_FREELIST` and
+# `mi_assert_internal`. Without it every nimony program — including one built
+# with `-d:danger` — linked an allocator full of assertions and per-block
+# padding checks (`nm` on a shipped `-d:danger` binary showed `_mi_assert_fail`,
+# `mi_check_padding`, `mi_page_decode_padding`).
+#
+# Safe to vary per build mode only because `nimcache_static/` keys the resulting
+# object on the `cc` command (`sharedObjFile` in `src/nimony/deps.nim`);
+# keyed by basename alone this `when` would have made the LAST program built on
+# the machine decide every other program's allocator.
+when defined(release) or defined(danger):
+  {.compile("${path}/../../../vendor/mimalloc/src/static.c", "-DMI_BUILD_RELEASE -DMI_STAT=1 -I${path}/../../../vendor/mimalloc/include").}
+else:
+  {.compile("${path}/../../../vendor/mimalloc/src/static.c", "-DMI_STAT=1 -I${path}/../../../vendor/mimalloc/include").}
 when defined(arm):
   {.passL:"-latomic".}
 

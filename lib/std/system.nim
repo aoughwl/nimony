@@ -196,6 +196,9 @@ template linear*() {.pragma.}
   ## this to allow parallel `c[i] = …` writes. `seq`/array indexing is linear;
   ## `Table` indexing is not (it may rehash and relocate other slots).
 
+when defined(aowlgc):
+  include "system/aowlgc"
+
 include "system/seqimpl"
 include "system/stringimpl"
 include "system/openarrays"
@@ -559,12 +562,20 @@ proc typeof*(x: untyped; mode = typeOfIter): typedesc {.magic: TypeOf.}
 
 proc allocFrame*(size: int): ptr CoroutineBase =
   ## Allocates a new coroutine frame of the given size on the heap.
-  result = cast[ptr CoroutineBase](alloc(size))
+  when defined(aowlgc):
+    # The frame layout is produced by the cps pass, after hooks are lifted, so
+    # it has no precise tracer: a pinned block, scanned conservatively.
+    result = cast[ptr CoroutineBase](aowlgcAllocPinned(size))
+  else:
+    result = cast[ptr CoroutineBase](alloc(size))
 
 proc deallocFrame*(frame: ptr CoroutineBase) =
   ## Frees a coroutine frame previously allocated by `allocFrame`.
   if frame.callee != nil:
-    dealloc(frame)
+    when defined(aowlgc):
+      aowlgcFreePinned(frame)
+    else:
+      dealloc(frame)
 
 type
   Exception* = object of RootObj

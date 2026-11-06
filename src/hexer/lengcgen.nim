@@ -2564,6 +2564,7 @@ proc trToplevel(c: var EContext; dest: var TokenBuf; n: var Cursor) =
       swap dest, c.initBody
 
 proc expand*(infile: string; bits: int; bigEndian: bool; flags: set[CheckMode]; isMain: bool; outdir: string; appType = appConsole) =
+  aowlgcMode = AowlGc in flags
   let mp = splitModulePath(infile)
   let dir =
     if outdir.len > 0: outdir

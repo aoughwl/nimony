@@ -23,6 +23,7 @@ include ".." / lib / compat2
 import ".." / lib / [symparser, nifindexes, docpaths]
 import ".." / gear2 / modnames
 import ".." / models / nifindex_tags
+from ".." / hexer / lifter import aowlgcMode
 import nimony_model, symtabs, builtintypes, decls, programs, sigmatch,
   reporters, nifconfig, xints, semdata, sembasics,
   semos, langmodes, derefs, vtables_frontend,
@@ -465,6 +466,7 @@ proc semcheckCore(c: var SemContext; dest: var TokenBuf; n0: Cursor) =
       dest = move afterSem
     else:
       var finalBuf = beginRead afterSem
+      aowlgcMode = c.g.config.isDefined("aowlgc")
       dest = injectDerefs(finalBuf, c.typeHooks, c.classes, c.thisModuleSuffix, c.g.config.bits)
     when true: #defined(enableContracts):
       var moreErrors = analyzeContractsFinalIr(dest, c.thisModuleSuffix, c.g.config.verbose)
@@ -551,6 +553,7 @@ proc semcheckPostProcess(c: var SemContext; dest: var TokenBuf) =
       dest = move afterSem
     else:
       var finalBuf = beginRead afterSem
+      aowlgcMode = c.g.config.isDefined("aowlgc")
       dest = injectDerefs(finalBuf, c.typeHooks, c.classes, c.thisModuleSuffix, c.g.config.bits)
   else:
     quit 1

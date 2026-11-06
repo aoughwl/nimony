@@ -980,10 +980,15 @@ proc trStmt(c: var ControlFlow; n: var Cursor) =
     trTry c, n, aa
   of RaiseS:
     trRaise c, n
-  of IteratorS, ProcS, FuncS, MacroS, ConverterS, MethodS:
+  of IteratorS, ProcS, FuncS, ConverterS, MethodS:
     trProc c, n
-  of TemplateS, TypeS, CommentS, EmitS, IncludeS, ImportS, ExportS, FromimportS, ImportexceptS, PragmasS,
+  of MacroS, TemplateS, TypeS, CommentS, EmitS, IncludeS, ImportS, ExportS, FromimportS, ImportexceptS, PragmasS,
      ImportasS, ExportexceptS, BindS, MixinS, UsingS:
+    # Macros are compiled into out-of-process plugins and templates are expanded
+    # at call sites; neither has a runtime body that participates in control-flow
+    # analysis. Their stored bodies also encode nested routine names as plain
+    # symbol uses (not SymbolDefs), so descending into them would crash
+    # `takeRoutineHeader`. Skip them like the other compile-time-only decls.
     c.dest.addDotToken()
     skip n
   of CallKindsS, InclS, ExclS, AssumeS, AssertS:

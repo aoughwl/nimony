@@ -1035,9 +1035,21 @@ proc semLocalTypeImpl*(c: var SemContext; dest: var TokenBuf; n: var Cursor;
     of SetT:
       if tryTypeClass(c, dest, n):
         return
+      let setStart = dest.len
       takeToken dest, n
       let elemTypeStart = dest.len
-      semLocalTypeImpl c, dest, n, InLocalDecl
+      if isRangeExpr(n):
+        # `set['a'..'z']` means `set[range['a'..'z']]`, exactly as
+        # `array['a'..'z', T]` means an array over that range (see
+        # `semArrayType`). Without this the range EXPRESSION is semmed as a
+        # value, which is not an ordinal type, so a correct program was
+        # rejected with "set element type must be ordinal" — and worse, the
+        # error node produced here is not something the type-decl reader can
+        # consume, so the rejection surfaced as a `[Bug]` traceback
+        # ("expected ')', but got: (err …)") instead of a diagnostic.
+        semRangeTypeFromExpr c, dest, n, info
+      else:
+        semLocalTypeImpl c, dest, n, InLocalDecl
       takeParRi dest, n
       let elemType = cursorAt(dest, elemTypeStart)
       if containsGenericParams(elemType):
@@ -1045,12 +1057,21 @@ proc semLocalTypeImpl*(c: var SemContext; dest: var TokenBuf; n: var Cursor;
         dest.endRead()
       elif not isOrdinalType(elemType, allowEnumWithHoles = true):
         dest.endRead()
+        # The error node has to REPLACE the `(set …)` tree, not follow it. The
+        # set tree was closed by the `takeParRi` above, so appending here left
+        # `(set T)(err …)` where the type-decl reader expects one tree, and it
+        # aborted with `expected ')', but got: (err …)` — a [Bug] traceback
+        # instead of this diagnostic. `semArrayType` does not have the problem
+        # because it errors while its own tree is still open.
+        dest.shrink setStart
         c.buildErr dest, info, "set element type must be ordinal"
       else:
         let length = lengthOrd(c, elemType)
         dest.endRead()
         if length.isNaN or length > MaxSetElements:
-          c.buildErr dest, info, "type " & typeToString(elemType) & " is too large to be a set element type"
+          let msg = "type " & typeToString(elemType) & " is too large to be a set element type"
+          dest.shrink setStart
+          c.buildErr dest, info, msg
     of OrT, AndT:
       takeToken dest, n
       while n.hasMore:

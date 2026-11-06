@@ -911,6 +911,7 @@ proc findObjFieldAux(c: var SemContext; t: Cursor; name: StrId; bindings: Table[
   var baseType = n
   skip n, SkipType # skip basetype
   var iter = initObjFieldIter()
+  var fieldPos = 0 # declaration index of the current field within this level
   while nextField(iter, n):
     let isGuarded = n.substructureKind == GfldU
     inc n # skip FldU/GfldU
@@ -926,13 +927,14 @@ proc findObjFieldAux(c: var SemContext; t: Cursor; name: StrId; bindings: Table[
         # for invoked object types, bindings are built from the given arguments
         # and the field type is instantiated based on them here
         typ = instantiateType(c, typ, bindings)
-      return ObjField(sym: symId, level: level, typ: typ, exported: exported, guarded: isGuarded, rootOwner: SymId(0))
+      return ObjField(sym: symId, level: level, pos: fieldPos, typ: typ, exported: exported, guarded: isGuarded, rootOwner: SymId(0))
     skip n, SkipName # skip name
     skip n, SkipExport # skip export marker
     skip n, SkipPragmas # skip pragmas
     skip n, SkipType # type
     skip n, SkipValue # value
     skipParRi n
+    inc fieldPos
   if baseType.kind == DotToken:
     result = ObjField(level: -1)
   else:
@@ -1263,8 +1265,17 @@ proc insertType(c: var SemContext; dest: var TokenBuf; typ: TypeCursor; patchPos
   dest.insert t, patchPosition
 
 proc patchType(c: var SemContext; dest: var TokenBuf; typ: TypeCursor; patchPosition: int) =
+  # `patchPosition` currently holds the *user-written* declared type, whose head
+  # token carries the real source position of the type usage. `replace` swaps in
+  # the inferred/unified type cursor `typ`, whose head token instead carries the
+  # type's canonical (definition-site) line info. Preserve the original position
+  # so tooling (idetools) reports the type usage where the user actually wrote it
+  # rather than as a duplicate of some other occurrence of the same type.
+  let oldInfo = dest[patchPosition].info
   let t = skipModifier(typ)
   dest.replace t, patchPosition
+  if oldInfo.isValid and dest[patchPosition].info != oldInfo:
+    dest[patchPosition] = withLineInfo(dest[patchPosition], oldInfo)
 
 proc semIdentImpl(c: var SemContext; dest: var TokenBuf; n: var Cursor; ident: StrId; flags: set[SemFlag]): Sym =
   let mode =
@@ -3045,13 +3056,18 @@ proc semFor(c: var SemContext; dest: var TokenBuf; it: var Item) =
 proc semReturn(c: var SemContext; dest: var TokenBuf; it: var Item) =
   let info = it.n.info
   takeToken dest, it.n
-  if c.routine.kind == NoSym:
+  let noRoutine = c.routine.kind == NoSym
+  if noRoutine:
     buildErr c, dest, info, "`return` only allowed within a routine"
   if it.n.kind == DotToken:
     # Templates have no `result` symbol — the `return` is text-substituted
     # into the caller, so the meaning depends on the caller's signature.
     # Preserve the dot and let template expansion resolve it.
-    if c.routine.kind != TemplateY and c.routine.returnType.typeKind != VoidT:
+    # With NO enclosing routine there is no `returnType` cursor at all: reading
+    # its `typeKind` asserts in nifcursors (`c.p != nil and c.rem > 0`), which
+    # turned a plain error into a compiler crash.
+    if not noRoutine and c.routine.kind != TemplateY and
+       c.routine.returnType.typeKind != VoidT:
       dest.addSymUse c.routine.resId, info
       inc it.n # skips the dot
     else:
@@ -3059,8 +3075,9 @@ proc semReturn(c: var SemContext; dest: var TokenBuf; it: var Item) =
   else:
     var a = Item(n: it.n, typ: c.routine.returnType)
     # `return` within a template refers to the caller, so
-    # we allow any type here:
-    if c.routine.kind == TemplateY:
+    # we allow any type here; and outside a routine there is no expected type to
+    # check against, so the error above stands on its own.
+    if c.routine.kind == TemplateY or noRoutine:
       a.typ = c.types.autoType
     semExpr c, dest, a
     it.n = a.n
@@ -3119,7 +3136,10 @@ proc semYield(c: var SemContext; dest: var TokenBuf; it: var Item) =
     takeToken dest, it.n
   else:
     let expectedType =
-      if c.routine.pragmas.contains(PassiveP): c.types.autoType
+      if c.routine.pragmas.contains(PassiveP) or c.routine.kind == NoSym:
+        # No enclosing routine: `returnType` is an empty cursor, and reading it
+        # asserts in nifcursors. The error was already reported above.
+        c.types.autoType
       else: c.routine.returnType
     var a = Item(n: it.n, typ: expectedType)
     semExpr c, dest, a
@@ -3739,10 +3759,41 @@ proc buildObjConstrField(c: var SemContext; dest: var TokenBuf; field: Local;
       # for invoked object types, bindings are built from the given arguments
       # and the field type is instantiated based on them here
       typ = instantiateType(c, typ, bindings)
-    callDefault c, dest, typ, info
+    if field.val.kind != DotToken and bindings.len == 0:
+      # A DECLARED FIELD DEFAULT (`labelCounter: int = 1`) wins over the type's
+      # zero. Without this every field NOT named in `T(a: x)` — and every field
+      # of `default(T)` — silently got `default(fieldType)`, so a type that
+      # states its own starting value never actually had it. `field.val` is
+      # already semchecked at the declaration, so it can be spliced as-is.
+      #
+      # ⚠️ NOT DONE FOR AN INVOKED GENERIC TYPE (`bindings.len != 0`), where the
+      # default still mentions the type's typevars. Substituting it with
+      # `instantiateExprIntoBuf` — the obvious move, and what the first version of
+      # this did — re-sems the expression into `dest` and emits a tree the
+      # post-sem phase validator walks off the end of: it SIGSEGVs in
+      # `collectChildKinds` on tests/nimony/converter/tgenericconverter.nim, and
+      # also breaks tests/nimony/track/ttype_usage.nim. Measured against a
+      # baseline run of the same suite: 587/594 before, 585/594 with the
+      # substitution, 587/594 with this guard — those two were the ONLY delta
+      # (the 7 `nosystem/*` failures are pre-existing in both).
+      #
+      # The gap this leaves is NARROWER than "generics don't work": `bindings` is
+      # only non-empty for an INVOKED object type reached through the parent /
+      # instantiation walk, so an ordinary `G[int](v: 3)` still takes the splice
+      # path and honours its defaults (measured: `n: int = 5` gives 5). What is
+      # still dropped is a field default on an invoked generic reached with live
+      # bindings — a named, small gap instead of a silent wrong answer everywhere.
+      dest.addSubtree field.val
+    else:
+      callDefault c, dest, typ, info
     if depth != 0:
       dest.addIntLit(depth, info)
     dest.addParRi()
+
+proc caseHasSetField(c: var SemContext; n: Cursor; setFields: Table[SymId, Cursor]): (bool, SymId)
+proc emitNestedCase(c: var SemContext; dest: var TokenBuf; n: var Cursor;
+                    setFields: Table[SymId, Cursor]; info: PackedLineInfo;
+                    bindings: Table[SymId, Cursor]; depth: int)
 
 proc fieldsPresentInInitExpr(c: var SemContext; n: Cursor; setFields: Table[SymId, Cursor]): (bool, SymId) =
   var n = n
@@ -3751,9 +3802,47 @@ proc fieldsPresentInInitExpr(c: var SemContext; n: Cursor; setFields: Table[SymI
   if n.substructureKind == NilU:
     return
   while n.hasMore:
-    let local = takeLocal(n, SkipFinalParRi)
-    if local.name.symId in setFields:
-      result = (true, local.name.symId)
+    if n.substructureKind == CaseU:
+      # a nested variant inside this branch: recurse into the nested case,
+      # scanning its discriminator and every branch for a set field.
+      let (nestedHas, nestedSym) = caseHasSetField(c, n, setFields)
+      if nestedHas:
+        result = (true, nestedSym)
+        break
+      skip n
+    else:
+      let local = takeLocal(n, SkipFinalParRi)
+      if local.name.symId in setFields:
+        result = (true, local.name.symId)
+        break
+
+proc caseHasSetField(c: var SemContext; n: Cursor; setFields: Table[SymId, Cursor]): (bool, SymId) =
+  ## `n` is at a `(case (fld sel) (of ...) (of/else ...))` node. Returns whether
+  ## the discriminator or any (possibly deeply nested) branch field is set.
+  result = (false, SymId(0))
+  var n = n
+  inc n # (case -> selector fld
+  let sel = takeLocal(n, SkipFinalParRi)
+  if sel.name.symId in setFields:
+    return (true, sel.name.symId)
+  while n.hasMore:
+    case n.substructureKind
+    of OfU:
+      inc n # (of -> (ranges ...)
+      skip n # skip ranges -> branch body
+      let (has, sym) = fieldsPresentInInitExpr(c, n, setFields)
+      if has:
+        return (true, sym)
+      skip n # skip branch body
+      skipParRi n # close (of
+    of ElseU:
+      inc n # (else -> branch body
+      let (has, sym) = fieldsPresentInInitExpr(c, n, setFields)
+      if has:
+        return (true, sym)
+      skip n # skip branch body
+      skipParRi n # close (else
+    else:
       break
 
 proc asNimSym(symId: SymId): string =
@@ -3849,8 +3938,11 @@ proc fieldsPresentInBranch(c: var SemContext; dest: var TokenBuf; n: var Cursor;
             wrongBranchError(c, dest, info, presentFieldSymId, selectorSymId, getValueInKv(setFields.getOrQuit(selectorSymId)))
           inc n # stmt
           while n.hasMore:
-            let field = takeLocal(n, SkipFinalParRi)
-            buildObjConstrField(c, dest, field, setFields, info, bindings, depth)
+            if n.substructureKind == CaseU:
+              emitNestedCase(c, dest, n, setFields, info, bindings, depth)
+            else:
+              let field = takeLocal(n, SkipFinalParRi)
+              buildObjConstrField(c, dest, field, setFields, info, bindings, depth)
           skipParRi n
           lastFieldSymId = presentFieldSymId
         else:
@@ -3867,8 +3959,11 @@ proc fieldsPresentInBranch(c: var SemContext; dest: var TokenBuf; n: var Cursor;
             wrongBranchError(c, dest, info, presentFieldSymId, selectorSymId, getValueInKv(setFields.getOrQuit(selectorSymId)))
           inc n # stmt
           while n.hasMore:
-            let field = takeLocal(n, SkipFinalParRi)
-            buildObjConstrField(c, dest, field, setFields, info, bindings, depth)
+            if n.substructureKind == CaseU:
+              emitNestedCase(c, dest, n, setFields, info, bindings, depth)
+            else:
+              let field = takeLocal(n, SkipFinalParRi)
+              buildObjConstrField(c, dest, field, setFields, info, bindings, depth)
           skipParRi n # stmt
           lastFieldSymId = presentFieldSymId
         else:
@@ -3889,8 +3984,11 @@ proc fieldsPresentInBranch(c: var SemContext; dest: var TokenBuf; n: var Cursor;
         if bestBranch.substructureKind == NilU:
           skip bestBranch
           break
-        let field = takeLocal(bestBranch, SkipFinalParRi)
-        buildObjConstrField(c, dest, field, setFields, info, bindings, depth)
+        if bestBranch.substructureKind == CaseU:
+          emitNestedCase(c, dest, bestBranch, setFields, info, bindings, depth)
+        else:
+          let field = takeLocal(bestBranch, SkipFinalParRi)
+          buildObjConstrField(c, dest, field, setFields, info, bindings, depth)
       skipParRi bestBranch
 
 proc buildObjConstrFields(c: var SemContext; dest: var TokenBuf; n: var Cursor;
@@ -3910,6 +4008,19 @@ proc buildObjConstrFields(c: var SemContext; dest: var TokenBuf; n: var Cursor;
     else:
       let field = takeLocal(n, SkipFinalParRi)
       buildObjConstrField(c, dest, field, setFields, info, bindings, depth)
+
+proc emitNestedCase(c: var SemContext; dest: var TokenBuf; n: var Cursor;
+                    setFields: Table[SymId, Cursor]; info: PackedLineInfo;
+                    bindings: Table[SymId, Cursor]; depth: int) =
+  ## `n` is at a nested `(case ...)` appearing inside a variant branch body.
+  ## Emit its discriminator field and recurse into the selected/best branch,
+  ## then advance `n` past the whole case. Mirrors `buildObjConstrFields`.
+  var body = n
+  inc body
+  let field = takeLocal(body, SkipFinalParRi)
+  buildObjConstrField(c, dest, field, setFields, info, bindings, depth)
+  fieldsPresentInBranch(c, dest, body, field, setFields, info, bindings, depth)
+  skip n
 
 proc buildDefaultObjConstr(c: var SemContext; dest: var TokenBuf; typ: Cursor;
                            setFields: Table[SymId, Cursor]; info: PackedLineInfo;

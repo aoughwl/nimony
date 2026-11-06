@@ -17,7 +17,7 @@
 when defined(nimony):
   {.feature: "lenientnils".}
   {.feature: "untyped".}
-import std/[os, tables, sets, syncio, hashes, assertions, strutils, times, formatfloat, dirs, paths]
+import std/[os, tables, sets, syncio, hashes, assertions, strutils, times, formatfloat, dirs, paths, osproc]
 import semos, nifconfig, nimony_model, semdata, langmodes
 import ".." / gear2 / modnames
 import ".." / lib / [tooldirs, platform, nifindexes, symparser, docpaths, argsfinder]
@@ -596,10 +596,15 @@ proc getLastModTime(path: string): int64 =
   except:
     result = -1'i64
 
-proc execNifler(c: var DepContext; f: FilePair) =
+proc niflerCommandFor(c: DepContext; f: FilePair): tuple[cmd: string, needsRun: bool] =
+  ## Compute the nifler command string for `f` plus a staleness decision,
+  ## WITHOUT running anything. `needsRun == false` means the on-disk `.p.nif`
+  ## and `.p.deps.nif` are already up to date (or `f` is a `.nif` input that
+  ## never needs nifling). Shared by the serial `execNifler` fallback and the
+  ## parallel `preNifle` pre-pass so both agree on exactly what work is pending.
   # File can be a .nif file, if so, we don't need to run nifler.
   if f.nimFile.endsWith(".nif"):
-    return
+    return ("", false)
   let preserveDocs = c.cmd == DoDoc
   let output = c.config.parsedFile(f, preserveDocs)
   let depsFile = c.config.depsFile(f, preserveDocs)
@@ -607,11 +612,15 @@ proc execNifler(c: var DepContext; f: FilePair) =
   if not c.forceRebuild and semos.fileExists(output) and
       semos.fileExists(f.nimFile) and getLastModTime(output) > srcTime and
       semos.fileExists(depsFile) and getLastModTime(depsFile) > srcTime:
-    discard "nothing to do"
+    result = ("", false)
   else:
     let docsFlag = if preserveDocs: " --docs" else: ""
-    let cmd = quoteShell(c.nifler) & " --portablePaths --deps" & docsFlag & " parse " &
-      quoteShell(f.nimFile) & " " & quoteShell(output)
+    result = (quoteShell(c.nifler) & " --portablePaths --deps" & docsFlag & " parse " &
+      quoteShell(f.nimFile) & " " & quoteShell(output), true)
+
+proc execNifler(c: var DepContext; f: FilePair) =
+  let (cmd, needsRun) = niflerCommandFor(c, f)
+  if needsRun:
     exec cmd
 
 proc importSystem(c: var DepContext; current: Node) =
@@ -645,6 +654,139 @@ proc traverseDeps(c: var DepContext; p: FilePair; current: Node) =
   finally:
     nifstreams.close(stream)
 
+# --------------------------------------------------------------------------
+# Parallel dependency-discovery pre-pass.
+#
+# `preNifle` walks the import closure breadth-first and runs `nifler` over the
+# whole frontier IN PARALLEL before the serial DFS in `traverseDeps` starts.
+# It only ever writes the on-disk `.p.nif` / `.p.deps.nif` cache files that the
+# DFS would have written anyway (via `execNifler`), and mutates NOTHING on the
+# node graph. After pre-warming, every `execNifler` inside the DFS hits the
+# staleness short-circuit in `niflerCommandFor` and becomes a no-op, so the DFS
+# does only cheap in-memory work. Correctness is preserved by construction: if
+# the harvest ever misses a module, the DFS's own `execNifler` runs it as a
+# self-healing serial fallback. Over-nifling (e.g. ignoring `when` pruning) is
+# harmless — it only warms a cache entry the DFS may not consult.
+
+proc collectDepPath(c: DepContext; origin, path: string;
+                    res: var seq[FilePair]; seen: var HashSet[string]) =
+  ## Resolve one imported module path relative to `origin` and, if it is a new
+  ## `.nim` module, queue it for the next BFS round. Dedup is by `modname` (the
+  ## key used for `.p.nif` / `.p.deps.nif`), matching `processedModules`.
+  let f2 = resolveFileWrapper(c.config.paths, origin, path)
+  if not semos.fileExists(f2): return
+  if f2.endsWith(".nif"): return  # .nif inputs never need nifling
+  let mp = c.toPair(f2)
+  if not seen.containsOrIncl(mp.modname):
+    res.add mp
+
+proc harvestImport(c: DepContext; it: var Cursor; origin: string;
+                   res: var seq[FilePair]; seen: var HashSet[string]) =
+  ## Read-only mirror of `processImport`: collect imported module paths without
+  ## touching the graph. Ignores `when` conditions (over-nifle is safe) and
+  ## skips plugin imports (the DFS does not recurse into them). Cyclic imports
+  ## ARE harvested — the DFS recurses into them via `importCyclicModule`.
+  var x = it
+  skip it
+  x.into:  # (import …)
+    if x.stmtKind == WhenS:
+      skip x, SkipCond
+    while x.hasMore:
+      var isCyclic = false
+      if x.kind == ParLe and x.exprKind == PragmaxX:
+        var y = x
+        inc y
+        skip y
+        if y.substructureKind == PragmasU:
+          inc y
+          if y.kind == Ident and pool.strings[y.litId] == "cyclic":
+            isCyclic = true
+      var files: seq[ImportedFilename] = @[]
+      var hasError = false
+      if isCyclic:
+        x.into PragmaxX:
+          filenameVal(x, files, hasError, allowAs = false)
+          skip x, SkipPragmas
+          while x.hasMore: skip x, SkipFull
+      else:
+        filenameVal(x, files, hasError, allowAs = true)
+      if not hasError:
+        for f in files:
+          if f.plugin.len == 0:
+            collectDepPath(c, origin, f.path, res, seen)
+
+proc harvestSingleImport(c: DepContext; it: var Cursor; origin: string;
+                         res: var seq[FilePair]; seen: var HashSet[string]) =
+  ## Read-only mirror of `processSingleImport` (`from import` / `import except`).
+  var x = it
+  skip it
+  var files: seq[ImportedFilename] = @[]
+  var hasError = false
+  x.into:  # (fromimport …) / (importexcept …)
+    if x.stmtKind == WhenS:
+      skip x, SkipCond
+    filenameVal(x, files, hasError, allowAs = true)
+    while x.hasMore: skip x
+  if not hasError:
+    for f in files:
+      if f.plugin.len == 0:
+        collectDepPath(c, origin, f.path, res, seen)
+      break
+
+proc harvestDepImports(c: DepContext; p: FilePair;
+                       res: var seq[FilePair]; seen: var HashSet[string]) =
+  ## Cheaply parse `p`'s `.p.deps.nif` (read-only) to extract the modules it
+  ## imports. Includes are intra-module and left to the DFS. If the deps file
+  ## is missing (harvest miss), the DFS self-heals.
+  let depsFile = c.config.depsFile(p, c.cmd == DoDoc)
+  if not semos.fileExists(depsFile): return
+  var stream = nifstreams.open(depsFile)
+  try:
+    discard processDirectives(stream.r)
+    var buf = fromStream(stream)
+    var n = beginRead(buf)
+    if n.kind == ParLe and pool.tags[n.tagId] == "stmts":
+      n.into:
+        while n.hasMore:
+          case stmtKind(n)
+          of ImportS:
+            harvestImport(c, n, p.nimFile, res, seen)
+          of FromimportS, ImportexceptS:
+            harvestSingleImport(c, n, p.nimFile, res, seen)
+          else:
+            skip n
+  finally:
+    nifstreams.close(stream)
+
+proc preNifle(c: var DepContext; root: FilePair) =
+  ## BFS over the import closure, running nifler in parallel per round.
+  var seen = initHashSet[string]()
+  var frontier: seq[FilePair] = @[]
+  seen.incl root.modname
+  frontier.add root
+  # Seed std/system unless it is excluded (mirror traverseDeps' importSystem).
+  if {SkipSystem, IsSystem} * c.moduleFlags == {}:
+    let sysp = c.toPair(stdlibFile("std/system.nim"))
+    if not seen.containsOrIncl(sysp.modname):
+      frontier.add sysp
+  while frontier.len > 0:
+    # 1. Run nifler in parallel over the frontier modules that need it.
+    var cmds: seq[string] = @[]
+    for f in frontier:
+      let (cmd, needsRun) = niflerCommandFor(c, f)
+      if needsRun:
+        cmds.add cmd
+    if cmds.len > 0:
+      # execProcesses defaults n to countProcessors(). Nonzero exit must abort,
+      # mirroring semos.exec's `quit` on failure.
+      if execProcesses(cmds) != 0:
+        quit("FAILURE: nifler pre-pass")
+    # 2. Harvest the next frontier from each module's freshly-written deps file.
+    var nextFrontier: seq[FilePair] = @[]
+    for f in frontier:
+      harvestDepImports(c, f, nextFrontier, seen)
+    frontier = nextFrontier
+
 proc rootPath(c: DepContext): string =
   # XXX: Relative paths in build files are relative to current working directory, not the location of the build file.
   result = absoluteParentDir(c.rootNode.files[0].nimFile)
@@ -657,8 +799,35 @@ proc sharedObjDir(): string =
   ## across nimcaches saves ~4-5 s per cold build on Windows.
   result = parentDir(stdlibDir()) / "nimcache_static"
 
-proc sharedObjFile(cfile: CFile): string =
-  sharedObjDir() / cfile.obj
+proc ccIdentity(ccFlags: openArray[string]; customArgs: string): string =
+  ## Short stable digest (FNV-1a, hand-rolled so it means the same thing under
+  ## both the Nim and the Nimony build of this compiler) of the exact `cc`
+  ## invocation a `.compile`d TU is built with: the driver flags shared by every
+  ## TU plus that TU's own `{.compile.}` arguments.
+  var h: uint64 = 0xcbf29ce484222325'u64
+  for f in ccFlags:
+    for ch in f:
+      h = (h xor uint64(ord(ch))) * 0x100000001b3'u64
+    h = (h xor 0x20'u64) * 0x100000001b3'u64   # separator: `-DA -DB` != `-DA-DB`
+  for ch in customArgs:
+    h = (h xor uint64(ord(ch))) * 0x100000001b3'u64
+  const Digits = "0123456789abcdef"
+  result = ""
+  var shift = 60
+  while shift >= 0:
+    result.add Digits[int((h shr uint64(shift)) and 0xf'u64)]
+    shift -= 4
+
+proc sharedObjFile(cfile: CFile; ccFlags: openArray[string]): string =
+  ## `nimcache_static/` is shared by every nimony build on the machine, so the
+  ## object's NAME must carry the flags it was built with: keyed by basename
+  ## alone, a `-O0` debug build, a `--cc:clang` build and a test run injecting
+  ## `--passC:-DMI_TRACK_VALGRIND=1` all write the one `static.o` slot and then
+  ## silently hand their allocator to every other project — including builds
+  ## already running in another session. A cache key that omits an input is a
+  ## wrong answer waiting for a second consumer.
+  sharedObjDir() / (splitFile(cfile.obj).name & "_" &
+                    ccIdentity(ccFlags, cfile.customArgs) & splitFile(cfile.obj).ext)
 
 proc defineNiflerCmd(b: var Builder; nifler: string; preserveDocs = false) =
   b.withTree "cmd":
@@ -935,20 +1104,23 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string; passC, 
     # Command for hexer
     defineHexerCmds(b, hexer, c.config.bits, platform.CPU[c.config.targetCPU].endian == bigEndian, c.config.checkFlags)
 
-    # Command for C/LLVM compiler (object files)
-    b.withTree "cmd":
-      b.addSymbolDef "cc"
+    # Command for C/LLVM compiler (object files). The flags are collected into a
+    # seq first rather than emitted inline because the shared `nimcache_static/`
+    # objects are KEYED on them (see `sharedObjFile`); building the list once
+    # keeps the key and the actual command line from drifting apart.
+    var ccFlags: seq[string] = @[]
+    block:
       if c.config.backend == backendLLVM:
-        b.addStrLit "clang"
+        ccFlags.add "clang"
       elif nativeSysLink:
         # Compiles the `.compile`d TUs (e.g. Objective-C `.m`); same driver that
         # links them, so the toolchain/ABI matches.
-        b.addStrLit sysLinker
+        ccFlags.add sysLinker
       else:
-        b.addStrLit c.config.cc
-      b.addStrLit "-c"
+        ccFlags.add c.config.cc
+      ccFlags.add "-c"
       # Suppress visibility-attribute warnings from mimalloc etc. (GCC/Clang)
-      b.addStrLit "-Wno-attributes"
+      ccFlags.add "-Wno-attributes"
       # Note on TLS for clang/Windows: clang emits native PE TLS by default,
       # which is what we want — `__thread` access compiles to a single
       # `gs:0x58` load instead of a `__emutls_get_address` call. ld.bfd
@@ -958,24 +1130,41 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string; passC, 
       # here.
       # Add -fPIC for shared libraries
       if c.config.appType == appLib:
-        b.addStrLit "-fPIC"
+        ccFlags.add "-fPIC"
       # Optimization level. Even the default ("debug") gets -O1: in
       # practice it produces code that's just as easy to step through
       # as -O0, while letting the C compiler skip the truly silly
       # codegen patterns (per-statement spills, dead stores, etc.).
       case c.config.optLevel
-      of optDebug: b.addStrLit "-O1"
-      of optNone:  b.addStrLit "-O0"
-      of optSize:  b.addStrLit "-Os"
-      of optSpeed: b.addStrLit "-O3"
+      of optDebug: ccFlags.add "-O1"
+      of optNone:  ccFlags.add "-O0"
+      of optSize:  ccFlags.add "-Os"
+      of optSpeed: ccFlags.add "-O3"
       if passC.len > 0:
         for arg in passC.split(' '):
           if arg.len > 0:
-            b.addStrLit arg
+            ccFlags.add arg
       for i in c.passC:
-        b.addStrLit i
-      if c.config.backend == backendC:
-        b.addStrLit "-I" & rootPath(c)
+        ccFlags.add i
+      # NB: the project's own include path is deliberately NOT here. It is a
+      # cwd-RELATIVE path (`rootPath`), and everything in `ccFlags` is part of
+      # `ccIdentity`, i.e. part of the NAME of the shared objects in
+      # `nimcache_static/`. With it here, the same program built from its own
+      # directory and from its parent produced two differently-named copies of
+      # mimalloc's `static.o` — measured 2026-08-16, `static_e1f81b58197cd00b.o`
+      # and `static_5083d71df367201c.o` — so the directory that exists to compile
+      # that TU ONCE for the whole machine instead grew one object per (cwd ×
+      # flags), with no GC and no sharing.
+      #
+      # It belongs to the generated project TUs, which are the only ones that
+      # include project headers, so it is passed per-node in their `args` slot
+      # below. A `{.compile.}`d TU that genuinely needs a project header can say
+      # so in its own pragma arguments, which are already in its identity.
+
+    b.withTree "cmd":
+      b.addSymbolDef "cc"
+      for f in ccFlags:
+        b.addStrLit f
       b.addKeyw "args"
       b.addKeyw "input"
       b.addStrLit "-o"
@@ -1184,7 +1373,7 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string; passC, 
           # the dedup must happen here (not only on the DO-node ordering inputs).
           var seenObjs = initHashSet[string]()
           for cfile in c.toBuild:
-            let o = sharedObjFile(cfile)
+            let o = sharedObjFile(cfile, ccFlags)
             if not seenObjs.containsOrIncl(o): objs.add o
           for v in c.nodes:
             let o = c.config.objFile(v.files[0], backend)
@@ -1258,7 +1447,7 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string; passC, 
             b.addStrLit nativeObj
           objFiles.incl nativeObj
           for cfile in c.toBuild:
-            let obj = sharedObjFile(cfile)
+            let obj = sharedObjFile(cfile, ccFlags)
             if not objFiles.containsOrIncl(obj):
               b.withTree "input":
                 b.addStrLit obj
@@ -1293,7 +1482,7 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string; passC, 
       # that uses the `.compile` pragma (`nativeSysLink`) compiles them.
       if (not native) or nativeSysLink:
         for cfile in c.toBuild:
-          let obj = sharedObjFile(cfile)
+          let obj = sharedObjFile(cfile, ccFlags)
           if not objFiles.containsOrIncl(obj):
             b.withTree "do":
               b.addIdent "cc"
@@ -1318,6 +1507,14 @@ proc generateFinalBuildFile(c: DepContext; commandLineArgsLengc: string; passC, 
               b.addIdent "cc"
               b.withTree "input":
                 b.addStrLit c.config.genFile(v.files[0], backend)
+              if c.config.backend == backendC:
+                # The project's own include path: per-node, because these are the
+                # TUs that include project headers, and because a cwd-relative
+                # path in the shared `ccFlags` would key the machine-wide
+                # `nimcache_static/` objects on the caller's cwd. See the comment
+                # where it used to live.
+                b.withTree "args":
+                  b.addStrLit "-I" & rootPath(c)
               b.withTree "output":
                 b.addStrLit obj
 
@@ -1582,6 +1779,12 @@ proc initDepContext(config: sink NifConfig; project, nifler: string; isFinal, fo
   result.rootNode = root
   result.nodes.add root
   result.processedModules[p.modname] = 0
+  # Parallel dependency-discovery pre-pass: pre-warm the nifler cache over the
+  # whole import closure so the serial DFS below only does cheap in-memory work.
+  # Only meaningful for the cold discovery path (`not isFinal`); the final path
+  # consumes nimsem's `.s.deps.nif`, which the DFS never nifles.
+  if not isFinal:
+    preNifle result, p
   traverseDeps result, p, root
 
 proc buildGraphForEval*(config: NifConfig; mainNifFile: string; dependencyNifFiles: seq[string];

@@ -2589,6 +2589,7 @@ proc orderArgs*(m: var Match; paramsCursor: Cursor; args: openArray[CallArg]): s
 
   result = newSeqOfCap[CallArg](args.len)
   fi = 0
+  var prevAi = -1 # highest source-arg index consumed so far (eval-order check)
   while fi < params.len:
     ai = positions[fi]
     if ai < 0:
@@ -2596,6 +2597,15 @@ proc orderArgs*(m: var Match; paramsCursor: Cursor; args: openArray[CallArg]): s
       m.insertedParam = true
       result.add CallArg(n: emptyNode(m.context[]), typ: m.context.types.autoType)
     else:
+      # Walking parameters in declaration (evaluation) order, the source-argument
+      # index filling each parameter must keep increasing. If it drops, a later
+      # parameter is filled by an earlier-written argument, so named arguments
+      # reordered the evaluation of the values — flagged by the caller, consistent
+      # with object constructors (nim-lang/nimony#1056).
+      if ai < prevAi and not m.namedArgsReordered:
+        m.namedArgsReordered = true
+        m.namedArgsReorderInfo = args[ai].n.info
+      prevAi = ai
       while true:
         var arg = args[ai]
         # remove name:

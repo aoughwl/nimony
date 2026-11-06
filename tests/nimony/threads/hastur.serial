@@ -1,0 +1,1 @@
+# Load-sensitive race tests: run serially even under --jobs (see hastur.nim SerialMarker).

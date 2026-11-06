@@ -98,6 +98,7 @@ type
   ObjField* = object
     sym*: SymId
     level*: int # inheritance level
+    pos*: int # 0-based declaration index within `level` (used for eval-order checks)
     typ*: TypeCursor
     exported*: bool
     guarded*: bool # true for gfld fields (cannot be accessed via dot)

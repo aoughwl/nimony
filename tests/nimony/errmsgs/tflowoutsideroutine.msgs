@@ -1,0 +1,2 @@
+tests/nimony/errmsgs/tflowoutsideroutine.nim(6, 3) Error: `return` only allowed within a routine
+tests/nimony/errmsgs/tflowoutsideroutine.nim(7, 1) Error: `yield` only allowed within an `iterator`

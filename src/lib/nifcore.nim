@@ -49,11 +49,23 @@ when defined(nimony):
   # `ref` fields/returns are nilable here (e.g. `pool`/`tags` return nil for
   # an ownerless cursor); opt out of Nimony's strict not-nil analysis.
   {.feature: "lenientnils".}
+  # The `fallbackPool`/`fallbackTags` globals are shared by every ownerless
+  # `TokenBuf`; the compiler is single threaded.
+  {.feature: "assumeSync".}
+else:
+  # Dual-compiled: nimony builds this for the compiler, host Nim for `nifler`.
+  # `alwaysInline` is a nimony pragma; give host Nim the nearest thing it has.
+  {.pragma: alwaysInline, inline.}
+  # `assertionsEnabled` comes from nimony's `std/assertions`; host Nim spells the
+  # same question `compileOption`. (`raiseAssert` it already has, in `system`.)
+  const assertionsEnabled = compileOption("assertions")
 
 import std / [assertions, hashes]
-import bitabs, lineinfos
+import bitabs, lineinfos, nifroles
+export nifroles  # a `{.nifWrap.}` in a template body is resolved where it expands
 export bitabs  # adapters touching pool.strings / tags need getOrIncl etc.
-export lineinfos.FileId, lineinfos.NoFile, lineinfos.isValid
+export lineinfos.FileId, lineinfos.NoFile, lineinfos.isValid,
+       lineinfos.`==`, lineinfos.hash
 
 type
   NifKind* = enum
@@ -69,6 +81,16 @@ type
     TagLit            # opening tag with body-token-count "jump"
     ExtendedSuffix    # supplies 28 extra high bits to the preceding token
     LineInfoLit       # trailing line-info suffix on a head token (file/line/col)
+    # ── reader-level lexical kinds ────────────────────────────────────────
+    # Produced only by the textual NIF reader (nifreader.ExpandedToken.tk);
+    # they never occur in a binary token stream, where parens are implicit
+    # (TagLit + jump) and EOF is `not hasMore`. Sharing ONE enum keeps every
+    # token-kind consumer (including external ones like Nim's ast2nif.nim)
+    # on a single type. The 16 members exactly fill the 4-bit kind field.
+    UnknownToken      # lexical error / unclassified byte sequence
+    EofToken          # end of input
+    ParLe             # textual '('
+    ParRi             # textual ')'
 
   NifToken* = distinct uint32
 
@@ -85,9 +107,9 @@ func hash*(x: TagId): Hash {.borrow.}
 func hash*(x: StrId): Hash {.borrow.}
 func hash*(x: SymId): Hash {.borrow.}
 
-proc `$`*(x: TagId): string {.borrow.}
-proc `$`*(x: StrId): string {.borrow.}
-proc `$`*(x: SymId): string {.borrow.}
+func `$`*(x: TagId): string {.borrow.}
+func `$`*(x: StrId): string {.borrow.}
+func `$`*(x: SymId): string {.borrow.}
 
 # ── bit-packing constants ────────────────────────────────────────────────
 
@@ -96,6 +118,7 @@ const
   KindMask*    = (1'u32 shl KindBits) - 1'u32       # 0x0F
   PayloadBits* = 32'u32 - KindBits                  # 28
   PayloadMask* = (1'u32 shl PayloadBits) - 1'u32    # 0x0FFFFFFF
+  IdPayloadMax* = PayloadMask shr 1'u32
 
   TagBits*     = 9'u32
   TagShift*    = KindBits                           # 4
@@ -104,7 +127,9 @@ const
   JumpBits*    = 32'u32 - JumpShift                 # 19
   InlineJumpCap* = (1'u32 shl JumpBits) - 1'u32     # 524287
 
-template kind*(n: NifToken): NifKind = NifKind(uint32(n) and KindMask)
+func kind*(n: NifToken): NifKind {.inline.} = NifKind(uint32(n) and KindMask)
+  ## A `func` (not a `template`) so downstream `export … except kind` can drop
+  ## it — nimony's `except` cannot filter a name that has a template overload.
 template uoperand*(n: NifToken): uint32 = uint32(n) shr KindBits
 template soperand*(n: NifToken): int32 =
   ## Sign-extended 28-bit payload (for inline signed values).
@@ -115,31 +140,67 @@ template toX(k: NifKind; operand: uint32): uint32 =
 
 # ── atom constructors ────────────────────────────────────────────────────
 
-proc dotToken*(): NifToken {.inline.} = NifToken(uint32(DotToken))
+func dotToken*(): NifToken {.inline.} = NifToken(uint32(DotToken))
 
-proc tagLitToken*(t: TagId; jump: uint32 = 0): NifToken {.inline.} =
+# ── assertion failure helpers ────────────────────────────────────────────
+#
+# An `assert` whose message is COMPUTED (`"… " & $n.kind`) puts the string
+# building in the proc's body. The build is cold — `assert` only runs it on
+# failure — but its mere presence makes the proc a NON-LEAF, and arkham then
+# homes locals in callee-saved registers and pushes them on every call. Measured:
+# `tagLitToken`, a shift and an or, made two calls and pushed all six
+# callee-saved registers for 35 instructions per call.
+#
+# Hoisting the message into a `{.noinline, noreturn.}` func fixes it without
+# losing a single diagnostic: arkham does not treat a `noreturn` callee as a call
+# point (see `analyser.noReturnCallees`), so the caller stays a leaf. The `when
+# assertionsEnabled` keeps `-d:danger` / `-d:noAssertions` behaviour identical to
+# the `assert` it replaces.
+
+func failKind(what: string; k: NifKind) {.noinline, noreturn.} =
+  failedAssertImpl(what & $k)
+
+func failVal(what: string; v: uint32; tail: string) {.noinline, noreturn.} =
+  failedAssertImpl(what & $v & tail)
+
+template checkKind(cond: bool; what: string; k: NifKind) =
+  when assertionsEnabled:
+    if not cond: failKind(what, k)
+
+template checkVal(cond: bool; what: string; v: uint32; tail: string) =
+  when assertionsEnabled:
+    if not cond: failVal(what, v, tail)
+
+func tagLitToken*(t: TagId; jump: uint32 = 0): NifToken {.inline.} =
   let tagBits = uint32(t) and TagMask
-  assert uint32(t) == tagBits, "tag id " & $uint32(t) & " exceeds 9 bits"
+  checkVal uint32(t) == tagBits, "tag id ", uint32(t), " exceeds 9 bits"
   assert jump <= InlineJumpCap, "use ExtendedSuffix for jump > InlineJumpCap"
   NifToken(uint32(TagLit) or (tagBits shl TagShift) or (jump shl JumpShift))
 
-proc charToken*(ch: char): NifToken {.inline.} =
+func charToken*(ch: char): NifToken {.inline.} =
   NifToken(toX(CharLit, uint32(ch)))
 
-proc strLitToken*(id: StrId): NifToken {.inline.} =
-  assert uint32(id) <= PayloadMask
+# Raw pool-ref constructors. They do NOT apply the writer's inline rule (see
+# "String/sym layout" below), so a name of at most `StrInlineMaxLen` bytes gets
+# an encoding the builders would never produce. Reach for `internedSymToken` /
+# the `add*` builders unless you own both ends of the encoding. The `IdPayloadMax`
+# bound is `PayloadMask shr 1` because one bit goes to the inline/pool-ref flag,
+# so a larger id would overflow the payload instead of widening into an
+# `ExtendedSuffix` (which a single token cannot express).
+func strLitToken*(id: StrId): NifToken {.inline.} =
+  assert uint32(id) <= IdPayloadMax
   NifToken(toX(StrLit, uint32(id) shl 1))    # bit 0 = 0 ⇒ pool ref
-proc symToken*(id: SymId): NifToken {.inline.} =
-  assert uint32(id) <= PayloadMask
+func symToken*(id: SymId): NifToken {.inline.} =
+  assert uint32(id) <= IdPayloadMax
   NifToken(toX(Symbol, uint32(id) shl 1))
-proc symdefToken*(id: SymId): NifToken {.inline.} =
-  assert uint32(id) <= PayloadMask
+func symdefToken*(id: SymId): NifToken {.inline.} =
+  assert uint32(id) <= IdPayloadMax
   NifToken(toX(SymbolDef, uint32(id) shl 1))
-proc identToken*(id: StrId): NifToken {.inline.} =
-  assert uint32(id) <= PayloadMask
+func identToken*(id: StrId): NifToken {.inline.} =
+  assert uint32(id) <= IdPayloadMax
   NifToken(toX(Ident, uint32(id) shl 1))
 
-proc extendedSuffixToken*(high28: uint32): NifToken {.inline.} =
+func extendedSuffixToken*(high28: uint32): NifToken {.inline.} =
   assert high28 <= PayloadMask
   NifToken(toX(ExtendedSuffix, high28))
 
@@ -196,42 +257,52 @@ const
   NoNifLineInfo* = NifLineInfo(file: NoFile, line: 0'i32, col: 0'i32,
                                comment: StrId(0))
 
-proc isValid*(x: NifLineInfo): bool {.inline.} = x.file.isValid
+func isValid*(x: NifLineInfo): bool {.inline.} = x.file.isValid
 
-proc fitsCommonLineInfo(file: FileId; line, col: int32): bool {.inline.} =
+func `==`*(a, b: NifLineInfo): bool {.inline.} =
+  ## Explicit because Nimony does not synthesize structural `==`/`hash` for
+  ## objects (frontend code keeps infos in HashSets, e.g. error dedup).
+  a.file == b.file and a.line == b.line and a.col == b.col and
+    a.comment == b.comment
+
+func hash*(x: NifLineInfo): Hash {.inline.} =
+  hash((uint64(uint32(x.file)) shl 32) xor (uint64(cast[uint32](x.line)) shl 16) xor
+       (uint64(cast[uint32](x.col)) shl 8) xor uint64(uint32(x.comment)))
+
+func fitsCommonLineInfo(file: FileId; line, col: int32): bool {.inline.} =
   uint32(file) <= LiFileMaxC and uint32(col) <= LiColMaxC and
     uint32(line) <= LiLineMaxC
 
-proc encodeLineInfoCommon(file: FileId; line, col: int32): uint32 {.inline.} =
+func encodeLineInfoCommon(file: FileId; line, col: int32): uint32 {.inline.} =
   (uint32(col) and LiColMaxC) or
   ((uint32(file) and LiFileMaxC) shl LiColBitsC) or
   ((uint32(line) and LiLineMaxC) shl (LiColBitsC + LiFileBitsC))
 
-proc encodeLineInfoWide(file: FileId; line, col: int32): uint64 {.inline.} =
+func encodeLineInfoWide(file: FileId; line, col: int32): uint64 {.inline.} =
   (uint64(col) and LiColMaskX) or
   ((uint64(file) and LiFileMaskX) shl LiColBitsX) or
   ((uint64(line) and LiLineMaskX) shl (LiColBitsX + LiFileBitsX))
 
 # ── TagLit field accessors (raw — don't consult the suffix) ──────────────
 
-proc rawJump(n: NifToken): uint32 {.inline.} =
-  assert n.kind == TagLit, $n.kind
+func rawJump(n: NifToken): uint32 {.inline.} =
+  checkKind n.kind == TagLit, "rawJump on ", n.kind
   uint32(n) shr JumpShift
 
-proc rawTag(n: NifToken): TagId {.inline.} =
-  assert n.kind == TagLit, $n.kind
+func rawTag(n: NifToken): TagId {.inline.} =
+  checkKind n.kind == TagLit, "rawTag on ", n.kind
   TagId((uint32(n) shr TagShift) and TagMask)
 
-proc setJump*(n: var NifToken; j: uint32) {.inline.} =
-  assert n.kind == TagLit, $n.kind
-  assert j <= InlineJumpCap, "jump " & $j & " exceeds 19 bits"
+func setJump*(n: var NifToken; j: uint32) {.inline.} =
+  checkKind n.kind == TagLit, "setJump on ", n.kind
+  checkVal j <= InlineJumpCap, "jump ", j, " exceeds 19 bits"
   let preserved = uint32(n) and ((1'u32 shl JumpShift) - 1'u32)  # kind+tag
   n = NifToken(preserved or (j shl JumpShift))
 
-proc setTag*(n: var NifToken; t: TagId) {.inline.} =
-  assert n.kind == TagLit, $n.kind
+func setTag*(n: var NifToken; t: TagId) {.inline.} =
+  checkKind n.kind == TagLit, "setTag on ", n.kind
   let tagBits = uint32(t) and TagMask
-  assert uint32(t) == tagBits, "tag id " & $uint32(t) & " exceeds 9 bits"
+  checkVal uint32(t) == tagBits, "tag id ", uint32(t), " exceeds 9 bits"
   n = NifToken((uint32(n) and not (KindMask or (TagMask shl TagShift))) or
                uint32(TagLit) or (tagBits shl TagShift))
 
@@ -248,38 +319,106 @@ proc setTag*(n: var NifToken; t: TagId) {.inline.} =
 #   pool across adapters destroys that property and gives no benefit
 #   (tag namespaces don't overlap meaningfully).
 
+# ── Symbols are objects, not strings (#2457) ─────────────────────────────
+#
+# A NIF symbol is `<name>.<disamb>`, `<name>.<disamb>.<module>` or
+# `<name>.<disamb>.<dedup>.<module>`, and the rest of the compiler used to take
+# that apart again at every question it asked. The pool STORES the taken-apart
+# form, so every question below is a field read and nothing re-derives anything.
+
+type
+  NifSymbol* = object
+    ## A NIF symbol, taken apart. The three names are ids into `Pool.strings`:
+    ## a module suffix is repeated by every symbol that comes from that module
+    ## (54 modules for 8044 symbols in a typical nimsem module), so asking
+    ## "same module?" must not mean building two strings and comparing them.
+    name*: StrId
+    disamb*: int32
+      ## `NoDisamb` when the spelling has none that is a NUMBER -- then `name`
+      ## holds everything up to the module suffix, and the symbol round-trips
+      ## unchanged. That covers an atom that is not a symbol at all (`[]=`) and
+      ## the reserved disambiguators older artifacts still carry
+      ## (`_exit.sys.mod`, `p.0h107`).
+    dedup*: StrId   ## `StrId(0)` unless the symbol is a generic instantiation
+    module*: StrId  ## `StrId(0)` for a local symbol
+
+const
+  NoDisamb* = -1'i32
+
+func `==`*(a, b: NifSymbol): bool {.inline.} =
+  a.name == b.name and a.disamb == b.disamb and
+  a.dedup == b.dedup and a.module == b.module
+
+func hash*(s: NifSymbol): Hash =
+  ## Four ids mixed, not a string walked: this is what the pool hashes on every
+  ## intern, and the reason interning a symbol stopped costing a string hash.
+  var h = uint64(uint32(s.name)) * 0x9E3779B97F4A7C15'u64
+  h = (h xor uint64(uint32(s.disamb))) * 0x9E3779B97F4A7C15'u64
+  h = (h xor uint64(uint32(s.dedup))) * 0x9E3779B97F4A7C15'u64
+  h = (h xor uint64(uint32(s.module))) * 0x9E3779B97F4A7C15'u64
+  result = cast[Hash](h)
+
 type
   Pool* = ref object
-    ## Literals pool — only categories where dedup genuinely pays:
+    ## Pool pool — only categories where dedup genuinely pays:
     ## strings and symbols. Integers / unsigned integers / floats are
     ## stored entirely inside the token stream (using a chain of
     ## `ExtendedSuffix` tokens to widen the carrier), so there's no
     ## pool for them — no hash lookups, no auto-tune machinery.
     strings*:   BiTable[StrId, string]
-    syms*:      BiTable[SymId, string]
+    symbols*:   BiTable[SymId, NifSymbol]
     filenames*: BiTable[FileId, string]
       ## Source filenames referenced by `LineInfoLit` tokens. Line/col are
       ## encoded inline in the token; only the filename is interned here.
 
   TagPool* = ref object
     tags*: BiTable[TagId, string]
+      ## Tag spelling ⇔ id, and NOT bounded by the 9-bit tag field: ids past
+      ## `TagMask` are perfectly legal, they just cost a second token to spell
+      ## (see `escapeTag`).
+    escapeTag*: TagId
+      ## The **escape tag** of this adapter, or `0` if it has none.
+      ##
+      ## A tag id is 9 bits in the token (`TagBits`), so the first 511 tags cost
+      ## one token. That is ample for a language vocabulary and hopeless for an
+      ## instruction set: nativenif alone spells 282 machine mnemonics, and each
+      ## further target (Cortex-M, RISC-V) wants a few hundred more.
+      ##
+      ## Rather than cap the pool there, an adapter may nominate one tag as the
+      ## escape: an id that does not fit is then stored as `(<escapeTag> <id> …)`,
+      ## the id carried by an ordinary inline `IntLit` first child. `openTag`
+      ## does that itself and the serializers undo it, so the NIF *text* is
+      ## unchanged, the binary token format is unchanged, and the pool is
+      ## effectively unbounded. Only the ids past `TagMask` pay the extra token.
+      ##
+      ## What an adapter DOES have to know is that an escaped node's id is not
+      ## `cursorTagId` (ask `resolvedTagId`) and that its operands start one
+      ## token later.
 
-proc newPool*(): Pool =
+func newPool*(): Pool =
   Pool(strings:   initBiTable[StrId, string](),
-       syms:      initBiTable[SymId, string](),
+       symbols:   initBiTable[SymId, NifSymbol](),
        filenames: initBiTable[FileId, string]())
 
-proc newTagPool*(): TagPool =
+func newTagPool*(): TagPool =
   ## All BiTable ids start at 1 (id 0 is the "not used" sentinel).
   ## Adapters whose enum has ordinal 0 as the first real value bridge
   ## the gap with a `+/- 1` shim in their `tagId` / `myKind` helpers
   ## (see jsonnif/htmlnif).
-  TagPool(tags: initBiTable[TagId, string]())
+  TagPool(tags: initBiTable[TagId, string](), escapeTag: TagId(0))
 
 proc registerTag*(tp: TagPool; tag: string): TagId =
   ## Intern a tag string. Adapters call this in enum-ordinal order at
   ## startup so the returned TagId equals the enum ordinal (1-based).
   tp.tags.getOrIncl(tag)
+
+const
+  FirstEscapeId* = TagMask + 1'u32
+    ## The first tag id that no longer fits the 9-bit tag field, hence the first
+    ## one an adapter must spell through its `escapeTag`. Registering tags is
+    ## otherwise unaffected: `registerTag` keeps counting.
+
+template hasEscapes*(tp: TagPool): bool = tp.escapeTag != TagId(0)
 
 proc createTags*[E: enum](): TagPool =
   ## One-shot tag-pool builder for an adapter's enum. Registers every
@@ -301,7 +440,310 @@ template tagName*(tp: TagPool; t: TagId): lent string = tp.tags[t]
 # strings/syms don't have ids). Prefer the cursor-side `strVal(c)` /
 # `symName(c)` accessors which handle both modes transparently.
 template poolStr*(p: Pool; s: StrId): lent string = p.strings[s]
-template poolSym*(p: Pool; s: SymId): lent string = p.syms[s]
+
+# ── Asking a symbol what it is ───────────────────────────────────────────
+
+func sym*(p: Pool; id: SymId): NifSymbol {.inline.} =
+  ## The symbol `id`, taken apart. A field read.
+  p.symbols[id]
+
+func strOrEmpty(p: Pool; s: StrId): string {.inline.} =
+  if s == StrId(0): "" else: p.strings[s]
+
+func symBasename*(p: Pool; id: SymId): string =
+  ## The identifier of `id`, without disambiguator, key or module suffix:
+  ## `abc.12.Ikey.mod` gives `abc`. A name may contain dots itself
+  ## (`Pool.Obj.0` gives `Pool.Obj`), and an atom that is not a symbol at all
+  ## gives `""` -- it has no identifier to name.
+  let s = p.symbols[id]
+  if s.disamb == NoDisamb: "" else: p.strings[s.name]
+
+func symNameId*(p: Pool; id: SymId): StrId {.inline.} =
+  ## `symBasename` as an id -- the one to compare identifiers by.
+  p.symbols[id].name
+
+func symVersionedBasename*(p: Pool; id: SymId): string =
+  ## The identifier AND its disambiguator, without key or module suffix:
+  ## `abc.12.Ikey.mod` gives `abc.12`. That is a name for the ROUTINE, not for
+  ## one instantiation of it -- `symWithoutModule` is the one that keeps the
+  ## key. An atom that is not a symbol gives `""`.
+  let s = p.symbols[id]
+  if s.disamb == NoDisamb:
+    result = ""
+  else:
+    result = p.strings[s.name]
+    result.add '.'
+    result.addInt s.disamb
+
+func symIsInstantiation*(p: Pool; id: SymId): bool =
+  ## Whether `id` carries a deduplication key -- the `Ikey` of
+  ## `abc.12.Ikey.mod`, which every module needing that instantiation derives
+  ## the same way. That is what makes `symWithoutModule` a cross-module
+  ## identity for it and only for it.
+  ##
+  ## ONE key, spelled the way nimony spells one: a name with two of them
+  ## (`foo.0.Ia.Ib.mod`) is not an instantiation of anything this toolchain
+  ## minted, and nifasm merges symbols by this answer -- it once hand-rolled
+  ## its own and merged such a name wrongly.
+  let d = p.symbols[id].dedup
+  if d == StrId(0): return false
+  let key = p.strings[d]
+  if key.len == 0 or key[0] != 'I': return false
+  for c in key:
+    if c == '.': return false
+  result = true
+
+func symWithoutModule*(p: Pool; id: SymId): string =
+  ## `id` minus its module suffix: `abc.12.Ikey.mod` gives `abc.12.Ikey`, and a
+  ## local symbol gives itself. For an instantiation this is the name every
+  ## module that needs it arrives at independently, so it is the key to merge
+  ## the copies by -- DCE, the type-key builder and overload resolution all use
+  ## it for exactly that.
+  let s = p.symbols[id]
+  result = p.strings[s.name]
+  if s.disamb != NoDisamb:
+    result.add '.'
+    result.addInt s.disamb
+  if s.dedup != StrId(0):
+    result.add '.'
+    result.add p.strings[s.dedup]
+
+func symSameEntity*(p: Pool; a, b: SymId): bool =
+  ## Whether two DIFFERENT symbols name the same entity seen from two modules:
+  ## both are instantiations and everything but the module suffix matches.
+  if a == b: return true
+  let sa = p.symbols[a]
+  let sb = p.symbols[b]
+  result = sa.dedup != StrId(0) and sa.dedup == sb.dedup and
+           sa.name == sb.name and sa.disamb == sb.disamb
+
+func symModule*(p: Pool; id: SymId): string {.inline.} =
+  ## The module suffix of `id`, `""` when it is local. For the places that need
+  ## the suffix as a string -- a table key, a file name, a `(strlit)` -- while
+  ## `sym(p, id).module` is what a COMPARISON should use.
+  strOrEmpty(p, p.symbols[id].module)
+
+func symIsLocal*(p: Pool; id: SymId): bool {.inline.} =
+  ## Whether `id` has no module suffix. A question about the module, never
+  ## about how many dots the spelling has: real names contain dots
+  ## (`Pool.Obj`, `dollar`.CaseMode`, `..<`).
+  p.symbols[id].module == StrId(0)
+
+func symModuleIs*(p: Pool; id: SymId; suffix: string): bool =
+  ## Whether `id` comes from the module `suffix`. Builds nothing.
+  let m = p.symbols[id].module
+  result = m != StrId(0) and p.strings[m] == suffix
+
+func digitCount(x: int32): int {.inline.} =
+  result = 1
+  var v = x div 10
+  while v > 0:
+    inc result
+    v = v div 10
+
+func symSpellingLen*(p: Pool; id: SymId): int =
+  ## How long `symString` would be, without building it. The token writers ask
+  ## only to decide whether the name fits inside the token itself.
+  let s = p.symbols[id]
+  result = p.strings[s.name].len
+  if s.disamb != NoDisamb: result += 1 + digitCount(s.disamb)
+  if s.dedup != StrId(0): result += 1 + p.strings[s.dedup].len
+  if s.module != StrId(0): result += 1 + p.strings[s.module].len
+
+func symString*(p: Pool; s: NifSymbol): string =
+  ## The spelling `s` would be interned under.
+  result = p.strings[s.name]
+  if s.disamb != NoDisamb:
+    result.add '.'
+    result.addInt s.disamb
+  if s.dedup != StrId(0):
+    result.add '.'
+    result.add p.strings[s.dedup]
+  if s.module != StrId(0):
+    result.add '.'
+    result.add p.strings[s.module]
+
+func symString*(p: Pool; id: SymId): string {.inline.} =
+  ## The whole spelling of `id`. Builds a string, so it is for the places that
+  ## genuinely need one -- the C mangler, error messages, serialization -- and
+  ## never for asking a question the accessors above answer.
+  symString(p, p.symbols[id])
+
+const
+  DisambMax* = int(high(int32))
+    ## Largest disambiguator `NifSymbol.disamb` can hold.
+
+func parseDisamb*(s: string; start, len: int): int =
+  ## The value of the disambiguator spelled by `s[start ..< start+len]`, or -1
+  ## when that is not how NIF spells a number:
+  ##
+  ## * digits only -- `p.0h107` names no `p` with a disambiguator;
+  ## * no leading zero -- `d.00` is a NAME, and deliberately so: no user symbol
+  ##   can collide with a field the compiler injects (`typenav.DataField`);
+  ## * small enough to fit the field.
+  ##
+  ## A spelling that fails any of these keeps its tail inside the NAME, which is
+  ## what lets every symbol round-trip through the pool unchanged. The reader's
+  ## split-symbol path asks this too, so the two agree about the same bytes.
+  if len == 0: return -1
+  if len > 1 and s[start] == '0': return -1
+  result = 0
+  for i in start ..< start+len:
+    if s[i] notin {'0'..'9'}: return -1
+    result = result * 10 + (ord(s[i]) - ord('0'))
+    if result > DisambMax: return -1
+
+type
+  Spelling = object
+    ## Where each part of `<name>.<disamb>[.<dedup>].<module>` sits inside the
+    ## string that spells it. Private: it exists to build a `NifSymbol` and to
+    ## look one up, and both are here.
+    nameLen: int
+    disamb: int32          ## `NoDisamb` when there is none that is a number
+    dedupStart, dedupLen: int
+    moduleStart, moduleLen: int
+
+func splitSpelling(s: string): Spelling =
+  ## The module is the LAST dot-separated component -- unless it STARTS with a
+  ## digit, which makes it the disambiguator and the symbol local. `p.0h107` is
+  ## a local whose disambiguator an inliner minted, not a symbol from a module
+  ## called `0h107`.
+  ##
+  ## The name/disambiguator boundary needs the digit anchor, because a name may
+  ## contain dots itself (`Pool.Obj.0`, `a.b.c.23`, `..<.3`) and only the digit
+  ## tells the two apart. Everything not accounted for stays in the name.
+  result = Spelling(nameLen: s.len, disamb: NoDisamb,
+                    dedupStart: 0, dedupLen: 0, moduleStart: 0, moduleLen: 0)
+  var lastDot = -1
+  for k in 0 ..< s.len:
+    if s[k] == '.': lastDot = k
+  var head = s.len
+  if lastDot >= 0:
+    if lastDot+1 < s.len and s[lastDot+1] notin {'0'..'9'}:
+      result.moduleStart = lastDot+1
+      result.moduleLen = s.len - (lastDot+1)
+      head = lastDot
+    elif lastDot == s.len-1:
+      head = lastDot
+  result.nameLen = head
+
+  var i = head - 2
+  while i > 0:
+    if s[i] == '.' and s[i+1] in {'0'..'9'}: break
+    dec i
+  if i <= 0: return  # no numeric disambiguator: the head is all name
+
+  var d = i+1
+  while d < head and s[d] in {'0'..'9'}: inc d
+  var disambLen = head - (i+1)
+  if d < head and s[d] == '.':
+    disambLen = d - (i+1)
+  let v = parseDisamb(s, i+1, disambLen)
+  if v < 0: return   # `p.0h107`, `d.00`: it belongs to the name
+  result.nameLen = i
+  result.disamb = int32(v)
+  if d < head and s[d] == '.':
+    result.dedupStart = d+1
+    result.dedupLen = head - (d+1)
+
+proc symRecord*(p: Pool; s: string): NifSymbol =
+  ## Take a spelling apart into the record the pool stores, interning each
+  ## component. Every spelling round-trips: one whose disambiguator is not a
+  ## NUMBER keeps it inside the name (`NoDisamb`), so the reserved forms older
+  ## artifacts carry (`_exit.sys.mod`, `p.0h107`) come back out unchanged.
+  assert s.len == 0 or s[s.len-1] != '.',
+    "a symbol reaches the pool with its module suffix expanded, never as `" & s & "`"
+  let sl = splitSpelling(s)
+  result = NifSymbol(name: p.strings.getOrIncl(substr(s, 0, sl.nameLen-1)),
+                     disamb: sl.disamb, dedup: StrId(0), module: StrId(0))
+  if sl.dedupLen > 0:
+    result.dedup = p.strings.getOrIncl(substr(s, sl.dedupStart,
+                                              sl.dedupStart+sl.dedupLen-1))
+  if sl.moduleLen > 0:
+    result.module = p.strings.getOrIncl(substr(s, sl.moduleStart,
+                                               sl.moduleStart+sl.moduleLen-1))
+
+proc symId*(p: Pool; s: string): SymId {.inline.} =
+  ## Intern a symbol given its whole spelling. This is what the reader and the
+  ## deserializers have; code that MINTS a symbol should say what its parts are
+  ## instead (the overload below).
+  p.symbols.getOrIncl(symRecord(p, s))
+
+proc symId*(p: Pool; name: string; disamb: int; module = ""; dedup = ""): SymId =
+  ## Intern a symbol from its parts. `module` empty means a local symbol.
+  var r = NifSymbol(name: p.strings.getOrIncl(name), disamb: int32(disamb),
+                    dedup: StrId(0), module: StrId(0))
+  if dedup.len > 0: r.dedup = p.strings.getOrIncl(dedup)
+  if module.len > 0: r.module = p.strings.getOrIncl(module)
+  result = p.symbols.getOrIncl(r)
+
+proc symId*(p: Pool; s: NifSymbol): SymId {.inline.} =
+  p.symbols.getOrIncl(s)
+
+func isLocal*(s: NifSymbol): bool {.inline.} = s.module == StrId(0)
+
+# ── The classic string-shaped view of the symbol pool ────────────────────
+#
+# The Nim compiler's IC modules speak to the symbol pool as a
+# `BiTable[SymId, string]`, and ask it exactly four things:
+# `pool.syms.getOrIncl(name)`, `pool.syms[id]`, `pool.syms.getKeyId(name)` and
+# `poolSym(pool, id)`. That is the surface `lib/nifstreams.nim` exists to keep
+# working, and it must keep working THROUGH the flip (#2457): the pool stores
+# `NifSymbol` records now, so `syms` is a view answering those questions with
+# `symId` / `symString`.
+#
+# Twelve files in `nim/compiler` import this library, and CI is the only place
+# they are COMPILED against it: its setup symlinks `nim/dist/nimony` to the
+# nimony checkout, while a local Nim has a copy of its own. So a change to the
+# names below builds green here and red there -- keep them, or fix Nim first.
+#
+# Nimony's own code does not use it: it asks the accessors above, which do not
+# build a string to ask a question.
+
+type
+  SymPool* = object
+    # NOT named `p`: the constructor below is written inside a template whose
+    # parameter would then substitute the FIELD name too, and the expansion
+    # stops parsing.
+    pool: Pool
+
+template syms*(p: Pool): SymPool = SymPool(pool: p)
+
+template poolSym*(p: Pool; s: SymId): string = symString(p, s)
+  ## The classic name for `symString`, and the fourth thing the Nim compiler's
+  ## IC modules ask (`ast2nif.indexFromBif`). It used to yield `lent string`
+  ## straight out of the pool; the pool has no string to lend now, so this
+  ## builds one -- the callers all wanted a copy anyway (a table key, a name to
+  ## re-emit).
+
+proc getOrIncl*(s: SymPool; name: string): SymId {.inline.} =
+  symId(s.pool, name)
+
+func `[]`*(s: SymPool; id: SymId): string {.inline.} =
+  symString(s.pool, id)
+
+func len*(s: SymPool): int {.inline.} =
+  s.pool.symbols.len
+
+proc getKeyId*(s: SymPool; name: string): SymId =
+  ## The id `name` already has, or `SymId(0)` when the pool does not hold it.
+  ## Looks up without interning ANYTHING: a component this pool never saw is
+  ## proof the symbol is not in it, which is the answer the caller wanted.
+  ensureIndexed s.pool.strings
+  ensureIndexed s.pool.symbols
+  let sl = splitSpelling(name)
+  var r = NifSymbol(name: s.pool.strings.getKeyId(substr(name, 0, sl.nameLen-1)),
+                    disamb: sl.disamb, dedup: StrId(0), module: StrId(0))
+  if sl.dedupLen > 0:
+    r.dedup = s.pool.strings.getKeyId(substr(name, sl.dedupStart,
+                                             sl.dedupStart+sl.dedupLen-1))
+    if r.dedup == StrId(0): return SymId(0)
+  if sl.moduleLen > 0:
+    r.module = s.pool.strings.getKeyId(substr(name, sl.moduleStart,
+                                              sl.moduleStart+sl.moduleLen-1))
+    if r.module == StrId(0): return SymId(0)
+  if r.name == StrId(0): return SymId(0)
+  result = s.pool.symbols.getKeyId(r)
 
 # ── Storage / CursorOwner / Cursor ───────────────────────────────────────
 
@@ -326,7 +768,13 @@ type
     savedRem: int
     bodyLen: int
 
-template decRcAndFree(owner: CursorOwner) =
+proc decRcAndFree(owner: CursorOwner) =
+  ## A proc, NOT a template and deliberately NOT `.inline`: this is the cold
+  ## free path behind every `=destroy`/`=dup` hook. As a template it was
+  ## expanded into the hooks' bodies, so the (correctly) `.inline` hooks
+  ## dragged the whole ORC free machinery into every splice site — the single
+  ## largest source of backend IR blowup. As an out-of-line proc the hooks
+  ## splice as the few tokens they read as: a nil test and a call.
   dec owner.rc
   if owner.rc == 0:
     if owner.data != nil: dealloc(owner.data)
@@ -338,18 +786,67 @@ template decRcAndFree(owner: CursorOwner) =
       owner.tags = nil
     dealloc(owner)
 
+when defined(nimonyPlugin):
+  # ── The plugin build's process-wide pools ──────────────────────────────
+  #
+  # A nimony PLUGIN is an executable that transforms one tree in one tag
+  # namespace, and `plugins.NifBuilder` is a plain alias for `TokenBuf`, so a
+  # plugin author can hand the API a builder `createTree` never minted: an
+  # object field, a `default(...)`, a `seq` slot. That API is public and stays
+  # total, so the plugin build keeps a process-wide default to bind such a
+  # buffer to — `src/nimony/lib/plugins.nim` installs it at module init.
+  #
+  # `-d:nimonyPlugin` is set by `semos.pluginCompileCmd` for every plugin
+  # sub-compile and by nothing else, so the compiler's own nifcore — the
+  # subject of nim-lang/nimony#2456 — contains no mutable module-level state
+  # whatsoever, and every buffer in it carries pools threaded in at
+  # construction.
+  var
+    fallbackPool*: Pool = nil
+      ## Plugin-process default literals pool; nil in every other build.
+    fallbackTags*: TagPool = nil
+      ## Plugin-process default tag pool, same contract as `fallbackPool`.
+
+  template defaultPool(): Pool = fallbackPool
+  template defaultTags(): TagPool = fallbackTags
+else:
+  template defaultPool(): Pool = nil
+  template defaultTags(): TagPool = nil
+
 proc pool*(c: Cursor): Pool {.inline.} =
-  ## Literals pool the cursor's underlying buffer was built against.
-  if c.owner != nil: c.owner.pool else: nil
+  ## Literals pool the cursor's underlying buffer was built against, or the
+  ## plugin build's default (`nil` everywhere else) when it carries none.
+  if c.owner != nil and c.owner.pool != nil: c.owner.pool else: defaultPool()
 
 proc tags*(c: Cursor): TagPool {.inline.} =
-  ## Tag pool the cursor's underlying buffer was built against. Adapter
-  ## code is expected to know which TagPool layout to expect, so callers
-  ## typically reach for `cast[MyTag](c.cursorTagId.uint32)` instead of
-  ## consulting `c.tags` directly.
-  if c.owner != nil: c.owner.tags else: nil
+  ## Tag pool the cursor's underlying buffer was built against, or the plugin
+  ## build's default (`nil` everywhere else) when it carries none. Adapter code
+  ## is expected to know which TagPool layout to expect, so callers typically
+  ## reach for `cast[MyTag](c.cursorTagId.uint32)` instead of consulting
+  ## `c.tags`.
+  if c.owner != nil and c.owner.tags != nil: c.owner.tags else: defaultTags()
 
-proc toUniqueId*(c: Cursor): int {.inline.} =
+proc escapeTagOf*(c: Cursor): TagId {.inline.} =
+  ## The adapter's escape tag, or `TagId(0)` when it declares none — which is
+  ## also what a cursor with no tag pool at all answers, since "no escape space"
+  ## is exactly what `TagId(0)` means.
+  ##
+  ## Exists to be read WITHOUT `tags`. `tags` returns the pool BY VALUE, and a
+  ## `ref` returned by value is an owned temporary: ARC pairs every call with an
+  ## incRef and a decRef, and the decRef has to carry the pool's whole destructor
+  ## behind it — a `BiTable` of strings — so the one-line accessor lowers to
+  ## several thousand tokens of Leng and stops being inlinable at all. On nifbench
+  ## `tags` plus that destructor cost more than `skip` and `symId` together, for a
+  ## pool that outlives the program. Reading the field through the raw owner
+  ## pointer takes no reference and reaches no hook.
+  if c.owner != nil and c.owner.tags != nil:
+    result = c.owner.tags.escapeTag
+  else:
+    result = TagId(0)
+    when defined(nimonyPlugin):
+      if fallbackTags != nil: result = fallbackTags.escapeTag
+
+func toUniqueId*(c: Cursor): int {.inline.} =
   ## A stable identity for the cursor's *position*: two cursors over the same
   ## buffer at the same token share it, distinct positions differ. Suitable as a
   ## `HashSet[int]`/`IntSet` key (e.g. type-traversal dedup). Not stable across
@@ -382,8 +879,22 @@ proc `=dup`*(src: Cursor): Cursor {.nodestroy, inline.} =
 
 # ── Cursor primitives ────────────────────────────────────────────────────
 
-proc load*(c: Cursor): NifToken {.inline.} =
-  assert c.p != nil and c.rem > 0
+const nifcoreChecks* = defined(nifcoreChecks)
+  ## Internal cursor invariants (`load`, `kind`) are checked only when this is
+  ## explicitly requested, NOT under plain `-d:release`.
+  ##
+  ## `load` is the single most executed routine in the whole toolchain — every
+  ## `kind`, `tokenWidth`, `combinedPayload` and literal decode bottoms out in
+  ## it. Its two-condition assert was more than the check: it made `load`'s NIFC
+  ## body 131 tokens, over the inliner's 100-token bound, so `load` AND its
+  ## callers stayed real calls — 28 instructions for `kind`, whose body is two.
+  ## The invariant it guards (a cursor is non-nil and has tokens left) is an
+  ## internal one: a violation is a nifcore bug, and every walk re-establishes it
+  ## structurally. Build with `-d:nifcoreChecks` to get it back.
+
+func load*(c: Cursor): NifToken {.inline.} =
+  when nifcoreChecks:
+    assert c.p != nil and c.rem > 0
   c.p[]
 
 template peekAhead(c: Cursor; offset: int): NifToken =
@@ -399,15 +910,15 @@ template advanceBy(c: var Cursor; n: int) =
   if c.rem > 0:
     c.rem = if c.rem >= advance: c.rem - advance else: 0
 
-proc cursorIsNil*(c: Cursor): bool {.inline.} = c.p == nil
+func cursorIsNil*(c: Cursor): bool {.inline.} = c.p == nil
 
-proc kind*(c: Cursor): NifKind {.inline.} =
+func kind*(c: Cursor): NifKind {.inline.} =
   ## Effective kind of the value at the cursor. Always one load + one
   ## mask — the cursor lands on the kinded token; any `ExtendedSuffix`
   ## sits *after* it and is only consulted when extended bits are needed.
   c.load.kind
 
-proc tokenWidth*(c: Cursor): int {.inline.} =
+func tokenWidth*(c: Cursor): int {.alwaysInline.} =
   ## Tokens occupied by the head of the current value — the kinded
   ## token plus any consecutive `ExtendedSuffix` tokens chained behind
   ## it. NOT including a TagLit's body.
@@ -415,21 +926,87 @@ proc tokenWidth*(c: Cursor): int {.inline.} =
   ## Chains are unbounded in principle; in practice the writers in
   ## nifcore emit at most 2 suffixes (enough to cover int64/float64 /
   ## 47-bit jumps / 55-bit pool ids). The hot path — no suffix at all
-  ## — is one peek + one branch, same as the prior single-suffix code.
+  ## — is one peek + one branch.
+  ##
+  ## Written as NESTED `if`s ending in `break`s rather than a `while` over a
+  ## conjunction, and deliberately WITHOUT a `noinline` slow-path helper.
+  ##
+  ## Do NOT give this one the hot/cold treatment `combinedPayload` gets, even
+  ## though the two look alike. Measured on nifbench: splitting `combinedPayload`
+  ## is −0.68 % instructions, splitting THIS is **+6.5 M (a loss)**, and doing
+  ## both is only −0.46 % — the loss here eats a third of the win there. The hot
+  ## path returns a *constant*, so the call it saves is already the cheapest kind
+  ## while the wrapper still costs a branch at all 10 M call sites. Reasons:
+  ##  * a conjunction whose second operand contains a call cannot be handed to
+  ##    the backend as branches, so it materialises a bool in an if/else
+  ##    diamond — 9 x86 instructions and ~90 NIFC tokens for two compares;
+  ##  * factoring the chain walk into a helper made this routine a NON-LEAF,
+  ##    and arkham then homes its locals in callee-saved registers and pushes
+  ##    them in the prologue on EVERY call, including the overwhelmingly common
+  ##    no-suffix path. That cost more than the loop it removed (`parse` +8%).
+  ##
+  ## `{.alwaysInline.}` is load-bearing for the native backend. Hexer's
+  ## inliner ignores `.inline` (it only auto-splices bodies ≤ 100 tokens, and
+  ## this one is larger once `peekAhead` expands) while GCC `-O3` inlines the
+  ## `static inline` C anyway. Without the force-splice, `skip`/`inc` call
+  ## this and copy the 24-byte Cursor onto the stack for the by-value
+  ## argument — the dominant arkham-vs-GCC gap on nifbench's walk/parse.
+  ##
+  ## Measured, not assumed: at 262 asm-NIF tokens this sits
+  ## above `InlineTinyBound`, so the size heuristic never took it, and it is the
+  ## one shape that pays — scalar in, scalar out, few live values, so the callee's
+  ## push/pop and call/ret vanish and the caller adds no spill traffic. Measured
+  ## on nimsem (128-invocation `check`, `-d:danger`): 55.320 G → 55.035 G Ir,
+  ## **−0.51 %**, for +4 KB of image.
+  ##
+  ## The two neighbours that looked like the same shape on nifbench do NOT
+  ## survive this measurement — do not annotate them: `inc` on top of this one is
+  ## −0.36 % (i.e. it gives back a third of the win, while nifbench said it added
+  ## to it), and `rawLineInfo` is **+0.22 %, a loss** — it returns an aggregate
+  ## and holds ~20 live values, so the push/pop it removes comes straight back as
+  ## frame traffic in every caller.
   result = 1
-  while c.rem > result and peekAhead(c, result).kind >= ExtendedSuffix:
-    inc result
+  if c.rem > 1:
+    if peekAhead(c, 1).kind >= ExtendedSuffix:
+      result = 2
+      while c.rem > result:
+        if peekAhead(c, result).kind < ExtendedSuffix: break
+        inc result
 
-proc combinedPayload*(c: Cursor): uint64 {.inline.} =
-  ## Combine the kinded token's 28-bit payload with any chained
-  ## ExtendedSuffix tokens. Each suffix supplies the next 28 high bits.
+func combinedPayloadSlow(c: Cursor): uint64 {.noinline.} =
+  ## The suffix chain walk — see `tokenWidthSlow` for why it is `.noinline`.
   result = uint64(c.load.uoperand)
   var i = 1
   var shift = PayloadBits
-  while c.rem > i and peekAhead(c, i).kind == ExtendedSuffix:
+  while true:
     result = result or (uint64(peekAhead(c, i).uoperand) shl shift)
     inc i
     shift += PayloadBits
+    if shift >= 64'u32: break
+    if c.rem <= i: break
+    if peekAhead(c, i).kind != ExtendedSuffix: break
+  assert not (c.rem > i and peekAhead(c, i).kind == ExtendedSuffix),
+         "too many ExtendedSuffix tokens!"
+
+func combinedPayload*(c: Cursor): uint64 {.alwaysInline.} =
+  ## Combine the kinded token's 28-bit payload with any chained
+  ## ExtendedSuffix tokens. Each suffix supplies the next 28 high bits.
+  ##
+  ## HOT PATH INLINE, COLD PATH OUT OF LINE. 7.3 M calls per nifbench run at 29
+  ## instructions each, for a common case that is one load and one branch — 12
+  ## of those 29 were callee-saved pushes and pops for registers only the chain
+  ## walk uses. `{.alwaysInline.}` because the wrapper is 269 NIFC tokens once
+  ## hexer has flattened it, far past `InlineTinyBound`; `combinedPayloadSlow`
+  ## is `{.noinline.}` because otherwise it gets spliced back in here and the
+  ## wrapper stops being worth inlining. **Both pragmas are load-bearing.**
+  ## nifbench −0.68 % instructions, self-hosted compiler unchanged.
+  ##
+  ## `tokenWidth` looks like the same shape but must NOT get the same treatment
+  ## — see the measurement in its doc comment.
+  if c.rem > 1 and peekAhead(c, 1).kind == ExtendedSuffix:
+    result = combinedPayloadSlow(c)
+  else:
+    result = uint64(c.load.uoperand)
 
 # String/sym layout (StrLit, Ident, Symbol, SymbolDef):
 #   bit 0      mode (1 = inline-short, 0 = pool ref)
@@ -454,69 +1031,104 @@ const
   StrDataShift* = 3'u32                  ## bits 3..26 hold up to 3 bytes
   StrInlineMaxLen* = 3                   ## bytes that fit inline
 
-proc isInlineLit*(c: Cursor): bool {.inline.} =
+func isInlineLit*(c: Cursor): bool {.inline.} =
   ## True if a StrLit/Ident/Symbol/SymbolDef stores its bytes inline.
   (c.load.uoperand and StrInlineFlag) != 0'u32
 
-proc inlineStrLen(payload: uint32): int {.inline.} =
+func inlineStrLen(payload: uint32): int {.inline.} =
   int((payload shr StrLengthShift) and StrLengthMask)
 
-proc readInlineStr(payload: uint32): string =
+func readInlineStr(payload: uint32): string =
   let length = inlineStrLen(payload)
   result = newString(length)
   let chars = payload shr StrDataShift
   for i in 0 ..< length:
     result[i] = char((chars shr (uint32(i) * 8)) and 0xFF)
 
-proc strVal*(c: Cursor; pool: Pool): string =
+func strVal*(c: Cursor; pool: Pool): string =
   ## Decode a StrLit/Ident at the cursor into a `string`. Handles the
   ## inline-short path (no pool touch) and the pool-ref path (with or
   ## without an ExtendedSuffix extending the pool id).
-  assert c.kind in {StrLit, Ident}, "strVal on " & $c.kind
+  checkKind c.kind in {StrLit, Ident}, "strVal on ", c.kind
   let payload = c.load.uoperand
   if (payload and StrInlineFlag) != 0'u32:
     readInlineStr(payload)
   else:
     pool.strings[StrId(combinedPayload(c) shr 1)]
 
-proc strVal*(c: Cursor): string {.inline.} = strVal(c, c.pool)
+# The one-argument accessors below spell the pool lookup out rather than calling
+# `pool(c)`. `pool` returns the pool BY VALUE, and a `ref` returned by value is an
+# owned temporary — ARC pairs the call with an incRef and a decRef, and the decRef
+# carries the `Pool`'s whole destructor (three `BiTable`s) behind it, for a pool
+# that outlives the program. Passed as an ARGUMENT the same field is borrowed and
+# costs nothing, so the branch is written here where the value is consumed
+# immediately. Same reasoning as `escapeTagOf`; measured together on nifbench.
+proc strVal*(c: Cursor): string {.inline.} =
+  when defined(nimonyPlugin):
+    if c.owner != nil and c.owner.pool != nil: strVal(c, c.owner.pool)
+    else: strVal(c, fallbackPool)
+  else:
+    assert c.owner != nil and c.owner.pool != nil,
+      "strVal on a cursor with no literals pool"
+    strVal(c, c.owner.pool)
 
 proc strId*(c: Cursor; pool: Pool): StrId =
   ## Stable pool id of the StrLit/Ident at `c` — the inverse of `strVal`.
   ## A pool-ref token already carries its id, so use it directly; only an inline
   ## short string (stored in the token itself) has to be interned. Mirrors
   ## `symId` and avoids the decode-then-reintern round trip of `strings[strVal]`.
-  assert c.kind in {StrLit, Ident}, "strId on " & $c.kind
+  checkKind c.kind in {StrLit, Ident}, "strId on ", c.kind
   let payload = c.load.uoperand
   if (payload and StrInlineFlag) != 0'u32:
     pool.strings.getOrIncl(readInlineStr(payload))
   else:
     StrId(combinedPayload(c) shr 1)
 
-proc strId*(c: Cursor): StrId {.inline.} = strId(c, c.pool)
+proc strId*(c: Cursor): StrId {.inline.} =
+  when defined(nimonyPlugin):
+    if c.owner != nil and c.owner.pool != nil: strId(c, c.owner.pool)
+    else: strId(c, fallbackPool)
+  else:
+    assert c.owner != nil and c.owner.pool != nil,
+      "strId on a cursor with no literals pool"
+    strId(c, c.owner.pool)
 
-proc symName*(c: Cursor; pool: Pool): string =
-  assert c.kind in {Symbol, SymbolDef}, "symName on " & $c.kind
+func symName*(c: Cursor; pool: Pool): string =
+  checkKind c.kind in {Symbol, SymbolDef}, "symName on ", c.kind
   let payload = c.load.uoperand
   if (payload and StrInlineFlag) != 0'u32:
     readInlineStr(payload)
   else:
-    pool.syms[SymId(combinedPayload(c) shr 1)]
+    symString(pool, SymId(combinedPayload(c) shr 1))
 
-proc symName*(c: Cursor): string {.inline.} = symName(c, c.pool)
+proc symName*(c: Cursor): string {.inline.} =
+  when defined(nimonyPlugin):
+    if c.owner != nil and c.owner.pool != nil: symName(c, c.owner.pool)
+    else: symName(c, fallbackPool)
+  else:
+    assert c.owner != nil and c.owner.pool != nil,
+      "symName on a cursor with no literals pool"
+    symName(c, c.owner.pool)
 
 proc symId*(c: Cursor; pool: Pool): SymId =
   ## Stable pool id of the Symbol/SymbolDef at `c` — the inverse of `symName`.
   ## A pool-ref token already carries its id, so use it directly; only an inline
   ## short name (stored in the token itself) has to be interned.
-  assert c.kind in {Symbol, SymbolDef}, "symId on " & $c.kind
+  checkKind c.kind in {Symbol, SymbolDef}, "symId on ", c.kind
   let payload = c.load.uoperand
   if (payload and StrInlineFlag) != 0'u32:
-    pool.syms.getOrIncl(readInlineStr(payload))
+    symId(pool, readInlineStr(payload))
   else:
     SymId(combinedPayload(c) shr 1)
 
-proc symId*(c: Cursor): SymId {.inline.} = symId(c, c.pool)
+proc symId*(c: Cursor): SymId {.inline.} =
+  when defined(nimonyPlugin):
+    if c.owner != nil and c.owner.pool != nil: symId(c, c.owner.pool)
+    else: symId(c, fallbackPool)
+  else:
+    assert c.owner != nil and c.owner.pool != nil,
+      "symId on a cursor with no literals pool"
+    symId(c, c.owner.pool)
 
 # Int/UInt/Float: pure-inline via chainable ExtendedSuffix.
 #
@@ -530,7 +1142,7 @@ proc symId*(c: Cursor): SymId {.inline.} = symId(c, c.pool)
 # are gone. The reader's per-call cost is the same as before in the
 # common case (no suffix → one peek + one branch).
 
-proc valueWidth*(c: Cursor): int {.inline.} =
+func valueWidth*(c: Cursor): int {.inline.} =
   ## Tokens carrying value bits — the kinded token plus consecutive
   ## `ExtendedSuffix` tokens. Excludes trailing LineInfoLit (which
   ## `tokenWidth` does include for advance-past purposes). This is the
@@ -540,7 +1152,7 @@ proc valueWidth*(c: Cursor): int {.inline.} =
   while c.rem > result and peekAhead(c, result).kind == ExtendedSuffix:
     inc result
 
-proc intVal*(c: Cursor): int64 {.inline.} =
+func intVal*(c: Cursor): int64 {.inline.} =
   assert c.kind == IntLit
   let width = uint32(valueWidth(c)) * PayloadBits      # 28, 56, or 84
   let combined = combinedPayload(c)
@@ -550,26 +1162,26 @@ proc intVal*(c: Cursor): int64 {.inline.} =
     let shift = uint64(64'u32 - width)
     cast[int64](combined shl shift) shr shift          # sign-extend
 
-proc uintVal*(c: Cursor): uint64 {.inline.} =
+func uintVal*(c: Cursor): uint64 {.inline.} =
   assert c.kind == UIntLit
   combinedPayload(c)                                   # no sign extension
 
-proc floatVal*(c: Cursor): float64 {.inline.} =
+func floatVal*(c: Cursor): float64 {.inline.} =
   assert c.kind == FloatLit
   cast[float64](combinedPayload(c))
 
-proc charLit*(c: Cursor): char {.inline.} =
+func charLit*(c: Cursor): char {.inline.} =
   ## Returns the character stored in the `CharLit` at `c`.
   assert c.kind == CharLit
   char(c.load.uoperand)
 
 # TagLit accessors — the tag is always in the kinded token; the jump
 # extends via the suffix when present.
-proc cursorTagId*(c: Cursor): TagId {.inline.} =
+func cursorTagId*(c: Cursor): TagId {.inline.} =
   assert c.kind == TagLit
   c.load.rawTag
 
-proc cursorJump*(c: Cursor): uint64 {.inline.} =
+func cursorJump*(c: Cursor): uint64 {.alwaysInline.} =
   ## Body tokens following this TagLit. 19 bits if unsuffixed; with one
   ## ExtendedSuffix the field widens to 47 bits (further chaining would
   ## extend it further, but no plausible jump needs that). The unified
@@ -580,7 +1192,7 @@ proc cursorJump*(c: Cursor): uint64 {.inline.} =
 
 # ── Line info reader ─────────────────────────────────────────────────────
 
-proc rawLineInfo*(c: Cursor): NifLineInfo =
+func rawLineInfo*(c: Cursor): NifLineInfo =
   ## Decode the `LineInfoLit` trailing the value at `c`, if present, returning
   ## a `FileId` (resolve against `pool.filenames`) plus line/col, and an
   ## optional `comment` `StrId` (a NIF `#…#` decoration; `StrId(0)` = none).
@@ -632,14 +1244,14 @@ proc lineInfoFile*(c: Cursor): string =
 
 # ── inc / skip / into ────────────────────────────────────────────────────
 
-proc inc*(c: var Cursor) {.inline.} =
+func inc*(c: var Cursor) {.inline, nifAdvance.} =
   ## Advance past the *head* of the current value (kinded token plus its
   ## suffix, if any). For a TagLit this lands at the first body token;
   ## use `skip` to jump past the whole subtree.
   assert c.rem != 0, "advancing past end of scope"
   advanceBy(c, tokenWidth(c))
 
-proc skip*(c: var Cursor) =
+func skip*(c: var Cursor) {.nifAdvance.} =
   ## Advance past the current value, including all descendants of a TagLit.
   if c.kind == TagLit:
     let span = int(tokenWidth(c).uint64 + c.cursorJump)
@@ -652,7 +1264,7 @@ template hasMore*(c: Cursor): bool =
   ## sentinel: `rem` does all the work.
   c.rem > 0
 
-proc enterScope*(c: var Cursor): CursorScope =
+func enterScope*(c: var Cursor): CursorScope =
   ## Enters the current `TagLit` body and returns its saved outer bounds.
   ## Pair with `leaveScope` after consuming every child.
   assert c.load.kind == TagLit, "into requires cursor at TagLit"
@@ -663,7 +1275,7 @@ proc enterScope*(c: var Cursor): CursorScope =
                            uint(headWidth) * sizeof(NifToken).uint)
   c.rem = result.bodyLen
 
-proc leaveScope*(c: var Cursor; scope: CursorScope) =
+func leaveScope*(c: var Cursor; scope: CursorScope) =
   ## Leaves a scope opened by `enterScope`.
   ## The cursor must have consumed the complete bounded body.
   assert c.rem == 0, "into: body did not consume all " & $scope.bodyLen &
@@ -675,7 +1287,56 @@ proc leaveScope*(c: var Cursor; scope: CursorScope) =
           else:
             0
 
+func sub*(c: Cursor): Cursor =
+  ## Read-only descent: returns a bounded cursor over the children of the
+  ## `TagLit` at `c`, leaving `c` itself untouched. Use it for a throwaway
+  ## walk of a node's body (`while result.hasMore: …`) where there is no dest
+  ## to preserve into and hence no scope to `leaveScope`. Replaces the old
+  ## `var t = c; discard enterScope(t)` idiom.
+  assert c.load.kind == TagLit, "sub requires cursor at TagLit"
+  result = c
+  discard enterScope(result)
+
+func isEscapedBody(c: Cursor): bool {.noinline.} =
+  ## The last conjunct of `isEscapedTag`, out of line. Reached only once the tag
+  ## at `c` IS the adapter's escape tag, which on nifbench is never: an adapter
+  ## that declares no escape space answers `TagId(0)` and the first conjunct is
+  ## already false. Keeping the `sub` here is what lets the caller be spliced —
+  ## `sub` enters a scope, so inlining this half would drag `enterScope` (and the
+  ## temp cursor's destructor) into every site, and on AArch64 the call alone
+  ## forces a frame: `bl` delivers the return address in x30, so a routine
+  ## holding one anywhere must spill lr on every entry to reach a branch not taken.
+  ##
+  ## `c.load.kind == TagLit` is the caller's second conjunct and therefore a
+  ## precondition here — it is what `sub`'s own assert wants.
+  let body = sub(c)
+  result = body.hasMore and body.load.kind == IntLit
+
+proc isEscapedTag*(c: Cursor): bool {.alwaysInline.} =
+  ## Is the node at `c` spelled through its adapter's escape tag — i.e. does its
+  ## real id sit in a leading `IntLit` child, one token in front of the operands?
+  ##
+  ## `{.alwaysInline.}` rather than `{.inline.}`, which `computeInlineInfo` does
+  ## not consult: what is left here is `escapeTagOf` plus two comparisons, and it
+  ## has five call sites. See `isEscapedBody` for what was taken out to make that
+  ## true.
+  let esc = escapeTagOf(c)
+  result = esc != TagId(0) and c.load.kind == TagLit and
+           c.cursorTagId == esc and isEscapedBody(c)
+
+proc resolvedTagId*(c: Cursor): TagId =
+  ## The tag id of the node at `c`, undoing the escape. Equal to `cursorTagId`
+  ## for everything that fits the 9-bit field, which is every tag of an adapter
+  ## that declares no escape space — so this is the accessor to reach for, and
+  ## `cursorTagId` the one for when you truly mean the token.
+  if isEscapedTag(c):
+    let body = sub(c)
+    result = TagId(uint32(intVal(body)))
+  else:
+    result = c.cursorTagId
+
 template into*(c: var Cursor; body: untyped) =
+  {.nifWrap.}
   ## Enters the current `TagLit`, runs `body`, then restores the outer bounds.
   ## `body` must consume every child.
   let cursorScope = enterScope(c)
@@ -683,10 +1344,11 @@ template into*(c: var Cursor; body: untyped) =
   leaveScope(c, cursorScope)
 
 template loopInto*(c: var Cursor; body: untyped) =
+  {.nifWrap.}
   into c:
     while c.hasMore: body
 
-proc leaveScopePartial*(c: var Cursor; scope: CursorScope) =
+func leaveScopePartial*(c: var Cursor; scope: CursorScope) =
   ## Leaves a scope opened by `enterScope` **without** requiring the body to
   ## have been fully consumed: rewinds to the scope head and skips the whole
   ## subtree. The early-out counterpart to `leaveScope`.
@@ -695,6 +1357,7 @@ proc leaveScopePartial*(c: var Cursor; scope: CursorScope) =
   skip c
 
 template peekInto*(c: var Cursor; body: untyped) =
+  {.nifWrap.}
   ## Like `into`, but `body` need not consume every child — any unconsumed
   ## remainder is skipped. Use for early-out searches over a node's children
   ## (e.g. `break` out on the first match). The finish is a single `skip`
@@ -755,6 +1418,25 @@ else:
     if dest.owner != nil: decRcAndFree(dest.owner)
     elif dest.data != nil: dealloc(dest.data)
 
+template requirePools*(b: var TokenBuf) =
+  ## A buffer the interning builders and the cross-pool copy are about to write
+  ## through must carry both of its pools. They are THREADED in at construction
+  ## (`createTokenBuf` / `initTokenBuf`) and never invented here: a literals
+  ## pool decides what a token's payload id means and a tag pool is the
+  ## buffer's whole kind space, so substituting a fresh one for either silently
+  ## reinterprets everything already in the buffer. `default(TokenBuf)` is not
+  ## a usable buffer; `initTokenBuf` is the zero-allocation way to spell one.
+  ##
+  ## The plugin build is the exception, and only there: it binds its
+  ## process-wide pools rather than reject the buffer, because
+  ## `plugins.NifBuilder` is a public alias whose `default` shape must keep
+  ## working. See the `nimonyPlugin` block above.
+  when defined(nimonyPlugin):
+    if b.pool == nil: b.pool = fallbackPool
+    if b.tags == nil: b.tags = fallbackTags
+  assert b.pool != nil, "TokenBuf has no literals pool"
+  assert b.tags != nil, "TokenBuf has no tag pool"
+
 proc createTokenBuf*(cap = 16; sharedPool: Pool = nil;
                      sharedTags: TagPool = nil): TokenBuf =
   ## Mint a new buffer. Pass `sharedPool` to thread a single literals
@@ -763,12 +1445,25 @@ proc createTokenBuf*(cap = 16; sharedPool: Pool = nil;
   ## tag namespace — adapters typically create their own fresh
   ## `TagPool` per buffer so `cast[Enum](c.cursorTagId.uint32)` lines
   ## up with the adapter's enum ordinals.
+  # `cap == 0` must NOT reach `alloc(0)`: Nim's allocator maps a zero-sized
+  # request to size class 0, which hands the SAME address to every caller and
+  # (on Nim <= 2.2.x) releases the whole page on the first `dealloc` — every
+  # other live zero-cap buffer is then a dangling pointer into a recycled page.
+  let cap = max(cap, 1)
   result = TokenBuf(
     data: cast[Storage](alloc(sizeof(NifToken) * cap)),
     len: 0, cap: cap,
     pool: (if sharedPool != nil: sharedPool else: newPool()),
     tags: (if sharedTags != nil: sharedTags else: newTagPool())
   )
+
+func initTokenBuf*(sharedPool: Pool; sharedTags: TagPool): TokenBuf {.inline.} =
+  ## A buffer bound to `sharedPool`/`sharedTags` that owns NO storage yet — the
+  ## first `add` allocates it. This is what an object field, a `seq` slot or any
+  ## other buffer that used to be spelled `default(TokenBuf)` must be
+  ## initialized with: the tag pool is a buffer's whole kind space, so it is
+  ## THREADED in at construction and never fallen back to.
+  TokenBuf(data: nil, len: 0, cap: 0, pool: sharedPool, tags: sharedTags)
 
 proc adoptForeignTokens*(data: pointer; count: int;
                          sharedPool: Pool = nil; sharedTags: TagPool = nil): TokenBuf =
@@ -804,9 +1499,9 @@ proc adoptForeignTokens*(data: pointer; count: int;
   GC_ref(result.owner.tags)
   result.owner.rc = 2
 
-proc len*(b: TokenBuf): int {.inline.} = b.len
+func len*(b: TokenBuf): int {.inline.} = b.len
 
-proc `[]`*(b: TokenBuf; i: int): NifToken {.inline.} =
+func `[]`*(b: TokenBuf; i: int): NifToken {.inline.} =
   assert i >= 0 and i < b.len
   b.data[i]
 
@@ -824,13 +1519,15 @@ proc prepareMutation*(b: var TokenBuf) {.inline.} =
       decRcAndFree(b.owner)
       b.owner = nil
     else:
-      let newData = cast[Storage](alloc(sizeof(NifToken) * b.cap))
+      # `max(.., 1)`: never `alloc(0)` — see `createTokenBuf`. A borrowed
+      # zero-token block (`adoptForeignTokens(_, 0)`) reaches this with cap 0.
+      let newData = cast[Storage](alloc(sizeof(NifToken) * max(b.cap, 1)))
       copyMem(newData, b.data, sizeof(NifToken) * b.len)
       decRcAndFree(b.owner)
       b.owner = nil
       b.data = newData
 
-proc expectUnique*(b: var TokenBuf) {.inline.} =
+func expectUnique*(b: var TokenBuf) {.inline.} =
   when defined(debug):
     assert b.owner == nil or b.owner.rc == 1,
       "TokenBuf has live cursors; missing endRead before mutation"
@@ -855,7 +1552,17 @@ proc add*(b: var TokenBuf; t: NifToken) {.inline.} =
 # (assigned 1,2,… in intern order), a loader that re-interns the pool values in
 # the same order reproduces identical ids, so the raw token words stay valid.
 
-proc rawTokenPtr*(b: TokenBuf): pointer {.inline.} =
+proc shrink*(b: var TokenBuf; newLen: int) =
+  ## Truncate to `newLen` tokens. Any still-open tags at or past the cut are
+  ## discarded from the build-time stack so later `closeTag` calls keep
+  ## sealing the right opens (rollback-past-an-open-tag pattern).
+  assert newLen >= 0 and newLen <= b.len
+  if b.owner != nil: prepareMutation(b)
+  while b.openTags.len > 0 and b.openTags[^1] >= newLen:
+    b.openTags.setLen b.openTags.len - 1
+  b.len = newLen
+
+func rawTokenPtr*(b: TokenBuf): pointer {.inline.} =
   ## Pointer to the first token word; `len(b) * sizeof(NifToken)` bytes follow.
   b.data
 
@@ -870,6 +1577,51 @@ proc growRawUninit*(b: var TokenBuf; count: int): pointer =
   b.len = count
   b.data
 
+func subtreeWidth*(c: Cursor): int =
+  ## Total tokens occupied by the value at `c` (head + body).
+  if c.kind == TagLit:
+    int(tokenWidth(c).uint64 + c.cursorJump)
+  else:
+    tokenWidth(c)
+
+proc replace*(dest: var TokenBuf; by: Cursor; pos: int) =
+  ## Replace the sealed subtree at `pos` with the sealed subtree `by`.
+  if dest.owner != nil: prepareMutation(dest)
+  var at = Cursor(p: cast[ptr NifToken](cast[uint](dest.data) +
+                    uint(pos) * sizeof(NifToken).uint), rem: dest.len - pos)
+  let actualLen = min(subtreeWidth(at), dest.len - pos)
+  let byLen = subtreeWidth(by)
+  let oldLen = dest.len
+  let delta = byLen - actualLen
+  if delta != 0:
+    for k in 0 ..< dest.openTags.len:
+      if dest.openTags[k] >= pos + actualLen: dest.openTags[k] += delta
+  if delta > 0:
+    discard growRawUninit(dest, oldLen + delta)
+    for i in countdown(oldLen - 1, pos + actualLen):
+      dest.data[i + delta] = dest.data[i]
+  elif delta < 0:
+    for i in pos + actualLen ..< oldLen:
+      dest.data[i + delta] = dest.data[i]
+    dest.len = oldLen + delta
+  for i in 0 ..< byLen:
+    dest.data[pos + i] = cast[ptr NifToken](cast[uint](by.p) +
+                           uint(i) * sizeof(NifToken).uint)[]
+
+proc insert*(dest: var TokenBuf; src: TokenBuf; pos: int) =
+  ## Splice `src`'s tokens into `dest` at index `pos` (raw). Enclosing sealed
+  ## scopes' jumps are NOT adjusted — the caller must `widenSealed` them.
+  assert pos >= 0 and pos <= dest.len
+  let n = src.len
+  if n == 0: return
+  let oldLen = dest.len
+  if dest.owner != nil: prepareMutation(dest)
+  discard growRawUninit(dest, oldLen + n)
+  for i in countdown(oldLen - 1, pos):
+    dest.data[i + n] = dest.data[i]
+  for i in 0 ..< n:
+    dest.data[pos + i] = src.data[i]
+
 # ── Builder API (interns, emits suffix on overflow) ──────────────────────
 
 proc appendLineInfo*(b: var TokenBuf; file: FileId; line, col: int32;
@@ -883,6 +1635,7 @@ proc appendLineInfo*(b: var TokenBuf; file: FileId; line, col: int32;
   ## none) — a NIF `#…#` decoration on this head. A non-zero comment forces the
   ## overflow position layout and rides as one further `ExtendedSuffix` (a second
   ## only for ids past 2^28), so `rawLineInfo` recovers it unambiguously.
+  requirePools(b)
   if not file.isValid: return
   var line = line
   var col = col
@@ -914,15 +1667,15 @@ template addSuffixIfNeeded(b: var TokenBuf; payload: uint64) =
 template lowBits(x: uint32): uint32 = x and PayloadMask
 template lowBits(x: uint64): uint32 = uint32(x and uint64(PayloadMask))
 
-proc addDotToken*(b: var TokenBuf) {.inline.} =
+proc addDotToken*(b: var TokenBuf) {.inline, nifEmits: "Dot".} =
   ## Appends an empty dot placeholder.
   b.add dotToken()
 
-proc addCharLit*(b: var TokenBuf; c: char) {.inline.} =
+proc addCharLit*(b: var TokenBuf; c: char) {.inline, nifEmits: "LIT".} =
   ## Appends a character literal.
   b.add charToken(c)
 
-proc encodeInlineStr(s: string): uint32 {.inline.} =
+func encodeInlineStr(s: string): uint32 {.inline.} =
   ## Pack up to 3 bytes of `s` into the inline-string layout.
   result = StrInlineFlag or (uint32(s.len) shl StrLengthShift)
   for i in 0 ..< s.len:
@@ -931,6 +1684,7 @@ proc encodeInlineStr(s: string): uint32 {.inline.} =
 template addStringLike(b: var TokenBuf; kind: NifKind; s: string; pool: untyped) =
   ## Shared body for StrLit/Ident/Symbol/SymbolDef. Inlines bytes for
   ## `s.len <= 3`; otherwise interns in the given `pool` BiTable.
+  requirePools(b)
   if s.len <= StrInlineMaxLen:
     b.add NifToken(toX(kind, encodeInlineStr(s)))
   else:
@@ -939,36 +1693,86 @@ template addStringLike(b: var TokenBuf; kind: NifKind; s: string; pool: untyped)
     b.add NifToken(toX(kind, lowBits(payload)))
     addSuffixIfNeeded(b, payload)
 
-proc addStrLit*(b: var TokenBuf; s: string) =
+proc addStrLit*(b: var TokenBuf; s: string) {.nifEmits: "LIT".} =
   ## Appends a string literal, using inline storage when possible.
   addStringLike(b, StrLit, s, b.pool.strings)
 
-proc addIdent*(b: var TokenBuf; s: string) =
+func encodeInlineStrView(s: openArray[char]): uint32 {.inline.} =
+  result = StrInlineFlag or (uint32(s.len) shl StrLengthShift)
+  for i in 0 ..< s.len:
+    result = result or (uint32(byte(s[i])) shl (StrDataShift + uint32(i) * 8))
+
+proc addStrLit*(b: var TokenBuf; s: openArray[char]) {.nifEmits: "LIT".} =
+  ## Appends a string literal taken straight from a byte view. For a parser
+  ## reading someone else's buffer this saves cutting a slice out of it first:
+  ## a short value costs nothing at all, and a long one costs the single copy
+  ## the pool was going to make anyway.
+  requirePools(b)
+  if s.len <= StrInlineMaxLen:
+    b.add NifToken(toX(StrLit, encodeInlineStrView(s)))
+  else:
+    var tmp = newString(s.len)
+    for i in 0 ..< s.len: tmp[i] = s[i]
+    let id = uint32 b.pool.strings.getOrIncl(tmp)
+    let payload = uint64(id) shl 1               # bit 0 = 0 => pool ref
+    b.add NifToken(toX(StrLit, lowBits(payload)))
+    addSuffixIfNeeded(b, payload)
+
+proc addIdent*(b: var TokenBuf; s: string) {.nifEmits: "Y".} =
   ## Appends an identifier, using inline storage when possible.
   addStringLike(b, Ident,  s, b.pool.strings)
 
-proc addSymUse*(b: var TokenBuf; s: string) =
-  ## Appends a symbol use, interning `s` when it does not fit inline.
-  addStringLike(b, Symbol, s, b.pool.syms)
-
-proc addSymDef*(b: var TokenBuf; s: string) =
-  ## Appends a symbol definition, interning `s` when it does not fit inline.
-  addStringLike(b, SymbolDef, s, b.pool.syms)
-
-proc addInternedSymbol(b: var TokenBuf; kind: NifKind; id: SymId) =
-  let s = b.pool.syms[id]
+template addSymLike(b: var TokenBuf; kind: NifKind; s: string) =
+  ## `addStringLike` for the SYMBOL pool, which does not take a spelling: the
+  ## pool stores the taken-apart form, so interning goes through `symId`.
+  requirePools(b)
   if s.len <= StrInlineMaxLen:
     b.add NifToken(toX(kind, encodeInlineStr(s)))
+  else:
+    let payload = uint64(uint32(symId(b.pool, s))) shl 1  # bit 0 = 0 => pool ref
+    b.add NifToken(toX(kind, lowBits(payload)))
+    addSuffixIfNeeded(b, payload)
+
+proc addSymUse*(b: var TokenBuf; s: string) {.nifEmits: "Y".} =
+  ## Appends a symbol use, interning `s` when it does not fit inline.
+  addSymLike(b, Symbol, s)
+
+proc addSymDef*(b: var TokenBuf; s: string) {.nifEmits: "D".} =
+  ## Appends a symbol definition, interning `s` when it does not fit inline.
+  addSymLike(b, SymbolDef, s)
+
+proc addInternedSymbol(b: var TokenBuf; kind: NifKind; id: SymId) =
+  requirePools(b)
+  # `symSpellingLen` rather than `symString`: this runs on every emitted
+  # symbol, and only the rare name short enough to live inside the token is
+  # worth building.
+  if symSpellingLen(b.pool, id) <= StrInlineMaxLen:
+    b.add NifToken(toX(kind, encodeInlineStr(symString(b.pool, id))))
   else:
     let payload = uint64(uint32(id)) shl 1
     b.add NifToken(toX(kind, lowBits(payload)))
     addSuffixIfNeeded(b, payload)
 
-proc addSymDef*(b: var TokenBuf; id: SymId) =
+func internedSymToken*(p: Pool; kind: NifKind; id: SymId): NifToken =
+  ## The single token `addSymUse` / `addSymDef` would emit for `id`: inline when
+  ## the name fits in `StrInlineMaxLen` bytes, a pool ref otherwise. Patching a
+  ## Symbol/SymbolDef token IN PLACE must go through this — a raw `symToken` for
+  ## a short name gives one symbol two different payloads within a tree, which
+  ## breaks the same-string ⇒ same-payload invariant the writer rule
+  ## establishes (and hence every payload-level equality test).
+  assert kind == Symbol or kind == SymbolDef, "not a symbol kind: " & $kind
+  if symSpellingLen(p, id) <= StrInlineMaxLen:
+    NifToken(toX(kind, encodeInlineStr(symString(p, id))))
+  else:
+    assert uint32(id) <= IdPayloadMax,
+      "symbol id " & $id & " needs an ExtendedSuffix chain: no single token fits"
+    NifToken(toX(kind, uint32(id) shl 1))
+
+proc addSymDef*(b: var TokenBuf; id: SymId) {.nifEmits: "D".} =
   ## Emits a symbol definition already interned in `b.pool`.
   addInternedSymbol(b, SymbolDef, id)
 
-proc addSymUse*(b: var TokenBuf; id: SymId) =
+proc addSymUse*(b: var TokenBuf; id: SymId) {.nifEmits: "Y".} =
   ## Emit a symbol already interned in `b.pool`. Short symbols remain inline;
   ## longer symbols reuse `id` without a second hash-table lookup.
   addInternedSymbol(b, Symbol, id)
@@ -984,7 +1788,7 @@ template emitChained(b: var TokenBuf; kind: NifKind; bits: uint64) =
     if bits shr (PayloadBits * 2) != 0'u64:
       b.add extendedSuffixToken(uint32(bits shr (PayloadBits * 2)))
 
-proc addIntLit*(b: var TokenBuf; v: int64) =
+proc addIntLit*(b: var TokenBuf; v: int64) {.nifEmits: "LIT".} =
   ## Pure inline. Writer picks the shortest carrier whose SIGNED width holds `v`:
   ##   28-bit (one token)    for v in [-2^27, 2^27),
   ##   56-bit (two tokens)   for v in [-2^55, 2^55),
@@ -1004,27 +1808,56 @@ proc addIntLit*(b: var TokenBuf; v: int64) =
     b.add extendedSuffixToken(uint32((bits shr PayloadBits) and uint64(PayloadMask)))
     b.add extendedSuffixToken(uint32(bits shr (PayloadBits * 2)))
 
-proc addUIntLit*(b: var TokenBuf; v: uint64) =
+proc addUIntLit*(b: var TokenBuf; v: uint64) {.nifEmits: "LIT".} =
   ## Appends an unsigned integer literal using the shortest token chain.
   emitChained(b, UIntLit, v)
 
-proc addFloatLit*(b: var TokenBuf; v: float64) =
+proc addFloatLit*(b: var TokenBuf; v: float64) {.nifEmits: "LIT".} =
   ## Appends a floating-point literal using its exact bit representation.
   emitChained(b, FloatLit, cast[uint64](v))
 
 # ── Open / close tags (the only mutations that touch `openTags`) ─────────
 
-proc openTag*(b: var TokenBuf; t: TagId) {.inline.} =
+proc openTagEscaped(b: var TokenBuf; t: TagId) =
+  ## Slow path of `openTag`: a tag id past the 9-bit field, spelled
+  ## `(<escapeTag> <id> …)` — see `TagPool.escapeTag`. The id is an ordinary
+  ## child, so `closeTag`'s jump counts it and every cursor walk works
+  ## unchanged; what an adapter must know is that operands start one token
+  ## later.
+  assert b.tags != nil and b.tags.escapeTag != TagId(0),
+    "tag id " & $uint32(t) & " exceeds the 9-bit tag field and this tag pool " &
+    "declares no escape tag"
+  ensureCap(b)
+  b.openTags.add b.len
+  b.data[b.len] = tagLitToken(b.tags.escapeTag, 0)
+  inc b.len
+  b.addIntLit int64(uint32(t))
+
+proc openTag*(b: var TokenBuf; t: TagId) {.inline, nifOpens.} =
   ## Begin a new tagged subtree. The matching `closeTag` patches the
   ## emitted TagLit's jump in place (or splices in an `ExtendedSuffix`
   ## right after the TagLit if the body overflows the 19-bit jump field).
+  ##
+  ## An id past `TagMask` does not fit the token and goes through the adapter's
+  ## escape tag instead; callers never have to sort the two apart.
   if b.owner != nil: prepareMutation(b)
+  if uint32(t) >= FirstEscapeId:
+    openTagEscaped(b, t)
+    return
   ensureCap(b)
   b.openTags.add b.len
   b.data[b.len] = tagLitToken(t, 0)
   inc b.len
 
-proc closeTag*(b: var TokenBuf) =
+proc reopenLastTree*(b: var TokenBuf; pos: int) =
+  ## Reopen the finished tree headed by the TagLit at `pos` so more children can
+  ## be appended; close it again with `closeTag` (which recomputes the jump over
+  ## the old + new children). The tree's subtree must be the last content of `b`.
+  if b.owner != nil: prepareMutation(b)
+  assert b.data[pos].kind == TagLit, "reopenLastTree: no TagLit at pos"
+  b.openTags.add pos
+
+proc closeTag*(b: var TokenBuf) {.nifCloses.} =
   ## Seal the most recently opened tag.
   if b.owner != nil: prepareMutation(b)
   assert b.openTags.len > 0, "closeTag with no matching openTag"
@@ -1079,6 +1912,10 @@ proc ensureOwner(b: var TokenBuf) {.inline.} =
     GC_ref(b.owner.tags)
     b.owner.rc = 1
 
+func unclosedTagPositions*(b: TokenBuf): seq[int] =
+  ## Debug helper: build-time stack of still-open TagLit positions.
+  b.openTags
+
 proc beginRead*(b: var TokenBuf): Cursor =
   assert b.openTags.len == 0, "beginRead with unclosed tags"
   ensureOwner(b)
@@ -1087,7 +1924,7 @@ proc beginRead*(b: var TokenBuf): Cursor =
                   p: addr(b.data[0]),
                   rem: b.len)
 
-proc childCursor*(c: Cursor): Cursor =
+func childCursor*(c: Cursor): Cursor =
   ## Returns a bounded cursor over the children of the `TagLit` at `c`.
   ## The input cursor is not advanced.
   assert c.kind == TagLit, "childCursor requires cursor at TagLit"
@@ -1109,41 +1946,120 @@ proc cursorAt*(b: var TokenBuf; i: int): Cursor =
                   p: addr b.data[i],
                   rem: b.len - i)
 
-proc cursorToPosition*(b: TokenBuf; c: Cursor): int {.inline.} =
+proc cursorTailAt*(b: var TokenBuf; i: int): Cursor =
+  ## Like `cursorAt` but accepts `i == b.len` (a sealed tree's implicit close
+  ## can leave the next position at end-of-buffer). Then `rem == 0` and the
+  ## cursor reports a virtual close — only `kind`-style probes are valid.
+  assert i >= 0 and i <= b.len
+  ensureOwner(b)
+  inc b.owner.rc
+  result = Cursor(owner: b.owner,
+                  p: cast[ptr NifToken](cast[uint](b.data) +
+                       uint(i) * sizeof(NifToken).uint),
+                  rem: b.len - i)
+
+func cursorToPosition*(b: TokenBuf; c: Cursor): int {.inline.} =
   ## Token index of `c` within `b` (inverse of `cursorAt`). Stable key for
   ## per-expression tables (e.g. a register allocator's location map).
   (cast[int](c.p) - cast[int](b.data)) div sizeof(NifToken)
 
+proc readonlyCursorAt*(b: TokenBuf; i: int): Cursor =
+  ## Like `cursorAt` but does not require `var b`.
+  ##
+  ## The `CursorOwner` header is minted on demand — through a cast, since `b`
+  ## is only borrowed here. It has to be: the owner is where a cursor's pools
+  ## live, so an ownerless cursor answers `nil` for both `pool` and `tags` and
+  ## every pool-backed payload read and every `addSubtree` off it would have to
+  ## guess which pool world it came from. That guess is what the compiler's
+  ## former `fallbackPool`/`fallbackTags` globals used to make. Minting the
+  ## header also
+  ## makes the cursor keep the tokens alive like any other cursor instead of
+  ## dangling the moment `b` dies.
+  ##
+  ## The header costs one small allocation, and only for a buffer that has none
+  ## yet; a following mutation reclaims it on the cheap `rc == 1` path.
+  assert i >= 0 and i < b.len
+  let mb = cast[ptr TokenBuf](unsafeAddr b)
+  ensureOwner(mb[])
+  inc mb.owner.rc
+  result = Cursor(owner: mb.owner,
+                  p: cast[ptr NifToken](unsafeAddr b.data[i]),
+                  rem: b.len - i)
+
+proc `+!`*(c: Cursor; diff: int): Cursor {.inline.} =
+  ## Advance `c` by `diff` tokens, keeping the bounded `rem` correct (used by CF
+  ## goto navigation). `diff` must not exceed `rem`.
+  result = Cursor(p: cast[ptr NifToken](cast[uint](c.p) +
+                    diff.uint * sizeof(NifToken).uint),
+                  rem: c.rem - diff)
+  if c.owner != nil:
+    inc c.owner.rc
+    result.owner = c.owner
+
+func hasCurrentToken*(c: Cursor): bool {.inline.} =
+  ## True if `c` points at a readable token (pointer + bound check). Prefer
+  ## `hasMore` in regular traversal; this survives malformed input.
+  c.p != nil and c.rem > 0
+
+func unsafeDec*(c: var Cursor) {.inline.} =
+  ## Move one token backwards (no bounds check). Only valid on a cursor known
+  ## to sit past a real token; used by backward scans over a raw buffer.
+  c.p = cast[ptr NifToken](cast[uint](c.p) - sizeof(NifToken).uint)
+  inc c.rem
+
+func peekPastEnd*(n: Cursor): Cursor =
+  ## A loosely-bounded cursor at the token following the fully-consumed bounded
+  ## scope `n` (`rem == 0`; the close is implicit). Read-only peek at a sibling
+  ## the caller KNOWS exists.
+  result = n
+  result.rem = high(int)
+
+proc sharesPools*(c: Cursor; p: Pool; t: TagPool): bool {.inline.} =
+  ## `p == c.pool and t == c.tags`, WITHOUT materializing either of the cursor's
+  ## pools. `pool`/`tags` return a `ref` by value, which is an owned temporary —
+  ## an incRef, a decRef, and the pool's whole destructor behind the decRef — so
+  ## the fast-path test in `addSubtree`, whose entire job is to compare two
+  ## pointers, was paying for two of those per copied subtree. Read through the
+  ## raw owner pointer instead: as `==` operands both sides are borrowed paths.
+  ## The `nil` fallbacks are what `pool`/`tags` answer, spelled out.
+  (if c.owner != nil and c.owner.pool != nil: p == c.owner.pool
+   else: p == defaultPool()) and
+  (if c.owner != nil and c.owner.tags != nil: t == c.owner.tags
+   else: t == defaultTags())
+
 # ── Subtree copy ─────────────────────────────────────────────────────────
 
-proc subtreeWidth*(c: Cursor): int =
-  ## Total tokens occupied by the value at `c` (head + body).
-  if c.kind == TagLit:
-    int(tokenWidth(c).uint64 + c.cursorJump)
-  else:
-    tokenWidth(c)
-
-proc reinternLineInfo(dest: var TokenBuf; c: Cursor): NifLineInfo =
+proc reinternLineInfo(dest: var TokenBuf; c: Cursor;
+                      srcPool: Pool): NifLineInfo =
   ## Map the source head's trailing line info into `dest`'s pools — the filename
   ## and, if present, the `#comment#` string. Returns `NoNifLineInfo` when none.
+  ##
+  ## Takes the source pool rather than asking `c` for it: as a parameter the ref
+  ## is borrowed, while `c.pool` would return an owned temporary and pay an
+  ## incRef/decRef — twice, here — per token copied. See `sharesPools`.
+  requirePools(dest)
   let li = rawLineInfo(c)
   if not li.isValid: return NoNifLineInfo
-  let fname = if c.pool != nil: c.pool.filenames[li.file] else: ""
+  let fname = if srcPool != nil: srcPool.filenames[li.file] else: ""
   var comment = StrId(0)
-  if uint32(li.comment) != 0'u32 and c.pool != nil:
-    comment = dest.pool.strings.getOrIncl(c.pool.strings[li.comment])
+  if uint32(li.comment) != 0'u32 and srcPool != nil:
+    comment = dest.pool.strings.getOrIncl(srcPool.strings[li.comment])
   result = NifLineInfo(file: dest.pool.filenames.getOrIncl(fname),
                        line: li.line, col: li.col, comment: comment)
 
-proc addAcrossPools(dest: var TokenBuf; c: var Cursor) =
+proc addAcrossPools(dest: var TokenBuf; c: var Cursor;
+                    srcPool: Pool; srcTags: TagPool) =
   ## Internal: copy one value (atom or whole TagLit subtree) from `c`
   ## into `dest`, re-interning literals (via the literals pool), tag names
   ## (via the tag pool) and line-info filenames. Recurses through children.
   ## The trailing `LineInfoLit` is part of the head's width (skipped by
   ## `c.inc`), so it is re-emitted explicitly via `appendLineInfo`.
-  let srcPool = c.pool
-  let srcTags = c.tags
-  let destLi = reinternLineInfo(dest, c)
+  ##
+  ## The source pools are THREADED, not re-read: they are the same for every node
+  ## of one subtree, and `let srcPool = c.pool` at each level cost an owned `ref`
+  ## — an incRef, a decRef, and the pool's destructor behind the decRef — per
+  ## token. The public wrapper below reads them once.
+  let destLi = reinternLineInfo(dest, c, srcPool)
   case c.kind
   of TagLit:
     let tagStr = srcTags.tags[c.cursorTagId]
@@ -1152,7 +2068,7 @@ proc addAcrossPools(dest: var TokenBuf; c: var Cursor) =
     dest.appendLineInfo destLi          # right after the tag head
     c.into:
       while c.hasMore:
-        addAcrossPools(dest, c)
+        addAcrossPools(dest, c, srcPool, srcTags)
     dest.closeTag()
   of StrLit:    dest.addStrLit  strVal(c, srcPool);  dest.appendLineInfo destLi; c.inc
   of IntLit:    dest.addIntLit  intVal(c);           dest.appendLineInfo destLi; c.inc
@@ -1167,13 +2083,15 @@ proc addAcrossPools(dest: var TokenBuf; c: var Cursor) =
     dest.add c.load; c.inc              # defensive: not a valid head token
   of ExtendedSuffix:
     assert false, "ExtendedSuffix cannot be a head token"
+  of UnknownToken, EofToken, ParLe, ParRi:
+    assert false, "reader-level lexical kind cannot appear in a token buffer"
 
-proc addSubtree*(dest: var TokenBuf; c: Cursor) =
+proc addSubtree*(dest: var TokenBuf; c: Cursor) {.nifEmits: "Any".} =
   ## Copy the subtree rooted at `c` into `dest`. When both pools AND
   ## both tag pools match, this is a single bulk `copyMem`; otherwise
   ## the source's literals and tag names are re-interned into `dest`'s
   ## pools token-by-token. Callers don't need to know which case applies.
-  if dest.pool == c.pool and dest.tags == c.tags:
+  if sharesPools(c, dest.pool, dest.tags):
     let n = subtreeWidth(c)
     if dest.owner != nil: prepareMutation(dest)
     if dest.len + n > dest.cap:
@@ -1183,20 +2101,34 @@ proc addSubtree*(dest: var TokenBuf; c: Cursor) =
     dest.len += n
   else:
     assert c.pool != nil and c.tags != nil
-    var c = c
-    addAcrossPools(dest, c)
+    # Read the source pools ONCE for the whole subtree and hand them down; see
+    # `addAcrossPools`. These two are still owned locals — a mutable `c` may not
+    # be passed alongside anything read out of it — but that is now one
+    # incRef/decRef pair per SUBTREE where it used to be one per token.
+    let srcPool = c.pool
+    let srcTags = c.tags
+    var cc = c
+    addAcrossPools(dest, cc, srcPool, srcTags)
 
-proc addBufferSamePool*(dest: var TokenBuf; src: TokenBuf) =
+proc addBufferSamePool*(dest: var TokenBuf; src: TokenBuf) {.nifEmits: "Any".} =
   ## Append a closed buffer that shares `dest`'s literal and tag pools.
   ##
   ## The source is borrowed and remains usable. Matching pools make the
   ## append one bulk copy without constructing a read cursor.
   assert src.openTags.len == 0, "addBufferSamePool with unclosed source tags"
-  assert dest.data != src.data, "cannot append a TokenBuf to itself"
-  assert dest.pool == src.pool and dest.tags == src.tags,
-         "addBufferSamePool requires matching pools"
   if src.len == 0:
+    # an empty buffer may never have been written to, leaving its pool
+    # refs nil — nothing to copy, nothing to check
     return
+  assert dest.data != src.data, "cannot append a TokenBuf to itself"
+  # Both buffers carry their pools from construction (a plugin build's may be
+  # the process defaults), so this is a plain identity test — a bulk copy is
+  # only valid when the two interned id spaces are literally the same objects.
+  requirePools(dest)
+  let spool = (if src.pool != nil: src.pool else: defaultPool())
+  let stags = (if src.tags != nil: src.tags else: defaultTags())
+  assert dest.pool == spool and dest.tags == stags,
+         "addBufferSamePool requires matching pools"
   if dest.owner != nil:
     prepareMutation(dest)
   if dest.len + src.len > dest.cap:
@@ -1207,7 +2139,7 @@ proc addBufferSamePool*(dest: var TokenBuf; src: TokenBuf) =
           src.len * sizeof(NifToken))
   dest.len += src.len
 
-proc addBuffer*(dest: var TokenBuf; src: var TokenBuf) =
+proc addBuffer*(dest: var TokenBuf; src: var TokenBuf) {.nifEmits: "Any".} =
   ## Append all complete top-level values from `src` to `dest`.
   ##
   ## Matching pools permit one bulk copy. Otherwise values are re-interned
@@ -1223,6 +2155,40 @@ proc addBuffer*(dest: var TokenBuf; src: var TokenBuf) =
     while c.hasMore:
       dest.addSubtree(c)
       c.skip()
+
+proc addWithSparseLineInfo(dest: var TokenBuf; c: var Cursor;
+                           last: var NifLineInfo) =
+  let info = rawLineInfo(c)
+  if c.kind == TagLit:
+    dest.openTag c.cursorTagId
+    if info.isValid and info != last:
+      dest.appendLineInfo info
+      last = info
+    c.into:
+      while c.hasMore: addWithSparseLineInfo(dest, c, last)
+    dest.closeTag()
+  else:
+    for i in 0 ..< valueWidth(c): dest.add peekAhead(c, i)
+    if info.isValid and info != last:
+      dest.appendLineInfo info
+      last = info
+    inc c
+
+proc withSparseLineInfo*(src: var TokenBuf): TokenBuf =
+  ## A copy of `src`, in the same pools, that keeps a `LineInfoLit` only where
+  ## the location changes in stream order — exactly what a `parse` without
+  ## `denseLineInfo` stores. The inverse of a densifying load.
+  ##
+  ## Passes that measure code in raw tokens (shoggoth's unswitch bound) see
+  ## line-info suffixes too, so the same program is "bigger" when its info is
+  ## dense; this lets a consumer that was calibrated on sparse input keep
+  ## seeing sparse input without a render-and-reparse round trip.
+  result = createTokenBuf(src.len, src.pool, src.tags)
+  var c = beginRead(src)
+  var last = NoNifLineInfo
+  while c.hasMore:
+    addWithSparseLineInfo(result, c, last)
+  endRead c
 
 # ── Self-test ────────────────────────────────────────────────────────────
 

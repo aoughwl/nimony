@@ -1,0 +1,25 @@
+12
+7
+5
+2.5
+7
+5
+3
+12
+2.5
+7
+int
+int32
+bool
+float
+float32
+array[0..2, int]
+seq[float64]
+Foo[int]
+StaticFoo[3]
+3
+float32
+true
+true
+true
+false

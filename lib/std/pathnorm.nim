@@ -12,13 +12,17 @@
 ##
 ## Unstable API.
 
+{.feature: "staticContracts".}
+
 # Yes, this uses import here, not include so that
 # we don't end up exporting these symbols from pathnorm and os:
 import std/private/osseps
 
 type
   PathIter* = object ## Cursor used while scanning raw path strings component by component.
-    i, prev: int
+    i, prev: Natural   ## `Natural`, so `0 <= i` is stated by the type: every
+                       ## `x[it.i]` below then owes only the upper bound, which
+                       ## the `it.i < x.len` guard already supplies.
     notFirst: bool
 
 func hasNext*(it: PathIter; x: string): bool =
@@ -29,7 +33,7 @@ func next*(it: var PathIter; x: string): (int, int) =
   ## Advances `it` over `x` and returns inclusive `(start, end)` indices of the next component.
   result = (0, 0)
   it.prev = it.i
-  if not it.notFirst and x[it.i] in {DirSep, AltSep}:
+  if not it.notFirst and it.i < x.len and x[it.i] in {DirSep, AltSep}:
     # absolute path:
     inc it.i
   else:
@@ -46,14 +50,24 @@ iterator dirs(x: string): (int, int) =
   var it = default PathIter
   while hasNext(it, x): yield next(it, x)
 
+# Statements rather than one `and` chain: the chain as a value is a bool
+# temporary, which carries none of the bounds its operands establish.
 func isDot(x: string; bounds: (int, int)): bool =
-  bounds[1] == bounds[0] and x[bounds[0]] == '.'
+  result = false
+  if bounds[1] == bounds[0] and bounds[0] >= 0 and bounds[0] < x.len:
+    result = x[bounds[0]] == '.'
 
 func isDotDot(x: string; bounds: (int, int)): bool =
-  bounds[1] == bounds[0] + 1 and x[bounds[0]] == '.' and x[bounds[0]+1] == '.'
+  result = false
+  # `bounds[0] < x.len - 1` first: it keeps `bounds[0] + 1` from wrapping,
+  # which is what lets the equality say `bounds[1]` is one past `bounds[0]`
+  if bounds[0] >= 0 and bounds[0] < x.len - 1 and bounds[1] == bounds[0] + 1:
+    result = x[bounds[0]] == '.' and x[bounds[0]+1] == '.'
 
 func isSlash(x: string; bounds: (int, int)): bool =
-  bounds[1] == bounds[0] and x[bounds[0]] in {DirSep, AltSep}
+  result = false
+  if bounds[1] == bounds[0] and bounds[0] >= 0 and bounds[0] < x.len:
+    result = x[bounds[0]] in {DirSep, AltSep}
 
 when doslikeFileSystem:
   import std/private/ntpath
@@ -93,7 +107,8 @@ func addNormalizePath*(x: string; result: var string; state: var int;
         # but right now we instead handle it inside os.joinPath
 
         # strip path component: foo/bar => foo
-        while (d-1) > (state and 1) and result[d-1] notin {DirSep, AltSep}:
+        let keep = (state and 1) + 1
+        while d > keep and result[d-1] notin {DirSep, AltSep}:
           dec d
         if d > 0:
           setLen(result, d-1)

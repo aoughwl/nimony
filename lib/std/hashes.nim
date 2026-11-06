@@ -1,3 +1,11 @@
+{.feature: "staticContracts".}
+
+## Hashing for the builtin types. The `hash` overloads live here, next to the
+## `Hashable` concept they are checked against: a concept requirement is looked
+## up in the module that declares the concept as well as in the module that
+## declares the checked type, so `string` satisfies `Hashable` even where this
+## module is not imported.
+
 type
   Hash* = uint
     ## Integer type carrying hash values; combine with `!&` and finish with `!$`.
@@ -17,11 +25,10 @@ func `!$`*(h: Hash): Hash {.inline.} =
   result = result xor (result shr 11)
   result = result + result shl 15
 
-func hash*(s: string): Hash =
-  result = 0'u
-  for c in items(s):
-    result = result !& uint(c)
-  result = !$result
+func hash*(s: string): Hash {.alwaysInline.} =
+  ## An inline shim for `system.hashStr`. The mix is `!&` / `!$` over the chars;
+  ## `hashStr` fetches the first `AlwaysAvail` of them from the `bytes` word.
+  hashStr(s)
 
 func hash*(u: uint): Hash {.inline.} = u
 when not defined(nimony):
@@ -37,6 +44,13 @@ when not defined(cpu64):
     ## (lineinfos.FileId/PackedLineInfo) or a generic `hash(v: T)` (bitabs) —
     ## it makes those calls ambiguous. So only define it off the 64-bit build.
 func hash*(x: int32): Hash {.inline.} = cast[Hash](int x)
+when sizeof(uint) == 4:
+  # 32-bit targets (wasm32): `uint` can't take a uint64, so provide the
+  # overload here, folding the halves so the high bits still hash. On
+  # 64-bit targets uint64 resolves to `hash(u: uint)` — declaring this
+  # there would make every `hash(uintval)` call ambiguous.
+  func hash*(x: uint64): Hash {.inline.} =
+    cast[Hash](uint32(x and 0xFFFFFFFF'u64) xor uint32(x shr 32))
 func hash*(x: char): Hash {.inline.} = Hash(x)
 func hash*(x: bool): Hash {.inline.} = Hash(x)
 func hash*(x: float64): Hash {.inline.} = cast[Hash](x + 0.0) # +0.0 normalizes -0.0
@@ -52,6 +66,13 @@ func hash*[A: Hashable, B: Hashable, C: Hashable](x: (A, B, C)): Hash {.inline.}
   result = hash(x[0]) !& hash(x[1]) !& hash(x[2])
   result = !$result
 
+func hash*[T: Hashable](x: seq[T]): Hash =
+  ## Computes a hash value for `x`, mixing each element's hash in order.
+  result = 0'u
+  for a in items(x):
+    result = result !& hash(a)
+  result = !$result
+
 #[
 func hash*[T: object](x: T): Hash {.inline.} =
   result = 0'u
@@ -60,7 +81,8 @@ func hash*[T: object](x: T): Hash {.inline.} =
   result = !$result
 ]#
 
-func nextTry*(h: Hash; maxHash: int): Hash {.inline.} =
+func nextTry*(h: Hash; maxHash: int): Hash {.inline, requires: 0 <= maxHash,
+    ensures: result <= maxHash.uint.} =
   ## Advances a hash probe index inside `0 .. maxHash` (linear probing helper).
   result = (h + 1'u) and maxHash.uint
 
@@ -83,13 +105,14 @@ func hashIgnoreStyle*(x: string): Hash =
     if c == '_':
       inc(i)
     else:
-      if c in {'A'..'Z'}:
+      if c >= 'A' and c <= 'Z':
         c = chr(ord(c) + (ord('a') - ord('A'))) # toLower()
       h = h !& uint(ord(c))
       inc(i)
   result = !$h
 
-func hashIgnoreStyle*(sBuf: string, sPos, ePos: int): Hash =
+func hashIgnoreStyle*(sBuf: string, sPos, ePos: int): Hash {.
+    requires: 0 <= sPos and ePos < sBuf.len.} =
   ## Efficient hashing of a string buffer, from starting
   ## position `sPos` to ending position `ePos` (included); style is ignored.
   ##
@@ -108,7 +131,7 @@ func hashIgnoreStyle*(sBuf: string, sPos, ePos: int): Hash =
     if c == '_':
       inc(i)
     else:
-      if c in {'A'..'Z'}:
+      if c >= 'A' and c <= 'Z':
         c = chr(ord(c) + (ord('a') - ord('A'))) # toLower()
       h = h !& uint(ord(c))
       inc(i)
@@ -128,12 +151,13 @@ func hashIgnoreCase*(x: string): Hash =
   var h: Hash = 0
   for i in 0..x.len-1:
     var c = x[i]
-    if c in {'A'..'Z'}:
+    if c >= 'A' and c <= 'Z':
       c = chr(ord(c) + (ord('a') - ord('A'))) # toLower()
     h = h !& uint(ord(c))
   result = !$h
 
-func hashIgnoreCase*(sBuf: string, sPos, ePos: int): Hash =
+func hashIgnoreCase*(sBuf: string, sPos, ePos: int): Hash {.
+    requires: 0 <= sPos and ePos < sBuf.len.} =
   ## Efficient hashing of a string buffer, from starting
   ## position `sPos` to ending position `ePos` (included); case is ignored.
   ##
@@ -148,7 +172,7 @@ func hashIgnoreCase*(sBuf: string, sPos, ePos: int): Hash =
   var h: Hash = 0
   for i in sPos..ePos:
     var c = sBuf[i]
-    if c in {'A'..'Z'}:
+    if c >= 'A' and c <= 'Z':
       c = chr(ord(c) + (ord('a') - ord('A'))) # toLower()
     h = h !& uint(ord(c))
   result = !$h

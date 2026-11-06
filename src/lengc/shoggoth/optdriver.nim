@@ -17,20 +17,59 @@
 ## per-body passes (`induction_variables`, …) are still being ported and plug
 ## into `optimizeBody`, which is currently an identity stage.
 
-import std / [os, assertions, strutils, syncio]
+import std / [os, assertions, strutils, syncio, sets, envvars]
 import ".." / ".." / "lib" / nifcoreparse   # parse/serialize; re-exports nifcore
 import ".." / ".." / "lib" / nifcdecl        # createLengTagPool, stmtKind, takeProcDecl
+import ".." / ".." / "lib" / lengiface       # writeLengInterface (`.oc.idx.nif`)
 import induction_variables                     # runInductionVariables (live pass)
 import cse                                     # runCSE + collectFunctionSummaries
 import scalarizer                              # runScalarize (object → field scalars / SROA)
 import copyprop                                # runCopyProp (copy prop + dead-store elim)
-import imi_bridge                             # runImi (inter-module inliner, via nifcursors)
+import unswitch                                # runUnswitch (loop unswitching)
+import imi_bridge                             # runImi/parseModule (inter-module inliner)
+import vectorizer                             # runVectorizer (map loops -> (instr ...))
+export VecMode                                # the driver flag's type, for shoggoth.nim
+import vmrewriter                              # the DFA rewrite engine (arith.rewrite.nif)
+import tailcalls                              # runTailCalls (the tail-call encoding)
+import memidioms                              # runMemIdioms (fill loops -> Memset)
+import ".." / ".." / "lib" / intrinsics       # IntrinsicOp (Stats.memOps)
+export MemOpts                                # the driver flags' type, for shoggoth.nim
 import ".." / nifmodules                      # MainModule + load (type context for aliasing)
 import ".." / typenav                         # registerParams / scopes
+
+include ".." / ".." / "lib" / compat2          # onRaiseQuit
+
+const ArithRules = slurp("rules/arith.rewrite.nif")
+
+let disabledPasses = block:
+  ## `SHOGGOTH_DISABLE=rewrite,cse,…` turns individual optimization passes off.
+  ##
+  ## This is a BISECTION tool, not a tuning knob. When an optimized build misbehaves
+  ## the question is always "which pass", and the only way to answer it was to edit
+  ## `optimizeBody` and rebuild — per candidate, on a machine where rebuilding the
+  ## toolchain is minutes. One env var turns that into one run each, and it composes
+  ## with the boot: `SHOGGOTH_DISABLE=cse hastur boot --boot-backend:native` either
+  ## reaches a fixed point or does not. `SHOGGOTH_NO_VECTORIZE` was the same idea for
+  ## one pass; it stays, spelled `vectorize` here as well.
+  ##
+  ## Names: imi, rewrite, ctorproj, scalarize, copyprop, unswitch, indvars, cse,
+  ## memidioms, vectorize, sinkret, tailcall.
+  var res = initHashSet[string]()
+  for part in getEnv("SHOGGOTH_DISABLE").split(','):
+    let name = part.strip()
+    if name.len > 0: res.incl name
+  if getEnv("SHOGGOTH_NO_VECTORIZE").len > 0: res.incl "vectorize"
+  res
+
+template passOn(name: string): bool = name notin disabledPasses
+
 
 type
   Stats* = object
     procs*, bodies*, intermodChanged*: int
+    checksRemoved*: int
+    vectorized*: int
+    memOps*: set[IntrinsicOp]                 ## the mem rows memidioms emitted
 
 proc extractModuleSuffix(filename: string): string =
   ## Pure copy of `nifreader.extractModuleSuffix` (basename up to the first
@@ -48,26 +87,104 @@ proc extractModuleSuffix(filename: string): string =
       result.add c
 
 proc optimizeBody(buf: var TokenBuf; suffix: string; st: var Stats;
-                  summaries: ptr FunctionSummaryTable; m: ptr MainModule) =
+                  summaries: ptr FunctionSummaryTable; m: ptr MainModule;
+                  params: Cursor = default(Cursor); eng: Engine = nil;
+                  vecMode = vecOff; memOpts = MemOpts(intrinsics: true)) =
   ## Per-body optimization pipeline. The nifcore passes plug in here as they
-  ## are ported. The suffix is made unique per body (`st.bodies` is the body's
-  ## index in the module): the passes name synthesized temps `<kind>.<n>.<suffix>`
-  ## with a per-body counter, so without a per-body suffix two procs' first temps
-  ## would collide on one module-pool symbol and the C codegen — which declares
-  ## each symbol once — would leave later functions' uses undeclared.
-  let bodySuffix = suffix & "." & $st.bodies
+  ## are ported.
+  ##
+  ## The temps these passes mint are LOCALS of the body, so they are named like
+  ## locals -- `` `sroa.1 ``, `` `cse.1 `` -- and two bodies' first temps do
+  ## share a pool symbol. That is what a local name IS: every proc in the module
+  ## already has its own `result.0`, and both backends scope a local to its
+  ## function. This used to paste a per-body `<module>.<n>` after the counter to
+  ## avoid the sharing, which made the module suffix a MIDDLE segment of the
+  ## symbol (nimony#2457) -- a global's spelling for something that is not one.
+  # The structural rewriter runs FIRST so its `deref_addr` rules fold the
+  # inliner's by-address residue — `inc i` splices as `(deref (haddr i))` — before
+  # anything else looks at the body. Removing those `addr` nodes un-poisons the
+  # locals for every later pass (SROA and copyprop treat address-taken locals as
+  # untouchable) and for both backends' register allocation.
+  if eng != nil and passOn("rewrite"):
+    runRewritesFix(eng, buf)
   # SROA first: fold field projections off inline constructors (`T(f: a).f` → `a`),
   # then explode non-escaping local objects into per-field scalars; copy
   # propagation then cleans up the resulting scalar copies and dead stores, so the
   # later passes see simpler, scalar code.
-  runConstructorProjection(buf)
-  runScalarize(buf, bodySuffix)
-  runCopyProp(buf)
-  runInductionVariables(buf, bodySuffix)
-  runCSE(buf, bodySuffix, summaries, m)
+  if passOn("ctorproj"): runConstructorProjection(buf)
+  if passOn("scalarize"): runScalarize(buf, m)
+  if passOn("copyprop"): runCopyProp(buf, params, summaries, m)
+  # Hoist loop-invariant `if` conditions out of small loops by duplicating them
+  # (loop unswitching): an inlined string accessor's SSO test runs once instead
+  # of per character. AFTER copyprop so propagated copies make structurally
+  # identical conditions actually identical.
+  if passOn("unswitch") and runUnswitch(buf) > 0 and passOn("copyprop"):
+    # A specialized copy no longer READS the temps that fed the hoisted test —
+    # but it still computes them, once per iteration, which is most of what the
+    # unswitch was meant to remove. Copy propagation's dead-store elimination is
+    # what actually deletes them, so it has to see the loop again. They come in
+    # CHAINS (`x = bytes and 255` over `bytes = b.bytes`) and one round only
+    # deletes the last link, so run until the body stops shrinking.
+    for _ in 0 ..< 3:
+      let before = buf.len
+      runCopyProp(buf, params, summaries, m)
+      if buf.len >= before: break
+  # Copy-prop inlines symbol and literal bindings; re-run the rewriter so
+  # `(add T x 0)` / `(mul T x 1)` / `(add T 1 2)` that only became foldable
+  # after those substitutions actually fold. Cheap: the DFA walk is linear
+  # and a miss is a no-op.
+  if eng != nil and passOn("rewrite"):
+    runRewritesFix(eng, buf)
+  if passOn("indvars"): runInductionVariables(buf, m)
+  # CSE also deletes index checks a dominating identical check already made:
+  # same expression keys, same invalidation, same walk (see `cse.guardCondition`).
+  if passOn("cse"):
+    st.checksRemoved += runCSE(buf, summaries, m, params)
+  # The vectorizer runs last of the passes that OPTIMIZE: its emitted
+  # `(instr ...)` applications are final (selection-final by the tag's contract)
+  # and no later pass needs to look at them; the scalar remainder loop it leaves
+  # behind was already optimized by everything above. Only the encoding passes
+  # below follow it, and they rewrite `ret`s, which it never emits.
+  # Fill loops become a `Memset` intrinsic after CSE, so the loop it inspects is
+  # the cleaned-up one, and before the vectorizer, which would otherwise turn the
+  # same loop into vector stores. `memOpts.intrinsics` is false for a back end
+  # without a lowering for the rows (AVR); `memOpts.mergeWordBytes` enables
+  # merging adjacent constant field stores, native back end only.
+  if (memOpts.intrinsics or memOpts.mergeWordBytes > 0) and passOn("memidioms"):
+    discard runMemIdioms(buf, m, params, memOpts, "mem." & suffix, st.memOps)
+  if vecMode != vecOff and passOn("vectorize"):
+    if runVectorizer(buf, "vec." & suffix):
+      inc st.vectorized
+  # The tail-call encoding runs after EVERYTHING, the vectorizer included.
+  # `(ret (call …))` deliberately violates the Leng rule that calls are bound and
+  # do not nest: it is a directive to the backend ("do the tail call"), not an
+  # expression. Minting it last is what keeps every pass above from having to
+  # tolerate a nested call, and it is also when the most tails exist — each pass
+  # above can only expose more. Its two rewrites share a walk and a grammar but
+  # answer different questions when a build breaks — sinking changes
+  # control-flow shape, folding changes stack discipline — so they are one pass
+  # under two disable names.
+  var tailRules: set[TailRule] = {}
+  if passOn("sinkret"): tailRules.incl trSink
+  if passOn("tailcall"): tailRules.incl trFold
+  if tailRules != {}: runTailCalls(buf, tailRules)
+
+proc isAssemblerProc(pragmas: Cursor): bool =
+  ## An `{.assembler.}` body is a one-to-one transcription of machine code
+  ## whose locals are pinned to registers, so the passes' view of it is wrong:
+  ## copy propagation, for one, cannot see that a write to `rdx` clobbers
+  ## another local pinned to `rdx`. Such bodies are left exactly as written.
+  result = false
+  if pragmas.kind != TagLit: return
+  var p = pragmas
+  p.loopInto:
+    if p.kind == TagLit and p.pragmaKind == AssemblerP:
+      result = true
+    skip p
 
 proc rebuildTree(dest: var TokenBuf; n: var Cursor; suffix: string; st: var Stats;
-                 summaries: ptr FunctionSummaryTable; m: ptr MainModule) =
+                 summaries: ptr FunctionSummaryTable; m: ptr MainModule;
+                 eng: Engine = nil; vecMode = vecOff; memOpts = MemOpts(intrinsics: true)) =
   ## Copy the tree/token at `n` into `dest`, replacing each proc body with its
   ## optimized version. `dest` shares `n`'s pool+tags, so `addSubtree` is a
   ## bulk, line-info-preserving copy; reopened tags re-stamp their own info.
@@ -83,7 +200,7 @@ proc rebuildTree(dest: var TokenBuf; n: var Cursor; suffix: string; st: var Stat
       dest.addSubtree d.params
       dest.addSubtree d.returnType
       dest.addSubtree d.pragmas
-      if d.body.kind == TagLit:
+      if d.body.kind == TagLit and not isAssemblerProc(d.pragmas):
         inc st.bodies
         # Open a typenav scope for this proc and register its params, so the
         # alias pass's `getType` can resolve param/local types (mirrors how the C
@@ -93,7 +210,7 @@ proc rebuildTree(dest: var TokenBuf; n: var Cursor; suffix: string; st: var Stat
           m[].registerParams(d.params)
         var body = createTokenBuf(64, dest.pool, dest.tags)
         body.addSubtree d.body
-        optimizeBody(body, suffix, st, summaries, m)
+        optimizeBody(body, suffix, st, summaries, m, d.params, eng, vecMode, memOpts)
         if m != nil: m[].closeScope()
         var rb = body.beginRead()
         dest.addSubtree rb
@@ -107,20 +224,41 @@ proc rebuildTree(dest: var TokenBuf; n: var Cursor; suffix: string; st: var Stat
       if li.isValid: dest.appendLineInfo li
       n.into:
         while n.hasMore:
-          rebuildTree(dest, n, suffix, st, summaries, m)
+          rebuildTree(dest, n, suffix, st, summaries, m, eng, vecMode, memOpts)
       dest.closeTag()
   else:
     dest.addSubtree n
     inc n
 
 proc optimizeModule*(src: var TokenBuf; suffix: string; st: var Stats;
-                     m: ptr MainModule = nil): TokenBuf =
+                     m: ptr MainModule = nil; eng: Engine = nil;
+                     vecMode = vecOff; memOpts = MemOpts(intrinsics: true)): TokenBuf =
   ## Rebuild the single module-level root tree (`(stmts …)`), optimizing bodies.
-  ## `m` is the module type context for the alias pass (nil ⇒ coarse aliasing).
+  ## `m` is the module type context for the alias pass (nil ⇒ coarse aliasing);
+  ## `eng` the structural rewrite engine (nil ⇒ the rewriter stage is skipped);
+  ## `vecMode` enables the 128-bit loop vectorizer: `vecNeon` on native
+  ## AArch64, `vecSse` on native x86-64. Both emit the same target-neutral rows
+  ## today; the mode names the back end that lowers them.
   var summaries = collectFunctionSummaries(src)   # once per module; cse runs per body
   result = createTokenBuf(src.len + src.len div 8, src.pool, src.tags)
   var n = src.beginRead()
-  rebuildTree(result, n, suffix, st, addr summaries, m)
+  if n.kind == TagLit and n.stmtKind == StmtsS:
+    # Open the root by hand so the intrinsic declarations the vectorizer and
+    # memidioms need can be appended INSIDE it once every body is processed.
+    let tag = n.cursorTagId
+    let li = rawLineInfo(n)
+    result.openTag tag
+    if li.isValid: result.appendLineInfo li
+    n.into:
+      while n.hasMore:
+        rebuildTree(result, n, suffix, st, addr summaries, m, eng, vecMode, memOpts)
+    if st.vectorized > 0:
+      addVecIntrinsicDecls(result, "vec." & suffix)
+    if MemsetOp in st.memOps: addMemIntrinsicDecl(result, "mem." & suffix, MemsetOp)
+    if MemcpyOp in st.memOps: addMemIntrinsicDecl(result, "mem." & suffix, MemcpyOp)
+    result.closeTag()
+  else:
+    rebuildTree(result, n, suffix, st, addr summaries, m, eng, vecMode, memOpts)
 
 proc checkWellFormed(buf: var TokenBuf) =
   ## Drain every top-level tree to exhaustion; `skip` would crash on a
@@ -128,25 +266,38 @@ proc checkWellFormed(buf: var TokenBuf) =
   var n = buf.beginRead()
   while n.hasMore: skip n
 
-proc processFile*(input, output: string; verify = false): Stats =
+proc processFile*(input, output: string; verify = false;
+                  vecMode = vecOff; memOpts = MemOpts(intrinsics: true)): Stats =
   ## Optimize one NIFC file. Seeds the tag pool so `cursorTagId` aligns with the
   ## master NIFC tag ordinals (`stmtKind`/`takeProcDecl` rely on it).
   let suffix = extractModuleSuffix(input)
   var st = Stats()
-  # 1. Whole-module inter-module inlining runs first, in the nifcursors world
-  #    (via the bridge); the result comes back as a NIF string.
+  # 1. Whole-module inter-module inlining runs first (via the bridge, which
+  #    owns the nifpools surface the inliner is written against).
   var imiChanged = false
-  let imiNif = runImi(input, suffix, splitFile(input).dir, imiChanged)
+  var src = block:
+    var inlined =
+      if passOn("imi"): runImi(input, suffix, splitFile(input).dir, imiChanged)
+      else: parseModule(input)
+    # The inliner works on dense line info; the per-body passes were calibrated
+    # on the sparse form a plain parse stores (unswitch bounds loops in raw
+    # tokens, suffixes included), and CSE's temp order follows token positions.
+    # An in-memory copy keeps them seeing exactly the tokens they always saw.
+    withSparseLineInfo(inlined)
   if imiChanged: inc st.intermodChanged
-  # 2. Load the module as a typenav context (for type-precise aliasing), and
-  #    reparse the (post-inlining) body into nifcore SHARING that context's pool
-  #    so symbol ids line up between the type context and the optimization buffer.
-  var typeCtx = load(input)
-  var src = parseFromBuffer(imiNif, suffix, 4000,
-                            sharedPool = typeCtx.pool, sharedTags = typeCtx.tags)
-  var optimized = optimizeModule(src, suffix, st, addr typeCtx)
+  # 2. Load the module as a typenav context (for type-precise aliasing), in the
+  #    SAME pools as `src`, so symbol ids line up between the type context and
+  #    the optimization buffer. This used to serialize the inliner's result to
+  #    NIF text and re-parse it into the context's pools: on `sem.nim` that
+  #    round trip was 9.7 % of the whole run.
+  var typeCtx = load(input, src.pool, src.tags)
+  # The rewrite engine shares the module's pool/tags so its compiled patterns'
+  # tag ids coincide with the buffers it rewrites.
+  var eng = newEngine(ArithRules, typeCtx.pool, typeCtx.tags)
+  var optimized = optimizeModule(src, suffix, st, addr typeCtx, eng, vecMode, memOpts)
   checkWellFormed(optimized)
-  writeFile(output, toModuleString(optimized, "." & extractModuleSuffix(output)))
+  onRaiseQuit writeFile(output, toModuleString(optimized, "." & extractModuleSuffix(output)))
+  onRaiseQuit writeLengInterface(optimized, output)
   if verify:
     var back = parseFromFile(output, 4000, sharedTags = createLengTagPool())
     checkWellFormed(back)

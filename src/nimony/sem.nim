@@ -15,10 +15,10 @@ import std / [tables, sets, syncio, formatfloat, assertions, strutils, hashes]
 from std/os import changeFileExt, getCurrentDir, isAbsolute, absolutePath, normalizedPath
 include ".." / lib / nifprelude
 include ".." / lib / compat2
-import ".." / lib / [symparser, nifindexes, docpaths]
-import nimony_model, symtabs, builtintypes, decls, asthelpers,
+import ".." / lib / [symparser, nifindexes, docpaths, intrinsics]
+import nimony_model, staticmatches, symtabs, builtintypes, decls, asthelpers,
   programs, sigconcepts, sigmatch, magics, reporters, nifconfig,
-  intervals, xints, typeprops,
+  intervals, xints, typeprops, conceptcache,
   semdata, sembasics, semchecks, semconst, semmagics, semimport, templates, sempragmas, semos, expreval, semborrow, enumtostr, derefs, sizeof, renderer,
   semuntyped, vtables_frontend, module_plugins, deferstmts, pragmacanon, exprexec, langmodes,
   features, identstyle, macro_plugin
@@ -46,7 +46,7 @@ proc implicitlyDiscardable(n: Cursor, dest: var TokenBuf, noreturnOnly = false):
   #    nkOfBranch, nkElse, nkFinally, nkExceptBranch,
   #    nkElifBranch, nkElifExpr, nkElseExpr, nkBlockStmt, nkBlockExpr,
   #    nkHiddenStdConv, nkHiddenSubConv, nkHiddenDeref}
-  while it.kind == ParLe and (stmtKind(it) in {StmtsS, BlockS} or exprKind(it) == ExprX):
+  while it.isTagLit and (stmtKind(it) in {StmtsS, BlockS} or exprKind(it) == ExprX):
     # Unwrap ExprX by advancing to the last son (the value); do not mutate the tree to StmtsS.
     # `if (let e = f(); e != 0)` should keep ExprX so xelim sees stmt/expr distinction.
     if exprKind(it) == ExprX:
@@ -56,16 +56,16 @@ proc implicitlyDiscardable(n: Cursor, dest: var TokenBuf, noreturnOnly = false):
       # it now points to the last son (the expression); continue unwrapping if needed
     else:
       inc it
-      var last = it
-      while true:
+      if not it.hasMore:
+        # Empty statement list — e.g. a `case`/`if` branch whose whole body
+        # was a compile-time-false `when`. Nothing to inspect; stepping into
+        # the loop below would `skip` past the ParRi and overrun the span
+        # (`isLastSon` skips blindly, so it never sees the empty case).
+        return false
+      while not isLastSon(it):
         skip it
-        if it.kind == ParRi:
-          it = last
-          break
-        else:
-          last = it
 
-  if it.kind != ParLe: return false
+  if not it.isTagLit: return false
   case stmtKind(it)
   of IfS:
     it.into IfS:
@@ -82,9 +82,9 @@ proc implicitlyDiscardable(n: Cursor, dest: var TokenBuf, noreturnOnly = false):
             checkBranch(it)
             skip it
             while it.hasMore: skip it
-        of NoSub, NilU, NotnilU, KvU, VvU, RangeU, RangesU, ParamU, TypevarU, StaticTypevarU, EfldU, FldU,
+        of NoSub, NilU, NotnilU, KvU, VvU, RangeU, RangesU, ParamU, StaticParamU, TypevarU, StaticTypevarU, EfldU, FldU,
            WhenU, TypevarsU, CaseU, OfU, StmtsU, ParamsU, PragmasU, EitherU, JoinU,
-           UnpackflatU, UnpacktupU, ExceptU, FinU, UncheckedU, GfldU, CallargsU, ForcallU:
+           UnpackflatU, UnpacktupU, ExceptU, FinU, UncheckedU, GfldU, CallargsU, ForcallU, DeferexpansionU, NeedtypesU:
           error "illformed AST: `elif` or `else` inside `if` expected, got ", it
           skip it  # avoid infinite loop on illformed
     # all branches are discardable
@@ -111,9 +111,9 @@ proc implicitlyDiscardable(n: Cursor, dest: var TokenBuf, noreturnOnly = false):
             checkBranch(it)
             skip it
             while it.hasMore: skip it
-        of NoSub, NilU, NotnilU, KvU, VvU, RangeU, RangesU, ParamU, TypevarU, StaticTypevarU, EfldU, FldU,
+        of NoSub, NilU, NotnilU, KvU, VvU, RangeU, RangesU, ParamU, StaticParamU, TypevarU, StaticTypevarU, EfldU, FldU,
            WhenU, TypevarsU, CaseU, StmtsU, ParamsU, PragmasU, EitherU, JoinU,
-           UnpackflatU, UnpacktupU, ExceptU, FinU, UncheckedU, GfldU, CallargsU, ForcallU:
+           UnpackflatU, UnpacktupU, ExceptU, FinU, UncheckedU, GfldU, CallargsU, ForcallU, DeferexpansionU, NeedtypesU:
           error "illformed AST: `of`, `elif` or `else` inside `case` expected, got ", it
           skip it
     # all branches are discardable
@@ -132,7 +132,7 @@ proc implicitlyDiscardable(n: Cursor, dest: var TokenBuf, noreturnOnly = false):
     result = true
   of CallKindsS:
     inc it
-    if it.kind == Symbol:
+    if it.isSymbol:
       let sym = tryLoadSym(it.symId)
       if sym.status == LacksNothing:
         var decl = sym.decl
@@ -148,7 +148,7 @@ proc implicitlyDiscardable(n: Cursor, dest: var TokenBuf, noreturnOnly = false):
           let accepted =
             if noreturnOnly: {NoreturnP}
             else: {DiscardableP, NoreturnP}
-          if decl.kind == ParLe:
+          if decl.isTagLit:
             decl.peekInto:  # (pragmas …)
               while decl.hasMore:
                 if pragmaKind(decl) in accepted:
@@ -157,17 +157,22 @@ proc implicitlyDiscardable(n: Cursor, dest: var TokenBuf, noreturnOnly = false):
     result = false
   of RetS, BreakS, ContinueS, RaiseS:
     result = true
-  else:
+  of NoStmt, GvarS, TvarS, VarS, ConstS, ResultS, GletS, TletS, LetS, CursorS, PatternvarS,
+     ProcS, FuncS, IteratorS, ConverterS, MethodS, MacroS, TemplateS, TypeS, BlockS, EmitS,
+     AsgnS, ScopeS, WhenS, ForS, WhileS, CoroforS, LabS, JmpS, YldS, StmtsS, AlwaysS, PragmasS,
+     PragmaxS, InclS, ExclS, IncS, DecS, IncludeS, ImportS, ImportasS, FromimportS, ImportexceptS,
+     ExportS, ExportexceptS, CommentS, DiscardS, UnpackdeclS, AssumeS, AssertS, StaticstmtS,
+     BindS, MixinS, UsingS, AsmS, DeferS:
     result = false
 
 proc isNoReturn(n: Cursor): bool {.inline.} =
-  var dummy = default(TokenBuf)
+  var dummy = initTokenBuf()
   result = implicitlyDiscardable(n, dummy, noreturnOnly = true)
 
 proc requestRoutineInstance*(c: var SemContext; origin: SymId;
                             typeArgs: TokenBuf;
                             inferred: Table[SymId, Cursor];
-                            info: PackedLineInfo): ProcInstance
+                            info: NifLineInfo): ProcInstance
 
 proc tryConverterMatch(c: var SemContext; convMatch: var Match; f: TypeCursor, arg: CallArg): bool
 
@@ -181,7 +186,21 @@ proc semExpr*(c: var SemContext; dest: var TokenBuf; it: var Item; flags: set[Se
 
 proc resolveDeferredLocal(c: var SemContext; ident: StrId): bool
 
+proc semExprMissingPhases(c: var SemContext; dest: var TokenBuf; it: var Item; firstPhase: SemPhase)
+
 proc semCall(c: var SemContext; dest: var TokenBuf; it: var Item; flags: set[SemFlag]; source: TransformedCallSource = RegularCall)
+
+proc semStaticExpr(c: var SemContext; dest: var TokenBuf; it: var Item) =
+  ## `(static x)`, the `static` magic: explicit general CTFE. Evaluate the
+  ## operand at compile time and use the resulting value. This is the only way
+  ## an arbitrary call reaches a `static` parameter; general CTFE is never
+  ## triggered implicitly.
+  var n = it.n
+  inc n # tag
+  var inner = Item(n: n, typ: it.typ)
+  semConstExpr c, dest, inner
+  it.typ = inner.typ
+  skip it.n
 
 proc commonType*(c: var SemContext; dest: var TokenBuf; it: var Item; argBegin: int; expected: TypeCursor) =
   if typeKind(expected) == AutoT:
@@ -197,11 +216,17 @@ proc commonType*(c: var SemContext; dest: var TokenBuf; it: var Item; argBegin: 
     # noreturn allowed in expression context
     # maybe use sem flags to restrict this to statement branches
     done = true
+  elif typeKind(arg.typ) == UntypedT:
+    # `untyped` means "not semantically checked yet" -- a deferred plugin call
+    # parked by `deferPluginCall`, for instance. Adopt the expected type, the
+    # way an `untyped` template body does when it expands into a typed slot;
+    # the real check happens when instantiation re-drives the node.
+    it.typ = expected
+    done = true
   elif typeKind(arg.typ) == AutoT and not isEmptyContainer(arg.n):
     # auto is valid for empty container, will be handled below
     it.typ = expected
     done = true
-  endRead(dest)
   if done:
     return
 
@@ -210,7 +235,7 @@ proc commonType*(c: var SemContext; dest: var TokenBuf; it: var Item; argBegin: 
   typematch m, expected, arg
   if m.err:
     # try converter
-    var convMatch = default(Match)
+    var convMatch = createMatch(addr c)
     var convArg = CallArg(n: arg.n, typ: arg.typ)
     if tryConverterMatch(c, convMatch, expected, convArg):
       # `arg.n` and `convArg.n` are cursors into `dest` (via `cursorAt`
@@ -222,8 +247,8 @@ proc commonType*(c: var SemContext; dest: var TokenBuf; it: var Item; argBegin: 
       endRead convArg.n
       expectUnique dest
       shrink dest, argBegin
-      dest.add parLeToken(HcallX, info)
-      dest.add symToken(convMatch.fn.sym, info)
+      dest.addParLe(HcallX, info)
+      dest.addSymUse(convMatch.fn.sym, info)
       if convMatch.genericConverter:
         buildTypeArgs(convMatch)
         if convMatch.err:
@@ -231,7 +256,7 @@ proc commonType*(c: var SemContext; dest: var TokenBuf; it: var Item; argBegin: 
           buildErr c, dest, info, getErrorMsg(convMatch)
         else:
           let inst = c.requestRoutineInstance(convMatch.fn.sym, convMatch.typeArgs, convMatch.inferred, info)
-          dest[dest.len-1].setSymId inst.targetSym
+          setSymIdAt(dest, lastValueStart(dest), inst.targetSym)
       # ignore refineArgType case, probably environment is generic
       dest.add convMatch.args
       dest.addParRi()
@@ -253,13 +278,17 @@ proc commonType*(c: var SemContext; dest: var TokenBuf; it: var Item; argBegin: 
       semCall c, dest, call, {}
     else:
       dest.add m.args
-    it.typ = expected
+    # a bare type class such as `typedesc` only checks the argument; it must
+    # not replace the argument's concrete type (`typedesc[int]`)
+    if expected.typeKind != TypekindT:
+      it.typ = expected
 
 # -------------------- declare `result` -------------------------
 
-proc declareResult*(c: var SemContext; dest: var TokenBuf; info: PackedLineInfo): SymId =
+proc declareResult*(c: var SemContext; dest: var TokenBuf; info: NifLineInfo): SymId =
+  let returnType = c.routine.returnType
   if c.routine.kind in {ProcY, FuncY, ConverterY, MethodY, MacroY} and
-      classifyType(c, c.routine.returnType) != VoidT:
+      classifyType(c, returnType) != VoidT:
     let name = pool.strings.getOrIncl("result")
     result = identToSym(c, name, ResultY)
     let s = Sym(kind: ResultY, name: result,
@@ -269,11 +298,11 @@ proc declareResult*(c: var SemContext; dest: var TokenBuf; info: PackedLineInfo)
 
     let declStart = dest.len
     buildTree dest, ResultS, info:
-      dest.add symdefToken(result, info) # name
+      dest.addSymDef(result, info) # name
       dest.addDotToken() # export marker
       if NoinitP in c.routine.pragmas:
-        dest.add parLeToken(PragmasU, info)
-        dest.add parLeToken(NoinitP, info)
+        dest.addParLe(PragmasU, info)
+        dest.addParLe(NoinitP, info)
         dest.addParRi()
         dest.addParRi()
       else:
@@ -287,45 +316,72 @@ proc declareResult*(c: var SemContext; dest: var TokenBuf; info: PackedLineInfo)
 # -------------------- generics ---------------------------------
 
 
+proc instToStringRec(b: var Builder; n: var Cursor) =
+  ## Cursor-based canonical rendering: line-info suffixes are skipped by the
+  ## cursor advance, so the text — and hence the instance-hash suffixes —
+  ## matches the classic token walk.
+  case n.kind
+  of DotToken:
+    b.addEmpty()
+    inc n
+  of Ident:
+    b.addIdent(pool.strings[n.strId])
+    inc n
+  of Symbol:
+    # for nested instantiations i.e. `Foo[Bar[int]]`
+    if pool.symIsInstantiation(n.symId):
+      b.addSymbol(pool.symWithoutModule(n.symId))
+    else:
+      b.addSymbol(pool.symString(n.symId))
+    inc n
+  of IntLit:
+    b.addIntLit(n.intVal)
+    inc n
+  of UIntLit:
+    b.addUIntLit(n.uintVal)
+    inc n
+  of FloatLit:
+    b.addFloatLit(n.floatVal)
+    inc n
+  of SymbolDef:
+    b.addSymbolDef(pool.symString(n.symId))
+    inc n
+  of CharLit:
+    b.addCharLit char(n.uoperand)
+    inc n
+  of StrLit:
+    b.addStrLit(pool.strings[n.strId])
+    inc n
+  of TagLit:
+    b.addTree(globalTags.tags[n.cursorTagId])
+    n.into:
+      while n.hasMore:
+        instToStringRec(b, n)
+    b.endTree()
+  else:
+    # suffix kinds never appear as a cursor head
+    b.addIdent "<unknown token>"
+    inc n
+
 proc instToString(buf: TokenBuf; start: int): string =
   # canonicalized string of invocation
   # could directly build hash too but this is easier to debug
   var b = nifbuilder.open((buf.len - start) * 20, compact = true)
-  for n in start ..< buf.len:
-    let k = buf[n].kind
-    case k
-    of DotToken: b.addEmpty()
-    of Ident: b.addIdent(pool.strings[buf[n].litId])
-    of Symbol:
-      # for nested instantiations i.e. `Foo[Bar[int]]`
-      let s = pool.syms[buf[n].symId]
-      if isInstantiation(s):
-        b.addSymbol(removeModule(s))
-      else:
-        b.addSymbol(s)
-    of IntLit: b.addIntLit(pool.integers[buf[n].intId])
-    of UIntLit: b.addUIntLit(pool.uintegers[buf[n].uintId])
-    of FloatLit: b.addFloatLit(pool.floats[buf[n].floatId])
-    of SymbolDef: b.addSymbolDef(pool.syms[buf[n].symId])
-    of CharLit: b.addCharLit char(buf[n].uoperand)
-    of StringLit: b.addStrLit(pool.strings[buf[n].litId])
-    of UnknownToken: b.addIdent "<unknown token>"
-    of EofToken: b.addIntLit buf[n].soperand
-    of ParRi: b.endTree()
-    of ParLe: b.addTree(pool.tags[buf[n].tagId])
+  var n = readonlyCursorAt(buf, start)
+  while n.hasMore:
+    instToStringRec(b, n)
   result = b.extract()
-
 proc instToSuffix(buf: TokenBuf, start: int): string =
   result = uhashBase36(instToString(buf, start))
 
 proc newInstSymId(c: var SemContext; orig: SymId; suffix: string): SymId =
   # abc.123.Iabcdefgh.instmod
-  var name = removeModule(pool.syms[orig])
+  var name = pool.symWithoutModule(orig)
   name.add(".I")
   name.add(suffix)
   name.add '.'
   name.add c.thisModuleSuffix
-  result = pool.syms.getOrIncl(name)
+  result = pool.symId(name)
 
 type
   SubsContext = object
@@ -337,52 +393,56 @@ proc addFreshSyms(c: var SemContext, sc: var SubsContext) =
   for _, newVar in sc.newVars:
     c.freshSyms.incl newVar
 
-proc subs(c: var SemContext; dest: var TokenBuf; sc: var SubsContext; body: Cursor) =
-  var nested = 0
+proc subs(c: var SemContext; dest: var TokenBuf; sc: var SubsContext; body: Cursor;
+          isField = false) =
+  ## Substitutes one tree/token. `isField` mirrors the classic token-wise
+  ## walk's "the last open tag was a field" state: field names keep their
+  ## SymbolDef (numbering is object-scoped), everything else is renamed.
   var n = body
-  var isField = false
-  while true:
-    case n.kind
-    of UnknownToken, EofToken, DotToken, Ident, StringLit, CharLit, IntLit, UIntLit, FloatLit:
-      dest.add n
-    of Symbol:
+  case n.kind
+  of UnknownToken, EofToken, ParLe, ParRi, ExtendedSuffix, LineInfoLit, DotToken, Ident, StrLit, CharLit, IntLit, UIntLit, FloatLit:
+    dest.addSubtree n
+  of Symbol:
+    let s = n.symId
+    let arg = sc.params[].getOrDefault(s)
+    if arg != default(Cursor):
+      dest.addSubtree arg
+    else:
+      let nv = sc.newVars.getOrDefault(s)
+      if nv != SymId(0):
+        dest.addSymUse(nv, n.info)
+      else:
+        dest.addSubtree n # keep Symbol as it was
+  of SymbolDef:
+    if isField:
+      dest.addSubtree n
+    else:
       let s = n.symId
-      let arg = sc.params[].getOrDefault(s)
-      if arg != default(Cursor):
-        dest.addSubtree arg
-      else:
-        let nv = sc.newVars.getOrDefault(s)
-        if nv != SymId(0):
-          dest.add symToken(nv, n.info)
+      let newDef =
+        if sc.instSuffix != "":
+          # Don't apply instantiation suffix to field names
+          newInstSymId(c, s, sc.instSuffix)
         else:
-          dest.add n # keep Symbol as it was
-    of SymbolDef:
-      if isField:
-        dest.add n
-      else:
-        let s = n.symId
-        let newDef =
-          if sc.instSuffix != "":
-            # Don't apply instantiation suffix to field names
-            newInstSymId(c, s, sc.instSuffix)
-          else:
-            newSymId(c, s)
-        sc.newVars[s] = newDef
-        dest.add symdefToken(newDef, n.info)
-    of ParLe:
-      isField = n.substructureKind in {FldU, GfldU}
-      dest.add n
-      inc nested
-    of ParRi:
-      dest.add n
-      dec nested
-    if nested == 0: break
-    inc n
+          newSymId(c, s)
+      sc.newVars[s] = newDef
+      dest.addSymDef(newDef, n.info)
+  of TagLit:
+    let fld = n.substructureKind in {FldU, GfldU}
+    dest.addParLe(n.cursorTagId, n.info)
+    n.into:
+      while n.hasMore:
+        subs(c, dest, sc, n, fld)
+        skip n
+      dest.addParRi(n.endInfo)
+  else:
+    # classic: a real ParRi cannot happen (subtree ends are consumed by the
+    # bounded scope); nifcore has no ParRi kind.
+    discard
 
 proc produceInvoke(c: var SemContext; dest: var TokenBuf; req: InstRequest;
-                   typeVars: Cursor; info: PackedLineInfo) =
+                   typeVars: Cursor; info: NifLineInfo) =
   dest.buildTree InvokeT, info:
-    dest.add symToken(req.origin, info)
+    dest.addSymUse(req.origin, info)
     var typeVars = typeVars
     if typeVars.substructureKind == TypevarsU:
       typeVars.into TypevarsU:
@@ -404,7 +464,7 @@ proc subsGenericType(c: var SemContext; dest: var TokenBuf; req: InstRequest) =
   let info = req.requestFrom[^1]
   let decl = getTypeSection(req.origin)
   dest.buildTree TypeS, info:
-    dest.add symdefToken(req.targetSym, info)
+    dest.addSymDef(req.targetSym, info)
     dest.addDotToken() # export
     produceInvoke c, dest, req, decl.typevars, info
     # take the pragmas from the origin:
@@ -417,8 +477,8 @@ proc subsGenericProc(c: var SemContext; dest: var TokenBuf; req: InstRequest) =
   let info = req.requestFrom[^1]
   let decl = getProcDecl(req.origin)
   dest.buildTree decl.kind, info:
-    dest.add symdefToken(req.targetSym, info)
-    if decl.exported.kind == ParLe:
+    dest.addSymDef(req.targetSym, info)
+    if decl.exported.isTagLit:
       # magic?
       dest.copyTree decl.exported
     else:
@@ -450,7 +510,7 @@ proc semLocalType(c: var SemContext; dest: var TokenBuf; n: var Cursor; context 
   assert dest.len > insertPos
   result = typeToCursor(c, dest, insertPos)
 
-proc semTypeSection(c: var SemContext; dest: var TokenBuf; n: var Cursor; outerRefOwner: SymId = SymId(0))
+proc semTypeSection(c: var SemContext; dest: var TokenBuf; n: var Cursor)
 
 proc instantiateType*(c: var SemContext; typ: Cursor; bindings: Table[SymId, Cursor]): Cursor =
   var destB = createTokenBuf(30)
@@ -500,8 +560,7 @@ proc instantiateExprIntoBuf(c: var SemContext; buf: var TokenBuf; it: var Item; 
 
 proc fetchSym*(c: var SemContext; s: SymId): Sym =
   # yyy find a better solution
-  var name = pool.syms[s]
-  extractBasename name
+  var name = pool.symBasename(s)
   let identifier = pool.strings.getOrIncl(name)
   var it {.cursor.} = c.currentScope
   while it != nil:
@@ -518,35 +577,78 @@ proc fetchSym*(c: var SemContext; s: SymId): Sym =
 
 proc semStmtsExpr(c: var SemContext; dest: var TokenBuf; it: var Item; isNewScope: bool) =
   let before = dest.len
-  dest.add it.n
+  let info = it.n.info
+  dest.addParLe(it.n.cursorTagId, it.n.info)
+  var empty = true
   it.n.into:
     while it.n.hasMore:
+      empty = false
       if not isLastSon(it.n):
         semStmt c, dest, it.n, false
       else:
         semExpr c, dest, it
   dest.addParRi()
+  if empty:
+    # `(stmts)` produces nothing: that is `void`, not "unknown". A template whose
+    # body was a `when` that compiled to nothing publishes exactly this, and its
+    # expansion was then rejected as `auto` where `void` was wanted.
+    producesVoid c, dest, info, it.typ
   let kind =
     if classifyType(c, it.typ) in {VoidT, AutoT}:
       (if isNewScope: ScopeTagId else: StmtsTagId)
     else: ExprTagId
-  setTag(dest[before], TagId(kind))
+  setTagAt(dest, before, TagId(kind))
+
+proc discardCallExplicitly(dest: var TokenBuf; exPos: int; info: NifLineInfo) =
+  ## Make the implicit discard of a discardable call at `dest[exPos..]`
+  ## explicit: `(discard …)` is what later passes bind to a temp and destroy.
+  ## A bare `(call …)` statement of a type with a destructor
+  ## (`{.discardable.}` proc returning a `string`) was bound to a temp whose
+  ## symbol was then left behind as a statement.
+  var one = cursorAt(dest, exPos)
+  # Only a CALL: an `if`/`case` whose branches are discardable calls is
+  # typed by them too, but wrapping it would turn a statement without an
+  # `else` into an expression that does not always produce a value.
+  let isCall = one.exprKind in CallKinds
+  skip one
+  let single = cursorToPosition(dest, one) == dest.len
+  endRead one
+  if single and isCall:
+    var val = createTokenBuf(dest.len - exPos + 2)
+    for i in exPos ..< dest.len: val.add dest[i]
+    dest.shrink exPos
+    dest.addParLe(DiscardS, info)
+    var vc = beginRead(val)
+    dest.addSubtree vc
+    endRead vc
+    dest.addParRi()
 
 proc semStmt*(c: var SemContext; dest: var TokenBuf; n: var Cursor; isNewScope: bool) =
   let info = n.info
   var it = Item(n: n, typ: c.types.autoType)
   let exPos = dest.len
   semExpr c, dest, it
+  when defined(sealCheck):
+    block:
+      let reports = checkSeals(dest)
+      if reports.len > 0:
+        let u = info
+        echo "SEAL[semStmt after ", (if u.file != FileId(0): pool.filenames[u.file] else: "?"), ":", u.line, "]"
+        for r in reports: echo "  ", r
+        writeStackTrace()
+        quit 1
   if it.typ.kind != Symbol and
       classifyType(c, it.typ) in {NoType, VoidT, AutoT, UntypedT}:
     discard "ok"
   else:
     # analyze the expression that was just produced:
-    let ex = cursorAt(dest, exPos)
+    var ex = cursorAt(dest, exPos)
     let discardable = implicitlyDiscardable(ex, dest)
-    endRead(dest)
+    endRead ex
     if not discardable:
       buildErr c, dest, info, "expression of type `" & typeToString(it.typ) & "` must be discarded"
+    else:
+      discardCallExplicitly dest, exPos, info
   n = it.n
 
 proc semStmtCallback*(c: var SemContext; dest: var TokenBuf; n: Cursor) =
@@ -565,31 +667,23 @@ proc semGetSize*(c: var SemContext; n: Cursor; strict=false): xint =
   getSize(n, c.g.config.bits div 8, strict)
 
 proc sameIdent(sym: SymId; str: StrId): bool =
-  # XXX speed this up by using the `fieldCache` idea
-  var name = pool.syms[sym]
-  extractBasename(name)
-  result = pool.strings.getOrIncl(name) == str
+  result = pool.symNameId(sym) == str
 
 proc sameIdent(a, b: SymId): bool =
   # not used yet
-  # XXX speed this up by using the `fieldCache` idea
-  var x = pool.syms[a]
-  extractBasename(x)
-  var y = pool.syms[b]
-  extractBasename(y)
-  result = x == y
+  result = pool.symNameId(a) == pool.symNameId(b)
 
 proc requestRoutineInstance*(c: var SemContext; origin: SymId;
                             typeArgs: TokenBuf;
                             inferred: Table[SymId, Cursor];
-                            info: PackedLineInfo): ProcInstance =
+                            info: NifLineInfo): ProcInstance =
   let key = typeToCanon(typeArgs, 0)
   var targetSym = c.instantiatedProcs.getOrDefault((origin, key))
   if targetSym == SymId(0):
     # Use the `.I<hash>.<mod>` instantiation naming convention (same as
     # type instantiations via `newInstSymId`). Mixing in plain `newSymId`
     # produced names like `@.0.<userMod>` that are indistinguishable from
-    # regular module-local procs, so `isInstantiation` can't detect them
+    # regular module-local procs, so `symIsInstantiation` can't detect them
     # and downstream consumers (e.g. `exprexec.collectUsedSymsFromExpr`)
     # can't tell the body-less stub apart from a real local proc.
     #
@@ -598,29 +692,29 @@ proc requestRoutineInstance*(c: var SemContext; origin: SymId;
     # instantiated with identical args — e.g. `Table.[]=` and `Tracker.[]=` over
     # `[SymId, HashSet[int]]` — would otherwise both mint `[]=.0.I<hash>.<mod>`
     # and collide in codegen. `newInstSymId` keeps only the base name
-    # (`removeModule(origin)`), so the routine identity must enter through the
+    # (`symWithoutModule(origin)`), so the routine identity must enter through the
     # suffix. This mirrors the type-instance path, whose suffix is hashed over
     # the `(head args)` invocation (and so already distinguishes heads), and the
     # `(invok …)` shape is the same one written into the signature's pattern
     # below, from which the origin remains recoverable for DCE.
     var instKey = createTokenBuf(typeArgs.len + 3)
     instKey.buildTree InvokeT, info:
-      instKey.add symToken(origin, info)
+      instKey.addSymUse(origin, info)
       instKey.add typeArgs
     let instSuffix = instToSuffix(instKey, 0)
     let targetSym = newInstSymId(c, origin, instSuffix)
     var signature = createTokenBuf(30)
     let decl = getProcDecl(origin)
-    assert decl.typevars.substructureKind == TypevarsU, pool.syms[origin]
-    var typeArgsStart = -1
+    assert decl.typevars.substructureKind == TypevarsU, pool.symString(origin)
+    var invokeStart = -1
     buildTree signature, decl.kind, info:
-      signature.add symdefToken(targetSym, info)
+      signature.addSymDef(targetSym, info)
       signature.addDotToken() # a generic instance is not exported
       signature.copyTree decl.pattern
       # InvokeT for the generic params:
+      invokeStart = signature.len
       signature.buildTree InvokeT, info:
-        signature.add symToken(origin, info)
-        typeArgsStart = signature.len
+        signature.addSymUse(origin, info)
         signature.add typeArgs
       var sc = SubsContext(params: addr inferred)
       subs(c, signature, sc, decl.params)
@@ -637,7 +731,9 @@ proc requestRoutineInstance*(c: var SemContext; origin: SymId;
     # rebuild inferred as cursors to params in signature invocation
     var newInferred = initTable[SymId, Cursor]()
     var typevar = decl.typevars
-    var typeArg = cursorAt(signature, typeArgsStart)
+    var typeArg = cursorAt(signature, invokeStart)
+    typeArg = sub(typeArg) # into the (invok …); bounds the arg walk
+    skip typeArg # the origin symbol
     typevar.into:  # (typevars …)
       while typevar.hasMore:
         assert typeArg.hasMore
@@ -645,7 +741,7 @@ proc requestRoutineInstance*(c: var SemContext; origin: SymId;
         newInferred[sym] = typeArg
         skip typevar
         skip typeArg
-    assert typeArg.kind == ParRi
+    assert not typeArg.hasMore
 
     publish targetSym, ensureMove signature
 
@@ -675,76 +771,89 @@ type
     FailedDot
     InvalidDot
 
-proc tryBuiltinDot(c: var SemContext; dest: var TokenBuf; it: var Item; lhs: Item; fieldName: StrId; info: PackedLineInfo; flags: set[SemFlag]): DotExprState
+proc tryBuiltinDot(c: var SemContext; dest: var TokenBuf; it: var Item; lhs: Item; fieldName: StrId; info: NifLineInfo; flags: set[SemFlag]; accessToken = ""): DotExprState
 
-proc tryBuiltinSubscript(c: var SemContext; dest: var TokenBuf; it: var Item; lhs: Item): bool
-proc semBuiltinSubscript(c: var SemContext; dest: var TokenBuf; it: var Item; lhs: Item)
+proc tryBuiltinSubscript(c: var SemContext; dest: var TokenBuf; it: var Item; lhs: Item;
+                         atStart: Cursor): bool
+proc semBuiltinSubscript(c: var SemContext; dest: var TokenBuf; it: var Item; lhs: Item;
+                         atStart: Cursor)
 
 proc semBaseobj(c: var SemContext; dest: var TokenBuf; it: var Item) =
-  inc it.n # baseobj
   let beforeExpr = dest.len
-  let destType = semLocalType(c, dest, it.n)
-  if it.n.kind == IntLit:
-    # we will recompute it via `typematch` below:
-    inc it.n
-  else:
-    bug("expected integer literal in `baseobj` construct")
-  var m = createMatch(addr c)
+  var destType = default(TypeCursor)
+  it.n.into: # baseobj
+    destType = semLocalType(c, dest, it.n)
+    if it.n.isIntLit:
+      # we will recompute it via `typematch` below:
+      inc it.n
+    else:
+      bug("expected integer literal in `baseobj` construct")
+    var m = createMatch(addr c)
 
-  var arg = Item(n: it.n, typ: c.types.autoType)
-  var argBuf = createTokenBuf(16)
-  semExpr c, argBuf, arg
-  it.n = arg.n
-  arg.n = cursorAt(argBuf, 0)
+    var arg = Item(n: it.n, typ: c.types.autoType)
+    var argBuf = createTokenBuf(16)
+    semExpr c, argBuf, arg
+    it.n = arg.n
+    arg.n = cursorAt(argBuf, 0)
 
-  typematch m, destType, arg
-  if not m.err and m.args[0].tagEnum == BaseobjTagId:
-    dest.shrink beforeExpr
-    dest.add m.args
-  else:
-    c.typeMismatch dest, it.n.info, it.typ, destType
-  skipParRi it.n
+    typematch m, destType, arg
+    if not m.err and m.args[0].tagEnum == BaseobjTagId:
+      dest.shrink beforeExpr
+      dest.add m.args
+    else:
+      # A downcast `(baseobj T -depth x)` (produced by an explicit
+      # conversion) fails the implicit direction above when re-semmed;
+      # try the flipped direction like `semConvArg` does:
+      var m2 = createMatch(addr c)
+      m2.flipped = true
+      var matchArg = arg
+      matchArg.typ = destType
+      typematch m2, skipModifier(arg.typ), matchArg
+      if not m2.err and m2.args[0].tagEnum == BaseobjTagId:
+        dest.shrink beforeExpr
+        dest.add m2.args
+      else:
+        # replace the partially written type so dest holds exactly one
+        # (err) tree instead of `[type][err]` that readers of a single
+        # tree silently truncate to the bare type:
+        dest.shrink beforeExpr
+        c.typeMismatch dest, it.n.endInfo, arg.typ, destType
   commonType c, dest, it, beforeExpr, destType
 
 proc addMaybeBaseobjConv(c: var SemContext; dest: var TokenBuf; m: var Match; beforeExpr: int) =
   if m.args[0].tagEnum == BaseobjTagId:
     dest.shrink beforeExpr
     dest.add m.args
-    # remove the ')' as the caller will add one for us!
-    dest.shrink dest.len - 1
+    # reopen the tree as the caller will close it for us!
+    dest.reopenLastTree beforeExpr
   else:
     dest.add m.args
 
 proc isStringLiteral(n: Cursor): bool =
   # supposing it's a string type
-  result = n.kind == StringLit or n.exprKind == SufX
+  result = n.isStringLit or n.exprKind == SufX
 
-proc semConvArg(c: var SemContext; dest: var TokenBuf; destType: Cursor; arg: Item; info: PackedLineInfo; beforeExpr: int) =
+proc skipRangeBase(t: TypeCursor): TypeCursor =
+  ## `range[lo..hi]` as the ordinal it is carved out of. Its value
+  ## representation *is* the base type's, which is why `isCastableType` below
+  ## looks through it too.
+  result = t
+  if result.typeKind == RangetypeT:
+    inc result # past the tag, to the base type
+
+proc semConvArg(c: var SemContext; dest: var TokenBuf; destType: Cursor; arg: Item; info: NifLineInfo; beforeExpr: int) =
   const
     IntegralTypes = {FloatT, CharT, IntT, UIntT, BoolT, EnumT, HoleyEnumT, AnumT}
 
   var srcType = skipModifier(arg.typ)
 
-  # Check if arg contains a symchoice that needs resolution for enum types
+  # A symchoice that the destination type can narrow: an enum field, or an
+  # overloaded routine passed where a routine type is expected.
   if arg.n.exprKind in {OchoiceX, CchoiceX}:
-    # Try to resolve the symchoice based on the destination type
-    var destSym = destType
-    if destSym.kind == Symbol:
-      let destSymId = destSym.symId
-      let impl = typeImpl(destSymId)
-      if impl.typeKind in {EnumT, HoleyEnumT, AnumT}:
-        # Try to match the enum choice
-        let matchedSym = tryMatchEnumChoice(arg.n, destSymId)
-        if matchedSym != SymId(0):
-          # Successfully resolved the overload choice
-          dest.add symToken(matchedSym, info)
-          return
-    elif destType.typeKind in {ProctypeT, ItertypeT}:
-      # Resolve an overloaded routine against the expected proc type.
-      let matchedSym = tryMatchProcChoice(addr c, arg.n, destType)
-      if matchedSym != SymId(0):
-        dest.add symToken(matchedSym, info)
-        return
+    let matchedSym = tryNarrowChoice(addr c, arg.n, destType)
+    if matchedSym != SymId(0):
+      dest.addSymUse(matchedSym, info)
+      return
     # If we couldn't resolve it, fall through to normal error handling
 
   # distinct type conversion?
@@ -759,9 +868,15 @@ proc semConvArg(c: var SemContext; dest: var TokenBuf; destType: Cursor; arg: It
       dest.addSubtree arg.n
     else:
       c.buildErr dest, info, "Only string literals can be converted to cstring. Use `toCString` for safe conversion."
-  elif (destBase.typeKind in IntegralTypes and srcBase.typeKind in IntegralTypes) or
+  elif (skipRangeBase(destBase).typeKind in IntegralTypes and
+        skipRangeBase(srcBase).typeKind in IntegralTypes) or
      (destBase.isSomeStringType and srcBase.isSomeStringType) or
      (destBase.containsGenericParams or srcBase.containsGenericParams):
+    # A `range[lo..hi]` on either side is an ordinary integral conversion:
+    # `uint64(x)` with `x: Natural` converts the ordinal it carries. Converting
+    # *into* a range still owes `lo <= value <= hi`, and that obligation is
+    # discharged at the conversion site by the contract analysis
+    # (`contracts_fir.checkRangeAssign`), not here.
     discard "ok"
     # XXX Add hderef here somehow
     dest.addSubtree arg.n
@@ -780,7 +895,7 @@ proc semConvArg(c: var SemContext; dest: var TokenBuf; destType: Cursor; arg: It
       # (e.g. derefs.nim) recognize it as a distinct conversion, which is
       # lvalue-preserving and therefore passable to `var T` parameters.
       if dest[beforeExpr].exprKind == ConvX:
-        dest[beforeExpr] = parLeToken(DconvX, dest[beforeExpr].info)
+        setTagAt(dest, beforeExpr, TagId(DconvX)) # keeps the sealed jump
   else:
     # maybe object types with an inheritance relation?
     var matchArg = arg
@@ -802,19 +917,39 @@ proc semConvArg(c: var SemContext; dest: var TokenBuf; destType: Cursor; arg: It
 proc isCastableType(t: TypeCursor): bool =
   const IntegralTypes = {FloatT, CharT, IntT, UIntT, BoolT, PointerT, CstringT,
                          RefT, PtrT, NiltT, EnumT, HoleyEnumT, AnumT}
-  result = t.typeKind in IntegralTypes or isEnumType(t)
+  var t = t
+  if t.typeKind == RangetypeT:
+    # `range[0..255]` casts exactly like the ordinal it is carved out of: the
+    # value representation is the base type's and `cast` is precisely the
+    # operation that says "skip the range check". `system/setops`'s `items`
+    # iterator needs this to walk a `set[range[…]]` at all.
+    inc t # past the tag, to the base type
+  if t.typeKind == SetT:
+    # a set that fits a machine word is a bit field (`uintN` in the backend),
+    # so `cast[set[E]](someInt)` and back is the usual flags idiom:
+    var err = false
+    let size = asSigned(bitsetSizeInBytes(t.childCursor), err)
+    result = not err and size <= 8
+  elif t.typeKind == ProctypeT:
+    # a non-closure proc is a code pointer, castable from and to `pointer`;
+    # a closure is a (code, env) pair:
+    result = not procHasPragma(t, ClosureP)
+  else:
+    result = t.typeKind in IntegralTypes or isEnumType(t)
 
 proc semCast(c: var SemContext; dest: var TokenBuf; it: var Item) =
   let beforeExpr = dest.len
   let info = it.n.info
-  takeToken dest, it.n
-  let destType = semLocalType(c, dest, it.n)
+  var destType = default(TypeCursor)
   var x = Item(n: it.n, typ: c.types.autoType)
-  # XXX Add hderef here somehow
-  let beforeArg = dest.len
-  semExpr c, dest, x
-  it.n = x.n
-  takeParRi dest, it.n
+  var beforeArg = dest.len
+  takeInto dest, it.n:
+    destType = semLocalType(c, dest, it.n)
+    x.n = it.n
+    # XXX Add hderef here somehow
+    beforeArg = dest.len
+    semExpr c, dest, x
+    it.n = x.n
 
   var srcType = skipModifier(x.typ)
 
@@ -853,9 +988,10 @@ proc objBody(td: TypeDecl): Cursor {.inline.} =
 
 proc skipInvoke(t: var Cursor): Cursor {.inline.} =
   ## if `t` is an invocation, skips to root sym and returns start of args,
-  ## otherwise returns `default(Cursor)`
+  ## otherwise returns `default(Cursor)`. Both cursors are bounded to the
+  ## invocation's children so `hasMore` stops at its (possibly elided) close.
   if t.typeKind == InvokeT:
-    inc t
+    t = sub(t)
     result = t
     inc result
   else:
@@ -866,7 +1002,7 @@ proc genericRootSym(td: TypeDecl): SymId =
   if td.typevars.typeKind == InvokeT:
     var root = td.typevars
     inc root
-    assert root.kind == Symbol
+    assert root.isSymbol
     result = root.symId
 
 proc bindInvokeArgs(decl: TypeDecl; invokeArgs: Cursor): Table[SymId, Cursor] =
@@ -899,7 +1035,8 @@ proc bindSubsInvokeArgs(c: var SemContext; decl: TypeDecl; buf: var TokenBuf;
     while arg.hasMore:
       subs(c, buf, sc, arg)
       skip arg
-    buf.addParRi()
+    # no sentinel ParRi: closeTag asserts on it and `bindInvokeArgs`
+    # walks the flat buffer hasMore-bounded
     result = bindInvokeArgs(decl, beginRead(buf))
   else:
     result = initTable[SymId, Cursor]()
@@ -907,47 +1044,38 @@ proc bindSubsInvokeArgs(c: var SemContext; decl: TypeDecl; buf: var TokenBuf;
 proc findObjFieldAux(c: var SemContext; t: Cursor; name: StrId; bindings: Table[SymId, Cursor]; level = 0): ObjField =
   assert t.typeKind == ObjectT
   var n = t
-  inc n # skip `(object` token
+  n = sub(n) # skip `(object` token; bound the walk, `n` is a copy
   var baseType = n
   skip n, SkipType # skip basetype
   var iter = initObjFieldIter()
   var fieldPos = 0 # declaration index of the current field within this level
   while nextField(iter, n):
     let isGuarded = n.substructureKind == GfldU
-    inc n # skip FldU/GfldU
-    if n.kind == SymbolDef and sameIdent(n.symId, name):
-      let symId = n.symId
-      inc n # skip name
-      let exported = n.kind != DotToken
-      skip n, SkipExport # export marker
-      skip n, SkipPragmas # pragmas
-      var typ = n
+    let field = takeLocal(n, SkipFinalParRi)
+    if field.name.isSymbolDef and sameIdent(field.name.symId, name):
+      var typ = field.typ
       if bindings.len != 0:
         # fields in generic type AST contain generic params of the type
         # for invoked object types, bindings are built from the given arguments
         # and the field type is instantiated based on them here
         typ = instantiateType(c, typ, bindings)
-      return ObjField(sym: symId, level: level, pos: fieldPos, typ: typ, exported: exported, guarded: isGuarded, rootOwner: SymId(0))
-    skip n, SkipName # skip name
-    skip n, SkipExport # skip export marker
-    skip n, SkipPragmas # skip pragmas
-    skip n, SkipType # type
-    skip n, SkipValue # value
-    skipParRi n
+      return ObjField(sym: field.name.symId, level: level, pos: fieldPos, typ: typ,
+                      exported: not field.exported.isDotToken,
+                      guarded: isGuarded, rootOwner: SymId(0))
     inc fieldPos
-  if baseType.kind == DotToken:
+  if baseType.isDotToken:
     result = ObjField(level: -1)
   else:
     if baseType.typeKind in {RefT, PtrT}:
       inc baseType
     let baseInvokeArgs = skipInvoke(baseType)
-    if baseType.kind == Symbol:
+    if baseType.isSymbol:
       let decl = getTypeSection(baseType.symId)
       if decl.kind != TypeY:
         error "invalid parent object type", baseType
       let objType = decl.objBody
       # build bindings for parent type:
-      var newBindingBuf = default(TokenBuf)
+      var newBindingBuf = initTokenBuf()
       let newBindings = bindSubsInvokeArgs(c, decl, newBindingBuf, bindings, baseInvokeArgs)
       result = findObjFieldAux(c, objType, name, newBindings, level+1)
       if result.level == level+1:
@@ -956,16 +1084,58 @@ proc findObjFieldAux(c: var SemContext; t: Cursor; name: StrId; bindings: Table[
       # maybe error
       result = ObjField(level: -1)
 
+proc visibilityModule(c: SemContext; info: NifLineInfo): string =
+  ## The module the code at `info` was WRITTEN in — what private field
+  ## visibility is judged against.
+  ##
+  ## Inside an expansion the tree mixes two provenances: the expanded routine's
+  ## body (which came from `frame.file`) and the call-site arguments
+  ## substituted into it (which did not). Only the former belongs to the
+  ## expanded routine's module; an argument is the caller's own code and stays
+  ## judged against the module being compiled. Walking outwards handles
+  ## expansions nested inside expansions.
+  ##
+  ## Comparing `FileId`s is enough unless `--inlineframes:on` forged some
+  ## filenames: a forged name is interned under its own `FileId`, so an
+  ## expansion's tokens would stop matching the owner's raw id. Only then is
+  ## the comparison lifted to the *real* file (see `comesfrom`), which costs a
+  ## string compare per frame and is why the id path stays.
+  result = c.thisModuleSuffix
+  if c.visOwner.len > 0 and info.file.isValid:
+    if not c.g.config.inlineFrames:
+      var i = c.visOwner.len - 1
+      while i >= 0:
+        if c.visOwner[i].file == info.file.uint32:
+          result = c.visOwner[i].module
+          break
+        dec i
+    else:
+      let infoFile = realFile(pool.filenames[info.file])
+      var i = c.visOwner.len - 1
+      while i >= 0:
+        let ownerId = FileId(c.visOwner[i].file)
+        if ownerId.isValid and realFile(pool.filenames[ownerId]) == infoFile:
+          result = c.visOwner[i].module
+          break
+        dec i
+
 proc findObjFieldConsiderVis(c: var SemContext; decl: TypeDecl; name: StrId;
                               bindings: Table[SymId, Cursor];
-                              bypassVis = false): ObjField =
+                              info: NifLineInfo;
+                              bypassVis = false;
+                              tokenModule = ""): ObjField =
+  ## `tokenModule` is the module named by the input's access token, if it
+  ## carried one: the module that access was written in, which is what its
+  ## visibility must be judged against no matter where it is re-checked.
   let impl = decl.objBody
   result = findObjFieldAux(c, impl, name, bindings)
-  if c.routine.inInst == 0 and not bypassVis:
-    # only check visibility during first semcheck, unless the input NIF
-    # already carried an access-token proving the access was hygiene-checked
-    # at a site that had visibility (e.g. a template body semchecked in the
-    # field's owner module).
+  if not bypassVis or (tokenModule.len > 0 and tokenModule != AlreadyChecked):
+    # Two things bypass the check outright: an object constructor whose field
+    # is already a resolved Symbol (an earlier pass validated it and there is
+    # no module to compare against), and the `AlreadyChecked` token, which
+    # `exprexec` stamps because its sub-compile runs under a synthesized module
+    # suffix that cannot match any real one. A token naming a real module is
+    # not a bypass: it says which module to judge against.
     if result.level == 0:
       result.rootOwner = genericRootSym(decl)
     if result.level >= 0:
@@ -978,15 +1148,24 @@ proc findObjFieldConsiderVis(c: var SemContext; decl: TypeDecl; name: StrId;
         if owner == SymId(0):
           visible = true
         else:
-          let ownerModule = extractModule(pool.syms[owner])
-          visible = ownerModule == "" or ownerModule == c.thisModuleSuffix
+          # Judge against the module this code was WRITTEN in, not the module
+          # being compiled: a template/macro body or a `{.untyped.}` generic
+          # body reaches sem in the consumer's module but belongs to its own.
+          # `c.routine.inInst` used to disable the check here instead, which
+          # also disabled it for `untyped` template arguments semchecked for
+          # the first time at a call site that cannot see the field (#1988).
+          let visMod =
+            if tokenModule.len > 0: tokenModule
+            else: visibilityModule(c, info)
+          let ownerModule = pool.symModule(owner)
+          visible = ownerModule == "" or ownerModule == visMod
       if not visible:
         # treat as undeclared
         result = ObjField(level: -1)
   elif bypassVis and result.level == 0:
     result.rootOwner = genericRootSym(decl)
 
-proc semQualifiedIdent(c: var SemContext; dest: var TokenBuf; module: SymId; ident: StrId; info: PackedLineInfo): Sym =
+proc semQualifiedIdent(c: var SemContext; dest: var TokenBuf; module: SymId; ident: StrId; info: NifLineInfo): Sym =
   # mirrors semIdent
   let insertPos = dest.len
   let count =
@@ -995,14 +1174,29 @@ proc semQualifiedIdent(c: var SemContext; dest: var TokenBuf; module: SymId; ide
     else:
       buildSymChoiceForForeignModule(c, dest, module, ident, info)
   if count == 1:
-    let sym = dest[insertPos+1].symId
+    # Read the single candidate back out, then roll the choice away and write
+    # a plain sym use in its place. The two cursors have to be RELEASED before
+    # the `shrink`: each holds an rc ref on `dest`'s CursorOwner, and
+    # `prepareMutation` then takes its copying branch and duplicates the whole
+    # buffer instead of the no-copy detach — the same trap `commonType` above
+    # spells out. This is by far the hottest instance of it: every identifier
+    # that resolves to exactly one symbol goes through here, and on `sem.nim`
+    # that was 41,385 whole-buffer copies, 3.96 GB of `memcpy`, 28 % of
+    # nimsem's instructions.
+    var choice = readonlyCursorAt(dest, insertPos)
+    var only = childCursor(choice)
+    let sym = only.symId
+    endRead only
+    endRead choice
+    expectUnique dest
     dest.shrink insertPos
-    dest.add symToken(sym, info)
+    dest.addSymUse(sym, info)
     result = fetchSym(c, sym)
   else:
     result = Sym(kind: if count == 0: NoSym else: CchoiceY)
 
-proc semExprSym(c: var SemContext; dest: var TokenBuf; it: var Item; s: Sym; start: int; flags: set[SemFlag])
+proc semExprSym(c: var SemContext; dest: var TokenBuf; it: var Item; s: Sym; start: int;
+                flags: set[SemFlag]; nearestIsUnique = false)
 
 proc findEnumField(decl: EnumDecl; name: StrId): SymId =
   result = SymId(0)
@@ -1014,14 +1208,16 @@ proc findEnumField(decl: EnumDecl; name: StrId): SymId =
     while f.hasMore:
       let field = takeLocal(f, SkipFinalParRi)
       let symId = field.name.symId
-      var isGlobal = false
-      let basename = extractBasename(pool.syms[symId], isGlobal)
+      let basename = pool.symBasename(symId)
       let strId = pool.strings.getOrIncl(basename)
       if name == strId:
         return symId
 
 proc tryBuiltinDot(c: var SemContext; dest: var TokenBuf; it: var Item; lhs: Item; fieldName: StrId;
-                   info: PackedLineInfo; flags: set[SemFlag]): DotExprState =
+                   info: NifLineInfo; flags: set[SemFlag];
+                   accessToken = ""): DotExprState =
+  ## `accessToken` is the module named by the input `(dot …)`'s access token,
+  ## or "" when it carried none.
   let exprStart = dest.len
   let expected = it.typ
   dest.addParLe(DotX, info)
@@ -1038,16 +1234,25 @@ proc tryBuiltinDot(c: var SemContext; dest: var TokenBuf; it: var Item; lhs: Ite
       result = MatchedDotSym
       dest.shrink exprStart
       let s = semQualifiedIdent(c, dest, moduleSym, fieldName, info)
+      if s.kind == NoSym:
+        # A module qualifier has no UFCS fallback, so a miss is a hard failure
+        # and every caller gets to say "undeclared identifier in module".
+        # `AllowUndeclared` (how `a.b(x)` stays open for `b(a, x)`) must not
+        # suppress it: leaving the bare identifier behind made overload
+        # resolution fail later with no name left to report, i.e. the
+        # "undeclared identifier: ''" of nim-lang/nimony#2308.
+        dest.shrink exprStart
+        return FailedDot
       semExprSym c, dest, it, s, exprStart, flags
       return
-    let t = skipModifier(lhs.typ)
+    let t = skipModifierAndOwned(lhs.typ)
     var root = t
     var doDeref = false # maybe arbitrary number of derefs for compat mode
     if root.typeKind in {RefT, PtrT}:
       doDeref = true
       inc root
     let invokeArgs = skipInvoke(root)
-    if root.kind == Symbol:
+    if root.isSymbol:
       let decl = getTypeSection(root.symId)
       if decl.kind == TypeY:
         var objType = decl.body
@@ -1058,36 +1263,43 @@ proc tryBuiltinDot(c: var SemContext; dest: var TokenBuf; it: var Item; lhs: Ite
         if objType.typeKind == ObjectT:
           # build bindings for invoked object type to get proper field type:
           let bindings = bindInvokeArgs(decl, invokeArgs)
-          let field = findObjFieldConsiderVis(c, decl, fieldName, bindings,
-                                              bypassVis = BypassFieldVis in flags)
+          let field = findObjFieldConsiderVis(c, decl, fieldName, bindings, info,
+                                              bypassVis = BypassFieldVis in flags,
+                                              tokenModule = accessToken)
           if field.level >= 0 and field.guarded and c.inUncheckedAccess == 0 and
               BypassGuardedCheck notin flags:
             dest.shrink exprStart
             c.buildErr dest, info,
               "field '" & pool.strings[fieldName] & "' can only be accessed in a pattern matching `case` branch"
-            result = InvalidDot
+            # the open DotX was shrunk away; don't fall through to its close
+            return InvalidDot
           elif field.level >= 0:
             result = MatchedDotField
             if doDeref:
-              dest[exprStart] = parLeToken(DdotX, info)
-            dest.add symToken(field.sym, info)
-            dest.add intToken(pool.integers.getOrIncl(field.level), info)
+              dest.retagAt(exprStart, DdotX, info)
+            dest.addSymUse(field.sym, info)
+            dest.addIntLit(field.level, info)
             if not field.exported:
-              # Emit the access-token string lit so later re-checks (template
-              # expansion, generic instantiation, exprexec serialization) see
-              # that this access was hygiene-checked with visibility and must
-              # be accepted even if the consumer module cannot see the field.
-              dest.addStrLit("x", info)
+              # Emit the access token: the module this access was written in.
+              # Later re-checks (template expansion, generic instantiation,
+              # exprexec serialization) happen in a different module, so they
+              # judge the access against this suffix rather than against
+              # whichever module they are running in. Never replace a token
+              # that is already there: it records the original authorization.
+              let token =
+                if accessToken.len > 0: accessToken
+                else: visibilityModule(c, info)
+              dest.addStrLit(token, info)
             it.typ = field.typ # will be fit later with commonType
             it.kind = FldY
           else:
-            dest.add identToken(fieldName, info)
+            dest.addIdent(fieldName, info)
         else:
           # typevars reach here, maybe return untyped state
           # though probably better to fail if this is a call, i.e. `x.int`
-          dest.add identToken(fieldName, info)
+          dest.addIdent(fieldName, info)
       else:
-        dest.add identToken(fieldName, info)
+        dest.addIdent(fieldName, info)
     elif t.typeKind == TupleT:
       var tup = t
       var i = 0
@@ -1097,7 +1309,7 @@ proc tryBuiltinDot(c: var SemContext; dest: var TokenBuf; it: var Item; lhs: Ite
           if field.kind == KvU:
             let name = takeIdent(field.name)
             if name == fieldName:
-              dest[exprStart] = parLeToken(TupatX, info)
+              dest.retagAt(exprStart, TupatX, info)
               dest.addIntLit(i, info)
               it.typ = field.typ # will be fit later with commonType
               result = MatchedDotField
@@ -1106,12 +1318,12 @@ proc tryBuiltinDot(c: var SemContext; dest: var TokenBuf; it: var Item; lhs: Ite
           skip tup
           inc i
       if result != MatchedDotField:
-        dest.add identToken(fieldName, info)
-        dest.add intToken(pool.integers.getOrIncl(0), info)
+        dest.addIdent(fieldName, info)
+        dest.addIntLit(0, info)
     elif t.typeKind == TypedescT:
       var tval = t
       inc tval
-      if tval.kind == Symbol:
+      if tval.isSymbol:
         let decl = getTypeSection(tval.symId)
         if decl.kind == TypeY:
           tval = decl.body
@@ -1121,16 +1333,16 @@ proc tryBuiltinDot(c: var SemContext; dest: var TokenBuf; it: var Item; lhs: Ite
         if field != SymId(0):
           result = MatchedDotSym
           dest.shrink exprStart
-          dest.add symToken(field, info)
+          dest.addSymUse(field, info)
           let s = Sym(kind: EfldY, name: field, pos: ImportedPos) # placeholder pos
           semExprSym c, dest, it, s, exprStart, flags
           return
         else:
-          dest.add identToken(fieldName, info)
+          dest.addIdent(fieldName, info)
       else:
-        dest.add identToken(fieldName, info)
+        dest.addIdent(fieldName, info)
     else:
-      dest.add identToken(fieldName, info)
+      dest.addIdent(fieldName, info)
   dest.addParRi()
   if result == MatchedDotField:
     commonType c, dest, it, exprStart, expected
@@ -1140,7 +1352,8 @@ proc semDot(c: var SemContext; dest: var TokenBuf, it: var Item; flags: set[SemF
   let info = it.n.info
   let expected = it.typ
   # read through the dot expression first:
-  inc it.n # skip tag
+  let dotStart = it.n
+  it.n = sub(it.n) # skip tag
   var lhsBuf = createTokenBuf(4)
   var lhs = Item(n: it.n, typ: c.types.autoType)
   semExpr c, lhsBuf, lhs, {AllowModuleSym}
@@ -1149,19 +1362,21 @@ proc semDot(c: var SemContext; dest: var TokenBuf, it: var Item; flags: set[SemF
   let fieldNameCursor = it.n
   let fieldName = takeIdent(it.n)
   # skip optional inheritance depth:
-  if it.n.kind == IntLit:
+  if it.n.isIntLit:
     inc it.n
-  # optional access-token StringLit — `"x"` — certifies this dot expression
-  # was already type-checked with visibility in the field's owner module.
+  # optional access-token StrLit: the module this dot expression was written
+  # in, stamped when it was first type-checked with visibility.
   var innerFlags = flags
-  if fieldNameCursor.kind == Symbol:
+  var accessToken = ""
+  if fieldNameCursor.isSymbol:
     innerFlags.incl BypassGuardedCheck
-  if it.n.kind == StringLit:
+  if it.n.isStringLit:
     innerFlags.incl BypassFieldVis
+    accessToken = pool.strings[it.n.strId]
     inc it.n
-  skipParRi it.n
+  it.n = dotStart; skip it.n
   # now interpret the dot expression:
-  let state = tryBuiltinDot(c, dest, it, lhs, fieldName, info, innerFlags)
+  let state = tryBuiltinDot(c, dest, it, lhs, fieldName, info, innerFlags, accessToken)
   if state == FailedDot and dotLhsModuleSym(lhs) != SymId(0):
     dest.shrink exprStart
     c.buildErr dest, info, "undeclared identifier in module: '" & pool.strings[fieldName] & "'"
@@ -1179,78 +1394,106 @@ proc semDot(c: var SemContext; dest: var TokenBuf, it: var Item; flags: set[SemF
 
 proc semWhile(c: var SemContext; dest: var TokenBuf; it: var Item) =
   let info = it.n.info
-  takeToken dest, it.n
-  semBoolExpr c, dest, it.n
-  inc c.routine.inLoop
-  withNewScope c:
-    semStmt c, dest, it.n, true
-  dec c.routine.inLoop
-  takeParRi dest, it.n
+  takeInto dest, it.n:
+    # The condition is re-evaluated inside the loop, so a declaration in it
+    # (`while (let s = f(); s > 0)`) is a loop local, never a global (#2794).
+    withNewScope c:
+      semBoolExpr c, dest, it.n
+      inc c.routine.inLoop
+      c.routine.breakTargets.add SymId(0)
+      withNewScope c:
+        semStmt c, dest, it.n, true
+      discard c.routine.breakTargets.pop()
+      dec c.routine.inLoop
   producesVoid c, dest, info, it.typ
 
 proc semBlock(c: var SemContext; dest: var TokenBuf; it: var Item) =
   let info = it.n.info
-  takeToken dest, it.n
+  takeInto dest, it.n:
+    inc c.routine.inBlock
+    let anonBreaks = AnonBlockBreaksFeature in c.features
+    withNewScope c:
+      if it.n.isDotToken and not anonBreaks:
+        takeTree dest, it.n
+      else:
+        # Under `anonBlockBreaks` an unlabeled `break` can leave this block, so
+        # an anonymous one gets a label nobody can spell for it to name.
+        var anonLabel = createTokenBuf(1)
+        var label = it.n
+        if label.isDotToken:
+          anonLabel.addIdent "`blk", label.info
+          label = beginRead(anonLabel)
+        let delayed = handleSymDef(c, dest, label, BlockY)
+        c.addSym dest, delayed
+        # A label that is already a symbol (a re-checked or template-expanded
+        # block) is not in scope, so `break` finds it through this entry: it
+        # has to be a `(block :label (stmts))` for its kind to be `BlockY` (#2640).
+        var decl = createTokenBuf(3)
+        decl.buildTree BlockS, delayed.info:
+          decl.addSymDef delayed.s.name, delayed.info
+          decl.buildTree StmtsS, delayed.info: discard # the body is not part of the entry
+        programs.publish delayed.s.name, decl, c.phase
+        skip it.n # the label (or the dot it replaced)
+        if anonBreaks: c.routine.breakTargets.add delayed.s.name
 
-  inc c.routine.inBlock
-  withNewScope c:
-    if it.n.kind == DotToken:
-      takeToken dest, it.n
-    else:
-      let declStart = dest.len
-      let delayed = handleSymDef(c, dest, it.n, BlockY)
-      c.addSym dest, delayed
-      publish c, dest, delayed.s.name, declStart
-
-    semStmtBranch c, dest, it, true
-  dec c.routine.inBlock
-
-  takeParRi dest, it.n
+      semStmtBranch c, dest, it, true
+      if anonBreaks: discard c.routine.breakTargets.pop()
+    dec c.routine.inBlock
   if typeKind(it.typ) == AutoT:
     producesVoid c, dest, info, it.typ
 
 proc semBreak(c: var SemContext; dest: var TokenBuf; it: var Item) =
   let info = it.n.info
-  takeToken dest, it.n
-  if c.routine.inLoop+c.routine.inBlock == 0:
-    buildErr c, dest, info, "`break` only possible within a `while` or `block` statement"
-    skip it.n
-  else:
-    if it.n.kind == DotToken:
-      wantDot c, dest, it.n
+  takeInto dest, it.n:
+    if c.routine.inLoop+c.routine.inBlock == 0:
+      buildErr c, dest, info, "`break` only possible within a loop or a `block` statement"
+      skip it.n
     else:
-      let labelInfo = it.n.info
-      var a = Item(n: it.n, typ: c.types.autoType)
-      semExpr(c, dest, a)
-      if a.kind != BlockY:
-        buildErr c, dest, labelInfo, "`break` needs a block label"
-      it.n = a.n
-  takeParRi dest, it.n
+      if it.n.isDotToken:
+        # An unlabeled `break` leaves the innermost loop; the Final IR reads
+        # `(break .)` that way. Under `anonBlockBreaks` the innermost `block`
+        # may come first and is then named explicitly.
+        let targets = addr c.routine.breakTargets
+        if targets[].len > 0 and targets[][^1] != SymId(0):
+          dest.addSymUse targets[][^1], it.n.info
+          inc it.n
+        elif c.routine.inLoop > 0:
+          wantDot c, dest, it.n
+        else:
+          buildErr c, dest, info,
+            "`break` without a label only leaves a loop; to leave a `block`, name it and use `break <name>`"
+          skip it.n
+      else:
+        let labelInfo = it.n.info
+        var a = Item(n: it.n, typ: c.types.autoType)
+        semExpr(c, dest, a)
+        if a.kind != BlockY:
+          buildErr c, dest, labelInfo, "`break` needs a block label"
+        it.n = a.n
   producesNoReturn c, dest, info, it.typ
 
 proc semContinue(c: var SemContext; dest: var TokenBuf; it: var Item) =
   let info = it.n.info
-  takeToken dest, it.n
-  if c.routine.inLoop == 0:
-    buildErr c, dest, info, "`continue` only possible within a loop"
-  else:
-    wantDot c, dest, it.n
-  takeParRi dest, it.n
+  takeInto dest, it.n:
+    if c.routine.inLoop == 0:
+      buildErr c, dest, info, "`continue` only possible within a loop"
+    else:
+      wantDot c, dest, it.n
   producesNoReturn c, dest, info, it.typ
 
 proc handleExportMarker(c: var SemContext; dest: var TokenBuf; n: var Cursor): bool =
   result = false
-  if n.kind == DotToken:
-    dest.add n
+  if n.isDotToken:
+    dest.addSubtree n
     inc n
-  elif n.kind == Ident and pool.strings[n.litId] == "x":
+  elif n.isIdent and pool.strings[n.strId] == "x":
     if c.currentScope.kind != ToplevelScope:
       buildErr c, dest, n.info, "only toplevel declarations can be exported"
     else:
       result = true
-      dest.add n
+      dest.addSubtree n
     inc n
-  elif n.kind == ParLe:
+  elif n.isTagLit:
     # export marker could have been turned into a NIF tag
     takeTree dest, n
     result = true
@@ -1277,13 +1520,31 @@ proc patchType(c: var SemContext; dest: var TokenBuf; typ: TypeCursor; patchPosi
   if oldInfo.isValid and dest[patchPosition].info != oldInfo:
     dest[patchPosition] = withLineInfo(dest[patchPosition], oldInfo)
 
-proc semIdentImpl(c: var SemContext; dest: var TokenBuf; n: var Cursor; ident: StrId; flags: set[SemFlag]): Sym =
+proc uniqueTypeCandidate(c: var SemContext; dest: var TokenBuf; choiceAt: int): SymId =
+  ## The one type in the symbol choice at `choiceAt`, or `SymId(0)` if there are
+  ## none or several.
+  result = SymId(0)
+  var types = 0
+  var choice = readonlyCursorAt(dest, choiceAt)
+  var a = choice.childCursor
+  while a.hasMore:
+    if a.isSymbol and fetchSym(c, a.symId).kind in {TypeY, TypevarY}:
+      result = a.symId
+      inc types
+    inc a
+  endRead a
+  endRead choice
+  if types != 1: result = SymId(0)
+
+proc semIdentImpl(c: var SemContext; dest: var TokenBuf; n: var Cursor; ident: StrId;
+                  flags: set[SemFlag]; nearestIsUnique: var bool): Sym =
   let mode =
     if AllowOverloads in flags: FindOverloads
     else: InnerMost
   let insertPos = dest.len
-  let info = n.info
-  var count = buildSymChoice(c, dest, ident, info, mode)
+  let info = n.endInfo # `semQuoted` calls this with `n` already past the
+                       # quoted subtree, possibly at a scope's end
+  var count = buildSymChoice(c, dest, ident, info, mode, nearestIsUnique)
   if count == 0 and c.deferredLocals.hasKey(ident):
     # On-demand resolution (nim-lang/nimony#1974): a signature-phase `when`
     # condition referenced a toplevel let/var that is otherwise deferred to
@@ -1293,52 +1554,122 @@ proc semIdentImpl(c: var SemContext; dest: var TokenBuf; n: var Cursor; ident: S
     # just its signature now, then retry the lookup.
     dest.shrink insertPos
     discard resolveDeferredLocal(c, ident)
-    count = buildSymChoice(c, dest, ident, info, mode)
+    count = buildSymChoice(c, dest, ident, info, mode, nearestIsUnique)
+  if count > 1 and PreferTypes in flags:
+    # In a type position only a type can stand, so its one type candidate is
+    # what the name means, as in Nim: nifcore's enum field `NifKind.Symbol`
+    # next to a type `Symbol` of another module is no ambiguity there.
+    let typeSym = uniqueTypeCandidate(c, dest, insertPos)
+    if typeSym != SymId(0):
+      expectUnique dest
+      dest.shrink insertPos
+      dest.addSymUse(typeSym, info)
+      return fetchSym(c, typeSym)
   if count == 1:
-    let sym = dest[insertPos+1].symId
+    # Read the single candidate back out, then roll the choice away and write
+    # a plain sym use in its place. The two cursors have to be RELEASED before
+    # the `shrink`: each holds an rc ref on `dest`'s CursorOwner, and
+    # `prepareMutation` then takes its copying branch and duplicates the whole
+    # buffer instead of the no-copy detach — the same trap `commonType` above
+    # spells out. This is by far the hottest instance of it: every identifier
+    # that resolves to exactly one symbol goes through here, and on `sem.nim`
+    # that was 41,385 whole-buffer copies, 3.96 GB of `memcpy`, 28 % of
+    # nimsem's instructions.
+    var choice = readonlyCursorAt(dest, insertPos)
+    var only = childCursor(choice)
+    let sym = only.symId
+    endRead only
+    endRead choice
+    expectUnique dest
     dest.shrink insertPos
-    dest.add symToken(sym, info)
+    dest.addSymUse(sym, info)
     result = fetchSym(c, sym)
   else:
     result = Sym(kind: if count == 0: NoSym else: CchoiceY)
 
+proc semIdentImpl(c: var SemContext; dest: var TokenBuf; n: var Cursor; ident: StrId;
+                  flags: set[SemFlag]): Sym =
+  var nearestIsUnique = false
+  result = semIdentImpl(c, dest, n, ident, flags, nearestIsUnique)
+
 proc semIdent(c: var SemContext; dest: var TokenBuf; n: var Cursor; flags: set[SemFlag]): Sym =
-  result = semIdentImpl(c, dest, n, n.litId, flags)
+  result = semIdentImpl(c, dest, n, n.strId, flags)
   inc n
 
-proc semQuoted(c: var SemContext; dest: var TokenBuf; n: var Cursor; flags: set[SemFlag]): Sym =
+proc semQuoted(c: var SemContext; dest: var TokenBuf; n: var Cursor; flags: set[SemFlag];
+               nearestIsUnique: var bool): Sym =
   let nameId = takeUnquoted(n)
-  result = semIdentImpl(c, dest, n, nameId, flags)
+  result = semIdentImpl(c, dest, n, nameId, flags, nearestIsUnique)
 
-proc maybeInlineMagic(c: var SemContext; dest: var TokenBuf; res: LoadResult) =
+proc semQuoted(c: var SemContext; dest: var TokenBuf; n: var Cursor; flags: set[SemFlag]): Sym =
+  var nearestIsUnique = false
+  result = semQuoted(c, dest, n, flags, nearestIsUnique)
+
+proc addWithInfoRewrite(dest: var TokenBuf; n: var Cursor; info: NifLineInfo) =
+  ## Copies the tree/token at `n`, rewriting every token's line info to
+  ## `info`. Structure-aware, so the (possibly elided) closes stay balanced.
+  if n.isTagLit:
+    dest.addParLe(n.cursorTagId, info)
+    n.into:
+      while n.hasMore:
+        addWithInfoRewrite(dest, n, info)
+      dest.addParRi(info)
+  else:
+    dest.add n.load
+    inc n
+
+proc maybeInlineMagic(c: var SemContext; dest: var TokenBuf; res: LoadResult): bool {.discardable.} =
+  ## Returns true when the trailing symbol was replaced with a magic's tree.
+  ## Callers must not infer this from `dest.len` growth: an empty magic such
+  ## as `(cstring)` occupies exactly one token under `-d:virtualParRi`, the
+  ## same as the symbol it replaces.
+  result = false
   if res.status == LacksNothing:
     var n = res.decl
     inc n # skip the symbol kind
-    if n.kind == SymbolDef:
+    if n.isSymbolDef:
       inc n # skip the SymbolDef
-      if n.kind == ParLe:
+      if n.isTagLit:
+        result = true
         # ^ export marker position has a `(`? If so, it is a magic!
-        let info = dest[dest.len-1].info
-        var tag = n.tagId
+        # The trailing symbol occupies its token PLUS any line-info suffix:
+        # find the atom's head so the whole atom is replaced.
+        var atomStart = dest.len-1
+        # Raw token reads for the scan: `readonlyCursorAt` mints a CursorOwner
+        # header for the buffer, and a cursor still holding a ref at the
+        # `shrink` below turns it into a full copy of `dest`. The line info is
+        # the one thing a bare `NifToken` cannot answer, so that read keeps a
+        # cursor — and releases it before the mutation.
+        while dest[atomStart].kind in {ExtendedSuffix, LineInfoLit}:
+          dec atomStart
+        var atom = readonlyCursorAt(dest, atomStart)
+        let info = atom.info
+        endRead atom
+        var tag = n.cursorTagId
         if cast[TagEnum](tag) == IsmainmoduleTagId:
+          c.queriedIsMain = true
           if IsMain in c.moduleFlags:
             tag = TagId(TrueTagId)
           else:
             tag = TagId(FalseTagId)
-        dest[dest.len-1] = parLeToken(tag, info)
-        inc n
-        while true:
-          dest.add withLineInfo(n.load, info)
-          if n.kind == ParRi: break
-          inc n
+        # Replace the trailing symbol with a properly registered open tag —
+        # an in-place `dest.retagAt(i, ...)` would bypass the open-tags
+        # bookkeeping and misseal every enclosing scope.
+        expectUnique dest
+        dest.shrink atomStart
+        dest.addParLe(tag, info)
+        n.into:
+          while n.hasMore:
+            addWithInfoRewrite(dest, n, info)
+          dest.addParRi(info)
 
-proc exprToType(c: var SemContext; dest: var TokenBuf; exprType: Cursor; start: int; context: TypeDeclContext; info: PackedLineInfo) =
+proc exprToType(c: var SemContext; dest: var TokenBuf; exprType: Cursor; start: int; context: TypeDeclContext; info: NifLineInfo) =
   case exprType.typeKind
   of TypedescT:
     dest.shrink start
     var base = exprType
-    inc base
-    if base.kind == ParRi:
+    base = sub(base)
+    if not base.hasMore:
       # A bare `typedesc` carrying no concrete base type, e.g. a `T: typedesc`
       # parameter used as a type (`proc f(T: typedesc): Box[T]`). nimony has no
       # implicit-generic `typedesc` params, so there is nothing to inline here.
@@ -1351,15 +1682,15 @@ proc exprToType(c: var SemContext; dest: var TokenBuf; exprType: Cursor; start: 
     discard
   of NoType, AtT, AndT, OrT, NotT, ProcT, FuncT, IteratorT, ConverterT, MethodT, MacroT, TemplateT,
      ObjectT, EnumT, ProctypeT, IT, UT, FT, CT, BoolT, VoidT, PtrT, ArrayT, VarargsT,
-     StaticT, TupleT, OnumT, AnumT, RefT, MutT, OutT, LentT, SinkT, NiltT, ConceptT,
+     StaticT, TupleT, ClosureTupleT, OnumT, AnumT, RefT, MutT, OutT, LentT, SinkT, OwnedT, NiltT, ConceptT,
      DistinctT, ItertypeT, RangetypeT, UarrayT, SetT, SymkindT, TypekindT, UntypedT, TypedT,
-     CstringT, PointerT, OrdinalT:
+     CstringT, PointerT, OrdinalT, PluginCallT:
     # otherwise, is a static value
     if context != AllowValues:
       dest.shrink start
       c.buildErr dest, info, "not a type"
 
-proc semTypeExpr(c: var SemContext; dest: var TokenBuf; n: var Cursor; context: TypeDeclContext; info: PackedLineInfo) =
+proc semTypeExpr(c: var SemContext; dest: var TokenBuf; n: var Cursor; context: TypeDeclContext; info: NifLineInfo) =
   # expression needs to be fully evaluated, switch to body phase
   var phase = SemcheckBodies
   swap c.phase, phase
@@ -1367,25 +1698,28 @@ proc semTypeExpr(c: var SemContext; dest: var TokenBuf; n: var Cursor; context: 
   var it = Item(n: n, typ: c.types.autoType)
   semExpr c, dest, it
   n = it.n
+  if context == AllowValues:
+    let emitted = cursorAt(dest, start)
+    if emitted.exprKind == ExprX and isPureTypeValueExpr(emitted):
+      var buf = createTokenBuf(4)
+      buf.addSubtree typeValueExpr(emitted)
+      dest.replace cursorAt(buf, 0), start
   exprToType c, dest, it.typ, start, context, info
   swap c.phase, phase
 
-proc semTypeSym(c: var SemContext; dest: var TokenBuf; s: Sym; info: PackedLineInfo; start: int; context: TypeDeclContext) =
+proc semTypeSym(c: var SemContext; dest: var TokenBuf; s: Sym; info: NifLineInfo; start: int; context: TypeDeclContext) =
   if s.kind in {TypeY, TypevarY}:
     let res = tryLoadSym(s.name)
-    let beforeMagic = dest.len
-    maybeInlineMagic c, dest, res
-    let afterMagic = dest.len
+    let wasMagic = maybeInlineMagic(c, dest, res)
     if s.kind == TypevarY:
       # likely was not magic
       # maybe substitution performed here?
       inc c.usedTypevars
-    elif beforeMagic != afterMagic:
+    elif wasMagic:
       c.expanded.addSymUse s.name, info
       # was magic symbol, may be typeclass, otherwise nothing to do
       if context != InInvokeHead:
         let magic = cursorAt(dest, start).typeKind
-        endRead(dest)
         # magic types that are just symbols and not in the syntax:
         if magic in {ArrayT, SetT, RangetypeT, EnumT, HoleyEnumT, AnumT}:
           var typeclassBuf = createTokenBuf(4)
@@ -1401,7 +1735,7 @@ proc semTypeSym(c: var SemContext; dest: var TokenBuf; s: Sym; info: PackedLineI
           # `(cstring)` and a `(cstring (unchecked))` are structurally distinct
           # and fragment generic instances (e.g. `seq[cstring]`) into
           # incompatible C structs.
-          dest.shrink dest.len - 1 # remove ParRi
+          dest.reopenLastTree start # reopen to append the annotation
           if LenientNilsFeature notin c.features:
             dest.addParPair NotnilU, info
           else:
@@ -1416,23 +1750,28 @@ proc semTypeSym(c: var SemContext; dest: var TokenBuf; s: Sym; info: PackedLineI
         if p != default(Cursor):
           var path = StrId(0)
           var pathInfo = p.info
-          if p.kind == StringLit:
-            path = p.litId
+          if p.isStringLit:
+            path = p.strId
             pathInfo = p.info
           if path != StrId(0) and path notin c.pluginBlacklist:
             c.pendingTypePlugins[s.name] = PluginObj(path: path, info: pathInfo)
+      elif s.name in c.typesInProgress:
+        dest.shrink lastValueStart(dest)
+        c.buildErr dest, typ.name.info, "illegal recursion in type '" & pool.symBasename(s.name) & "'"
       else:
         # remove symbol, inline type:
-        dest.shrink dest.len-1
+        dest.shrink lastValueStart(dest)
         var t = typ.body
+        c.typesInProgress.add s.name
         semLocalTypeImpl c, dest, t, context
+        discard c.typesInProgress.pop()
   else:
     # non type symbol, treat as expression
     # mirror semTypeExpr but just call semExprSym
     var phase = SemcheckBodies
     swap c.phase, phase
     var dummyBuf = createTokenBuf(1)
-    dummyBuf.add dotToken(info)
+    dummyBuf.addDotToken(info)
     var it = Item(n: cursorAt(dummyBuf, 0), typ: c.types.autoType)
     semExprSym c, dest, it, s, start, {}
     exprToType c, dest, it.typ, start, context, info
@@ -1450,7 +1789,8 @@ type
     isExported: bool
     isAnum: bool
     guarded: bool # true when inside a case with DotToken selector (sum type)
-    ownerSym: SymId
+    ownerSym: SymId # the type a sum type constructor must produce: for
+                    # `type T = ref object` that is `T`, not the split-off `T.Obj`
 
 proc semWhenImpl(c: var SemContext; dest: var TokenBuf; it: var Item; mode: WhenMode;
                  state: var SemObjectState)
@@ -1466,7 +1806,7 @@ proc semExprMissingPhases(c: var SemContext; dest: var TokenBuf; it: var Item; f
   # Only consider "real" phases, not InProgress markers
   const realPhases = [SemcheckTopLevelSyms, SemcheckSignatures, SemcheckBodies]
   if c.phase <= firstPhase:
-    var lastBuf = default(TokenBuf)
+    var lastBuf = initTokenBuf()
     var usingBuf = false
     for ph in realPhases:
       if ph >= c.phase:
@@ -1494,47 +1834,85 @@ proc semExprMissingPhases(c: var SemContext; dest: var TokenBuf; it: var Item; f
   else:
     semExpr c, dest, it
 
-proc addVarargsParameter(c: var SemContext; dest: var TokenBuf; paramsAt: int; info: PackedLineInfo) =
+proc addImpliedClosurePragma(c: var SemContext; dest: var TokenBuf;
+                             pragmasAt: int; info: NifLineInfo) =
+  ## Splice `(closure)` into the pragmas slot `semPragmas` just emitted at
+  ## `pragmasAt`. The enclosing routine tree must still be open: `replace` /
+  ## `insert` maintain the open-tag bookkeeping but cannot widen the sealed
+  ## jump of an enclosing scope (see `sem.addVarargsParameter`).
+  if dest[pragmasAt].kind == DotToken:
+    var tmp = createTokenBuf(4)
+    tmp.addParLe(PragmasU, info)
+    tmp.addParPair(ClosureP, info)
+    tmp.addParRi(info)
+    dest.replace cursorAt(tmp, 0), pragmasAt
+  else:
+    var closureBuf = createTokenBuf(2)
+    closureBuf.addParPair(ClosureP, info)
+    var n = cursorAt(dest, pragmasAt)
+    assert n.substructureKind == PragmasU
+    n = sub(n)
+    while n.hasMore: skip n
+    let insertPos = cursorToPosition(dest, n)
+    let before = dest.len
+    dest.insert closureBuf, insertPos
+    widenSealed(dest, pragmasAt, dest.len - before)
+
+proc addVarargsParameter(c: var SemContext; dest: var TokenBuf; paramsAt: int; info: NifLineInfo) =
+  ## The enclosing routine tree must still be open when this runs:
+  ## `insert`/`replace` maintain the open-tag bookkeeping but cannot widen
+  ## the sealed jump of an enclosing scope.
   const vanon = "vanon"
-  var varargsParam = @[
-    parLeToken(ParamY, info),
-    identToken(pool.strings.getOrIncl(vanon), info),
-    dotToken(info), # export marker
-    dotToken(info), # pragmas
-    parLeToken(VarargsT, info),
-    parRiToken(info),
-    dotToken(info), # value
-    parRiToken(info)
-  ]
+  # nifcore has no standalone open tokens: build the `(param …)` subtree as a
+  # sealed buffer via the open-tag bookkeeping.
+  var varargsParam = createTokenBuf(8)
+  varargsParam.addParLe(ParamY, info)
+  varargsParam.addIdent(pool.strings.getOrIncl(vanon), info)
+  varargsParam.addDotToken(info) # export marker
+  varargsParam.addDotToken(info) # pragmas
+  varargsParam.addParPair(VarargsT, info)
+  varargsParam.addDotToken(info) # value
+  varargsParam.addParRi()
   if dest[paramsAt].kind == DotToken:
-    dest[paramsAt] = parLeToken(ParamsU, info)
-    varargsParam.addParRi(info)
-    dest.insert fromBuffer(varargsParam), paramsAt+1
+    # build the `(params (param ...))` tree separately and replace the dot
+    # with it — an in-place TagLit assignment plus a trailing-`)` splice
+    # would bypass the open-tags bookkeeping:
+    var tmp = createTokenBuf(varargsParam.len + 2)
+    tmp.addParLe(ParamsU, info)
+    tmp.addSubtree cursorAt(varargsParam, 0)
+    tmp.addParRi(info)
+    dest.replace cursorAt(tmp, 0), paramsAt
   else:
     var n = cursorAt(dest, paramsAt)
     if n.substructureKind == ParamsU:
-      inc n
+      n = sub(n)
       while n.hasMore:
-        if n.symKind == ParamY:
-          inc n
+        if isParamLike(n.symKind):
+          let paramStart = n
+          n = sub(n)
           let lit = takeIdent(n)
           if lit != StrId(0) and pool.strings[lit] == vanon:
             # already added:
-            endRead(dest)
             return
           while n.hasMore: skip n
-          consumeParRi n
+          n = paramStart; skip n
         else:
           break
       let insertPos = cursorToPosition(dest, n)
-      endRead(dest)
-      dest.insert fromBuffer(varargsParam), insertPos
-
+      let before = dest.len
+      # NOT `insert fromBuffer(...)`: the raw array is unsealed, and the
+      # Cursor overload splices `subtreeWidth(src)` tokens of a *sealed* subtree.
+      # The openArray overload normalizes (seals + elides) first.
+      dest.insert varargsParam, insertPos
+      # the params tree is already sealed; widen its jump by the growth
+      # (no-op in classic mode where `jump` is always MaxJump):
+      widenSealed(dest, paramsAt, dest.len - before)
 include semtypes
 
 proc semTypeof(c: var SemContext; dest: var TokenBuf; it: var Item) =
   let beforeExpr = dest.len
-  inc it.n # typeof
+  let typeofStart = it.n
+  it.n = sub(it.n) # typeof
 
   let beforeMode = dest.len
   var modeArg = Item(n: it.n, typ: c.types.autoType)
@@ -1542,16 +1920,16 @@ proc semTypeof(c: var SemContext; dest: var TokenBuf; it: var Item) =
   semConstExpr c, dest, modeArg
   assert dest.len > beforeMode
   let modeTok = dest[beforeMode]
-  if modeTok.kind == ParLe and modeTok.tagId == nifstreams.ErrT:
+  if modeTok.isTagLit and modeTok.tagId == nifpools.ErrT:
     dest.insert it.n, beforeMode
     skip it.n
     skip it.n
-    takeParRi dest, it.n
+    dest.addParRi(it.n.endInfo)
+    it.n = typeofStart; skip it.n
     return
-  assert modeTok.kind == Symbol
+  assert modeTok.isSymbol
   var semFlags: set[SemFlag] = {}
-  var modeSym = pool.syms[modeTok.symId]
-  modeSym.extractBasename
+  let modeSym = pool.symBasename(readonlyCursorAt(dest, beforeMode).symId)
   case modeSym
   of "typeOfProc":
     discard
@@ -1581,17 +1959,18 @@ proc semTypeof(c: var SemContext; dest: var TokenBuf; it: var Item) =
   #echo "CAME HERE! ", typeToString(t), " ", c.phase
   #writeStackTrace()
   skip it.n # skip mode
-  skipParRi it.n
+  it.n = typeofStart; skip it.n
 
 proc semCaseOfValueImpl(c: var SemContext; dest: var TokenBuf; it: var Item; selectorType: TypeCursor;
                     seen: var seq[(xint, xint)])
 
-proc evalConstCaseBranch(c: var SemContext; dest: var TokenBuf; it: var Item; expected: TypeCursor; seen: var seq[(xint, xint)]; info: PackedLineInfo) =
+proc evalConstCaseBranch(c: var SemContext; dest: var TokenBuf; it: var Item; expected: TypeCursor; seen: var seq[(xint, xint)]; info: NifLineInfo) =
   let info = it.n.info
   var orig = it.n
 
   var ignored = createTokenBuf()
-  var valueBuf = evalConstExpr(c, ignored, it.n, c.types.autoType)
+  let autoType = c.types.autoType
+  var valueBuf = evalConstExpr(c, ignored, it.n, autoType)
 
   var value = beginRead(valueBuf)
   case value.exprKind
@@ -1613,6 +1992,7 @@ proc evalConstCaseBranch(c: var SemContext; dest: var TokenBuf; it: var Item; ex
         let b = getConstOrdinalValue(r); skip r
         if a.isNaN or b.isNaN:
           buildErr c, dest, rInfo, "expected constant ordinal value"
+          skip value   # the error path must still consume the element
         else:
           if seen.doesOverlapOrIncl(a, b):
             buildErr c, dest, rInfo, "overlapping values"
@@ -1628,34 +2008,52 @@ proc evalConstCaseBranch(c: var SemContext; dest: var TokenBuf; it: var Item; ex
             buildErr c, dest, vInfo, "value already handled"
           dest.takeTree value
   of NoExpr, ErrX, SufX, AtX, DerefX, DotX, PatX, ParX, AddrX, NilX, InfX, NeginfX, NanX,
-     FalseX, TrueX, AndX, OrX, XorX, NotX, NegX, SizeofX, AlignofX, OffsetofX, KvX, OconstrX,
-     AconstrX, BracketX, CurlyX, CurlyatX, OvfX, AddX, SubX, MulX, DivX, ModX, ShrX, ShlX,
+     FalseX, TrueX, AndX, OrX, XorX, NotX, NegX, SizeofX, CanFormCyclesX, SupportsCopyMemX, AlignofX, OffsetofX, KvX, OconstrX,
+     AconstrX, BracketX, CurlyX, CurlyatX, OvfX, AddX, SubX, SuccX, PredX, MulX, DivX, ModX, ShrX, ShlX,
      BitandX, BitorX, BitxorX, BitnotX, EqX, NeqX, LeX, LtX, CastX, ConvX, CallX, CmdX,
      CchoiceX, OchoiceX, PragmaxX, QuotedX, HderefX, DdotX, HaddrX, NewrefX, NewobjX, TupX,
      TupconstrX, TabconstrX, AshrX, BaseobjX, HconvX, DconvX, CallstrlitX, InfixX,
-     PrefixX, HcallX, CompilesX, DeclaredX, DefinedX, AstToStrX, BindSymX, BindSymNameX, InstanceofX, ProccallX, HighX,
-     LowX, TypeofX, UnpackX, FieldsX, FieldpairsX, EnumtostrX, IsmainmoduleX, DefaultobjX,
+     PrefixX, HcallX, CompilesX, StaticX, DeclaredX, DefinedX, AstToStrX, BindSymX, BindSymNameX, InstanceofX, ProccallX, HighX,
+     LowX, TypeofX, UnpackX, FieldsX, FieldpairsX, EnumtostrX, IsmainmoduleX, InstantiationinfoX, DefaultobjX,
      DefaulttupX, DefaultdistinctX, DelayX, Delay0X, SuspendX, ExprX, DoX, ArratX, TupatX,
      PlussetX, MinussetX, MulsetX, XorsetX, EqsetX, LesetX, LtsetX, InsetX, CardX, EmoveX,
      DestroyX, DupX, CopyX, WasmovedX, SinkhX, TraceX, InternalTypeNameX, InternalFieldPairsX,
-     FailedX, IsX, EnvpX, ToClosureX:
+     FailedX, IsX, EnvpX, ToClosureX, PluginCallX:
     let a = evalConstIntExpr(c, dest, orig, expected)
     if seen.containsOrIncl(a):
       buildErr c, dest, info, "value already handled"
 
 include semdecls
 
-proc semExprSym(c: var SemContext; dest: var TokenBuf; it: var Item; s: Sym; start: int; flags: set[SemFlag]) =
+proc isParameterlessRoutine(s: SymId): bool =
+  ## True when the routine `s` is non-generic and declares no value
+  ## parameters — i.e. `template t: T = ...` rather than `t(x)` or `t[T]`.
+  let res = tryLoadSym(s)
+  if res.status != LacksNothing:
+    return false
+  let routine = asRoutine(res.decl)
+  if isGeneric(routine):
+    return false
+  var params = routine.params
+  if params.substructureKind != ParamsU:
+    return true # `.` — no params slot at all
+  params = sub(params) # bounded probe: sealed decl bufs elide ParRi,
+                       # so a raw `inc` would read past an empty (params)
+  result = not params.hasMore
+
+proc semExprSym(c: var SemContext; dest: var TokenBuf; it: var Item; s: Sym; start: int;
+                flags: set[SemFlag]; nearestIsUnique = false) =
   it.kind = s.kind
   let expected = it.typ
   if s.kind == NoSym:
     if AllowUndeclared notin flags:
-      var orig = createTokenBuf(1)
-      orig.add dest[dest.len-1]
-      dest.shrink dest.len-1
+      let identStart = lastValueStart(dest)
+      var orig = createTokenBuf(2)
+      orig.addSubtree cursorAt(dest, identStart)
+      dest.shrink identStart
       let ident = cursorAt(orig, 0)
       if s.name != SymId(0):
-        c.buildErr dest, ident.info, "undeclared identifier: " & pool.syms[s.name], ident
+        c.buildErr dest, ident.info, "undeclared identifier: " & pool.symString(s.name), ident
       else:
         let s = getIdent(ident)
         if s != StrId(0):
@@ -1665,30 +2063,75 @@ proc semExprSym(c: var SemContext; dest: var TokenBuf; it: var Item; s: Sym; sta
     it.typ = c.types.autoType
   elif s.kind == CchoiceY:
     if KeepMagics notin flags and c.routine.kind != TemplateY:
-      # Try to disambiguate based on expected type (e.g., enum fields in case branches)
+      # A symbol choice is narrowed by context first and by scope distance only
+      # as a last resort; see "Identifier lookup" in doc/language.md.
+      var matchedSym = SymId(0)
       if typeKind(expected) != AutoT:
-        let choice = cursorAt(dest, start)
-        let matchedSym = tryMatchEnumChoice(choice, expected.symId)
-        endRead(dest)
-        if matchedSym != SymId(0):
-          let info = dest[start].info
-          dest.shrink start
-          dest.add symToken(matchedSym, info)
-          return
-      c.buildErr dest, dest[start].info, "ambiguous identifier"
+        # e.g. an enum field in a `case` branch, or an overloaded routine
+        # where a proc type is expected
+        matchedSym = tryNarrowChoice(addr c, cursorAt(dest, start), expected)
+      if matchedSym != SymId(0):
+        let info = readonlyCursorAt(dest, start).info
+        dest.shrink start
+        dest.addSymUse(matchedSym, info)
+        return
+      if KeepChoices in flags:
+        discard "the consumer resolves the choice against the formal parameters"
+      elif nearestIsUnique:
+        # Nothing narrowed the choice, so the nearest declaration wins: an inner
+        # scope beats an outer one and the module's own declaration beats an
+        # imported one (`Scope` is a subtype of `ImportScope`). Candidates are
+        # emitted nearest-first, so that is the first one.
+        let info = readonlyCursorAt(dest, start).info
+        let sym = childCursor(readonlyCursorAt(dest, start)).symId
+        dest.shrink start
+        dest.addSymUse(sym, info)
+        semExprSym c, dest, it, fetchSym(c, sym), start, flags
+        return
+      else:
+        # the choice goes INTO the error, as the undeclared identifier above
+        # does: an error next to it would be one child too many for whatever
+        # slot the name was in -- a parameter's default value, say, which
+        # phase 3 then walked past its end
+        var orig = createTokenBuf(4)
+        orig.addSubtree readonlyCursorAt(dest, start)
+        dest.shrink start
+        let choice = cursorAt(orig, 0)
+        c.buildErr dest, choice.info, "ambiguous identifier", choice
     it.typ = c.types.autoType
   elif s.kind == BlockY:
     it.typ = c.types.autoType
   elif s.kind in {TypeY, TypevarY}:
     let typeStart = dest.len
-    let info = dest[dest.len-1].info
+    let info = readonlyCursorAt(dest, dest.len-1).info
     dest.buildTree TypedescT, info:
       let symStart = dest.len
-      dest.add symToken(s.name, info)
+      dest.addSymUse(s.name, info)
       semTypeSym c, dest, s, info, symStart, InLocalDecl
     it.typ = typeToCursor(c, dest, typeStart)
     dest.shrink typeStart
     commonType c, dest, it, start, expected
+  elif s.kind in {TemplateY, MacroY} and AllowOverloads notin flags and
+       isParameterlessRoutine(s.name):
+    # A bare parameterless template/macro name is an implicit call: `MAGIC`
+    # means `MAGIC()`. Expand it here instead of falling through to the
+    # routine-as-value path below, which would emit the template symbol as a
+    # first-class value — but templates/macros have no runtime value and lengc
+    # has no decl to mangle for them, so codegen asserts "Symbol not found in
+    # NIF module". (`AllowOverloads` marks a callee position such as `MAGIC(x)`;
+    # there semCall drives the expansion itself and must not be pre-empted. The
+    # parameterless check leaves a generic template's base, e.g. the `foo` in
+    # `foo[float]()`, as a symbol for the AtX generic-instantiation path.)
+    let info = dest[start].info
+    dest.shrink start
+    var callBuf = createTokenBuf(4)
+    callBuf.addParLe(CallX, info)
+    callBuf.addSymUse s.name, info
+    callBuf.addParRi()
+    var call = Item(n: beginRead(callBuf), typ: expected)
+    semCall c, dest, call, flags
+    it.typ = call.typ
+    it.kind = call.kind
   else:
     if s.kind == StaticTypevarY:
       # a *value* generic parameter: it is an ordinary value whose type is the
@@ -1697,10 +2140,13 @@ proc semExprSym(c: var SemContext; dest: var TokenBuf; it: var Item; s: Sym; sta
       inc c.usedTypevars
     let res = declToCursor(c, dest, s)
     if KeepMagics notin flags:
-      let beforeMagic = dest.len
-      let info = dest[beforeMagic-1].info
-      maybeInlineMagic c, dest, res
-      if beforeMagic != dest.len:
+      # Released before `maybeInlineMagic` rewrites `dest`: a temporary cursor
+      # lives to the end of the scope, and a live one turns that rewrite into
+      # a copy of the whole buffer.
+      var last = readonlyCursorAt(dest, dest.len-1)
+      let info = last.info
+      endRead last
+      if maybeInlineMagic(c, dest, res):
         c.expanded.addSymUse s.name, info
     if res.status == LacksNothing:
       var n = res.decl
@@ -1723,13 +2169,13 @@ proc semExprSym(c: var SemContext; dest: var TokenBuf; it: var Item; s: Sym; sta
         n = beginRead(procTypeBuf)
       elif s.kind == ModuleY:
         if AllowModuleSym notin flags:
-          c.buildErr dest, dest[start].info, "module symbol '" & pool.syms[s.name] & "' not allowed in this context"
+          c.buildErr dest, readonlyCursorAt(dest, start).info, "module symbol '" & pool.symString(s.name) & "' not allowed in this context"
       else:
         assert false, "not implemented"
       it.typ = n
       commonType c, dest, it, start, expected
     else:
-      c.buildErr dest, dest[start].info, "could not load symbol: " & pool.syms[s.name] & "; errorCode: " & $res.status
+      c.buildErr dest, readonlyCursorAt(dest, start).info, "could not load symbol: " & pool.symString(s.name) & "; errorCode: " & $res.status
       it.typ = c.types.autoType
 
 proc semLocalTypeExpr(c: var SemContext; dest: var TokenBuf, it: var Item) =
@@ -1743,10 +2189,14 @@ proc semLocalTypeExpr(c: var SemContext; dest: var TokenBuf, it: var Item) =
   it.typ = typeToCursor(c, dest, start)
   dest.shrink start
 
-proc semSubscriptAsgn(c: var SemContext; dest: var TokenBuf; it: var Item; info: PackedLineInfo) =
+proc semSubscriptAsgn(c: var SemContext; dest: var TokenBuf; it: var Item; info: NifLineInfo;
+                      asgnStart: Cursor) =
   # check if LHS is builtin subscript:
   var subscript = Item(n: it.n, typ: c.types.autoType)
-  inc subscript.n # tag
+  # the close of this (at ...) scope is consumed either by
+  # tryBuiltinSubscript or by the reset below:
+  let atStart = subscript.n
+  subscript.n = sub(subscript.n) # skip tag
   var subscriptLhsBuf = createTokenBuf(4)
   var subscriptLhs = Item(n: subscript.n, typ: c.types.autoType)
   semExpr c, subscriptLhsBuf, subscriptLhs, {KeepMagics}
@@ -1754,7 +2204,7 @@ proc semSubscriptAsgn(c: var SemContext; dest: var TokenBuf; it: var Item; info:
   subscript.n = afterSubscriptLhs
   subscriptLhs.n = cursorAt(subscriptLhsBuf, 0)
   var subscriptBuf = createTokenBuf(8)
-  let builtin = tryBuiltinSubscript(c, subscriptBuf, subscript, subscriptLhs)
+  let builtin = tryBuiltinSubscript(c, subscriptBuf, subscript, subscriptLhs, atStart)
   if builtin:
     # build regular assignment:
     dest.addParLe(AsgnS, info)
@@ -1762,54 +2212,57 @@ proc semSubscriptAsgn(c: var SemContext; dest: var TokenBuf; it: var Item; info:
     removeModifier(subscript.typ) # remove `var` for rhs
     semExpr c, dest, subscript # use the type and position from the subscript
     it.n = subscript.n
-    takeParRi dest, it.n
+    dest.addParRi(it.n.endInfo)
+    it.n = asgnStart; skip it.n
     producesVoid c, dest, info, it.typ
   else:
     # generate call to `[]=`:
     var callBuf = createTokenBuf(16)
     callBuf.addParLe(CallX, subscriptLhs.n.info)
-    callBuf.add identToken(pool.strings.getOrIncl("[]="), subscriptLhs.n.info)
+    callBuf.addIdent(pool.strings.getOrIncl("[]="), subscriptLhs.n.info)
     callBuf.addSubtree subscriptLhs.n
     it.n = afterSubscriptLhs
     while it.n.hasMore:
       # arguments of the subscript
       callBuf.takeTree it.n
-    skipParRi it.n # end subscript expression
+    it.n = atStart; skip it.n # end subscript expression
     callBuf.takeTree it.n # assignment value
     callBuf.addParRi()
-    skipParRi it.n # end assignment
+    it.n = asgnStart; skip it.n # end assignment
     var call = Item(n: cursorAt(callBuf, 0), typ: it.typ)
     semCall c, dest, call, {}, SubscriptAsgnCall
     it.typ = call.typ
 
-proc semCurlyatAsgn(c: var SemContext; dest: var TokenBuf; it: var Item; info: PackedLineInfo) =
+proc semCurlyatAsgn(c: var SemContext; dest: var TokenBuf; it: var Item; info: NifLineInfo;
+                    asgnStart: Cursor) =
   # `{}=` has no builtin meaning; always rewrite to a call to `{}=`:
-  inc it.n # tag of curlyat
   var lhsBuf = createTokenBuf(4)
-  var lhs = Item(n: it.n, typ: c.types.autoType)
-  semExpr c, lhsBuf, lhs, {KeepMagics}
-  it.n = lhs.n
-  lhs.n = cursorAt(lhsBuf, 0)
   var callBuf = createTokenBuf(16)
-  callBuf.addParLe(CallX, info)
-  callBuf.add identToken(pool.strings.getOrIncl("{}="), info)
-  callBuf.addSubtree lhs.n
-  while it.n.hasMore:
-    # arguments of the curly subscript:
-    callBuf.takeTree it.n
-  skipParRi it.n # end curlyat expression
+  it.n.into: # curlyat
+    var lhs = Item(n: it.n, typ: c.types.autoType)
+    semExpr c, lhsBuf, lhs, {KeepMagics}
+    it.n = lhs.n
+    lhs.n = cursorAt(lhsBuf, 0)
+    callBuf.addParLe(CallX, info)
+    callBuf.addIdent(pool.strings.getOrIncl("{}="), info)
+    callBuf.addSubtree lhs.n
+    while it.n.hasMore:
+      # arguments of the curly subscript:
+      callBuf.takeTree it.n
   callBuf.takeTree it.n # assignment value
   callBuf.addParRi()
-  skipParRi it.n # end assignment
+  it.n = asgnStart; skip it.n # end assignment
   var call = Item(n: cursorAt(callBuf, 0), typ: it.typ)
   semCall c, dest, call, {}, CurlyatAsgnCall
   it.typ = call.typ
 
-proc semDotAsgn(c: var SemContext; dest: var TokenBuf; it: var Item; info: PackedLineInfo) =
+proc semDotAsgn(c: var SemContext; dest: var TokenBuf; it: var Item; info: NifLineInfo;
+                asgnStart: Cursor) =
   # check if LHS is builtin subscript:
   let dotInfo = it.n.info
   var dot = Item(n: it.n, typ: c.types.autoType)
-  inc dot.n # tag
+  let dotStart = dot.n
+  dot.n = sub(dot.n) # tag
   var dotLhsBuf = createTokenBuf(4)
   var dotLhs = Item(n: dot.n, typ: c.types.autoType)
   semExpr c, dotLhsBuf, dotLhs, {KeepMagics}
@@ -1817,16 +2270,18 @@ proc semDotAsgn(c: var SemContext; dest: var TokenBuf; it: var Item; info: Packe
   dotLhs.n = cursorAt(dotLhsBuf, 0)
   let fieldName = takeIdent(dot.n)
   # skip optional inheritance depth:
-  if dot.n.kind == IntLit:
+  if dot.n.isIntLit:
     inc dot.n
   var dotFlags: set[SemFlag] = {}
-  if dot.n.kind == StringLit:
+  var dotAccessToken = ""
+  if dot.n.isStringLit:
     dotFlags.incl BypassFieldVis
+    dotAccessToken = pool.strings[dot.n.strId]
     inc dot.n
-  skipParRi dot.n
+  dot.n = dotStart; skip dot.n
   var dotBuf = createTokenBuf(8)
   let builtin = tryBuiltinDot(c, dotBuf, dot, dotLhs, fieldName, dotInfo,
-                               dotFlags) != FailedDot
+                               dotFlags, dotAccessToken) != FailedDot
   if builtin:
     # build regular assignment:
     dest.addParLe(AsgnS, info)
@@ -1834,18 +2289,19 @@ proc semDotAsgn(c: var SemContext; dest: var TokenBuf; it: var Item; info: Packe
     removeModifier(dot.typ) # remove `var` for rhs
     semExpr c, dest, dot # use the type and position from the dot expression
     it.n = dot.n
-    takeParRi dest, it.n
+    dest.addParRi(it.n.endInfo)
+    it.n = asgnStart; skip it.n
     producesVoid c, dest, info, it.typ
   else:
     # generate call to `field=`:
     var callBuf = createTokenBuf(16)
     callBuf.addParLe(CallX, dotLhs.n.info)
-    callBuf.add identToken(pool.strings.getOrIncl(pool.strings[fieldName] & "="), dotLhs.n.info)
+    callBuf.addIdent(pool.strings.getOrIncl(pool.strings[fieldName] & "="), dotLhs.n.info)
     callBuf.addSubtree dotLhs.n
     it.n = dot.n
     callBuf.takeTree it.n # assignment value
     callBuf.addParRi()
-    skipParRi it.n
+    it.n = asgnStart; skip it.n
     var call = Item(n: cursorAt(callBuf, 0), typ: it.typ)
     semCall c, dest, call, {}, DotAsgnCall
     # XXX original compiler also checks if the call fails and tries a dotcall for the LHS
@@ -1853,26 +2309,27 @@ proc semDotAsgn(c: var SemContext; dest: var TokenBuf; it: var Item; info: Packe
 
 proc semAsgn(c: var SemContext; dest: var TokenBuf; it: var Item) =
   let info = it.n.info
-  inc it.n
+  let asgnStart = it.n
+  it.n = sub(it.n)
   case it.n.exprKind
   of AtX:
-    semSubscriptAsgn c, dest, it, info
+    semSubscriptAsgn c, dest, it, info, asgnStart
   of CurlyatX:
-    semCurlyatAsgn c, dest, it, info
+    semCurlyatAsgn c, dest, it, info, asgnStart
   of DotX, DdotX:
-    semDotAsgn c, dest, it, info
+    semDotAsgn c, dest, it, info, asgnStart
   of NoExpr, ErrX, SufX, DerefX, PatX, ParX, AddrX, NilX, InfX, NeginfX, NanX,
-     FalseX, TrueX, AndX, OrX, XorX, NotX, NegX, SizeofX, AlignofX, OffsetofX, KvX, OconstrX,
-     AconstrX, BracketX, CurlyX, OvfX, AddX, SubX, MulX, DivX, ModX, ShrX, ShlX,
+     FalseX, TrueX, AndX, OrX, XorX, NotX, NegX, SizeofX, CanFormCyclesX, SupportsCopyMemX, AlignofX, OffsetofX, KvX, OconstrX,
+     AconstrX, BracketX, CurlyX, OvfX, AddX, SubX, SuccX, PredX, MulX, DivX, ModX, ShrX, ShlX,
      BitandX, BitorX, BitxorX, BitnotX, EqX, NeqX, LeX, LtX, CastX, ConvX, CallX, CmdX,
      CchoiceX, OchoiceX, PragmaxX, QuotedX, HderefX, HaddrX, NewrefX, NewobjX, TupX,
      TupconstrX, SetconstrX, TabconstrX, AshrX, BaseobjX, HconvX, DconvX, CallstrlitX, InfixX,
-     PrefixX, HcallX, CompilesX, DeclaredX, DefinedX, AstToStrX, BindSymX, BindSymNameX, InstanceofX, ProccallX, HighX,
-     LowX, TypeofX, UnpackX, FieldsX, FieldpairsX, EnumtostrX, IsmainmoduleX, DefaultobjX,
+     PrefixX, HcallX, CompilesX, StaticX, DeclaredX, DefinedX, AstToStrX, BindSymX, BindSymNameX, InstanceofX, ProccallX, HighX,
+     LowX, TypeofX, UnpackX, FieldsX, FieldpairsX, EnumtostrX, IsmainmoduleX, InstantiationinfoX, DefaultobjX,
      DefaulttupX, DefaultdistinctX, DelayX, Delay0X, SuspendX, ExprX, DoX, ArratX, TupatX,
      PlussetX, MinussetX, MulsetX, XorsetX, EqsetX, LesetX, LtsetX, InsetX, CardX, EmoveX,
      DestroyX, DupX, CopyX, WasmovedX, SinkhX, TraceX, InternalTypeNameX, InternalFieldPairsX,
-     FailedX, IsX, EnvpX, ToClosureX:
+     FailedX, IsX, EnvpX, ToClosureX, PluginCallX:
     dest.addParLe(AsgnS, info)
     var a = Item(n: it.n, typ: c.types.autoType)
     let beforeLhs = dest.len
@@ -1883,13 +2340,17 @@ proc semAsgn(c: var SemContext; dest: var TokenBuf; it: var Item) =
       removeModifier(a.typ) # remove `var` for rhs
     semExpr c, dest, a # ensures type compatibility with `left-hand-side`
     it.n = a.n
-    takeParRi dest, it.n
+    dest.addParRi(it.n.endInfo)
+    it.n = asgnStart; skip it.n
     producesVoid c, dest, info, it.typ
 
 proc semEmit*(c: var SemContext; dest: var TokenBuf; it: var Item) =
+  ## Processes the emit operands at `it.n`. The caller owns the enclosing
+  ## scope — the `(emit ...)` statement or the pragma-line wrapper — and
+  ## closes it afterwards; the emitted `(emit ...)` tree's close carries
+  ## the scope close's info like the classic `takeParRi` did.
   let info = it.n.info
-  dest.add parLeToken(EmitS, info)
-  inc it.n
+  dest.addParLe(EmitS, info)
   if it.n.exprKind == BracketX:
     it.n.into:
       while it.n.hasMore:
@@ -1900,22 +2361,21 @@ proc semEmit*(c: var SemContext; dest: var TokenBuf; it: var Item) =
     var a = Item(n: it.n, typ: c.types.autoType)
     semExpr c, dest, a
     it.n = a.n
-  takeParRi dest, it.n
+  dest.addParRi(it.n.endInfo)
   producesVoid c, dest, info, it.typ
 
 proc semDiscard(c: var SemContext; dest: var TokenBuf; it: var Item) =
   let info = it.n.info
-  takeToken dest, it.n
-  if it.n.kind == DotToken:
-    takeToken dest, it.n
-  else:
-    let exInfo = it.n.info
-    var a = Item(n: it.n, typ: c.types.autoType)
-    semExpr c, dest, a
-    it.n = a.n
-    if classifyType(c, a.typ) == VoidT:
-      buildErr c, dest, exInfo, "expression of type `" & typeToString(a.typ) & "` must not be discarded"
-  takeParRi dest, it.n
+  takeInto dest, it.n:
+    if it.n.isDotToken:
+      takeTree dest, it.n
+    else:
+      let exInfo = it.n.info
+      var a = Item(n: it.n, typ: c.types.autoType)
+      semExpr c, dest, a
+      it.n = a.n
+      if classifyType(c, a.typ) == VoidT:
+        buildErr c, dest, exInfo, "expression of type `" & typeToString(a.typ) & "` must not be discarded"
   producesVoid c, dest, info, it.typ
 
 proc semStmtBranch(c: var SemContext; dest: var TokenBuf; it: var Item; isNewScope: bool) =
@@ -1930,7 +2390,6 @@ proc semStmtBranch(c: var SemContext; dest: var TokenBuf; it: var Item; isNewSco
     if classifyType(c, it.typ) == VoidT:
       let ex = cursorAt(dest, start)
       let nr = isNoReturn(ex)
-      endRead(dest)
       if nr:
         it.typ = c.types.autoType
   of VoidT:
@@ -1945,92 +2404,140 @@ proc semStmtBranch(c: var SemContext; dest: var TokenBuf; it: var Item; isNewSco
 
 proc semIf(c: var SemContext; dest: var TokenBuf; it: var Item) =
   let info = it.n.info
-  takeToken dest, it.n
-  if it.n.substructureKind == ElifU:
-    while it.n.substructureKind == ElifU:
-      takeToken dest, it.n
-      semBoolExpr c, dest, it.n
-      withNewScope c:
-        semStmtBranch c, dest, it, true
-      takeParRi dest, it.n
-  else:
-    buildErr c, dest, it.n.info, "illformed AST: `elif` inside `if` expected"
-  if it.n.substructureKind == ElseU:
-    takeToken dest, it.n
-    withNewScope c:
-      semStmtBranch c, dest, it, true
-    takeParRi dest, it.n
-  takeParRi dest, it.n
+  takeInto dest, it.n:
+    if it.n.hasMore and it.n.substructureKind == ElifU:
+      while it.n.hasMore and it.n.substructureKind == ElifU:
+        takeInto dest, it.n:
+          semBoolExpr c, dest, it.n
+          withNewScope c:
+            semStmtBranch c, dest, it, true
+    else:
+      buildErr c, dest, it.n.endInfo, "illformed AST: `elif` inside `if` expected"
+    if it.n.hasMore and it.n.substructureKind == ElseU:
+      takeInto dest, it.n:
+        withNewScope c:
+          semStmtBranch c, dest, it, true
   if typeKind(it.typ) == AutoT:
     producesVoid c, dest, info, it.typ
 
-proc semExceptionType(c: var SemContext; dest: var TokenBuf; it: var Item): TypeCursor =
-  result = semLocalType(c, dest, it.n)
-  # Allow any exception type - validation for "x != default(T)" semantics can come later
+proc errorCodeValueName(c: var SemContext; orig: Cursor): string =
+  ## `except ValueError:` is the Nim 2 form, and `ValueError` is a value of
+  ## `ErrorCode` here, not a type. Only asked once the arm already failed to
+  ## be a type: the name is checked again as an expression, into a scratch
+  ## buffer, and is reported only if that expression is an `ErrorCode`.
+  result = ""
+  if orig.kind == Ident or orig.exprKind == DotX:
+    var phase = SemcheckBodies
+    swap c.phase, phase
+    var scratch = createTokenBuf(8)
+    var it = Item(n: orig, typ: c.types.autoType)
+    let oldDebugAllowErrors = c.debugAllowErrors
+    c.debugAllowErrors = true
+    semExpr c, scratch, it
+    c.debugAllowErrors = oldDebugAllowErrors
+    swap c.phase, phase
+    if it.typ.isSymbol and it.typ.symId == pool.symId(ErrorCodeName):
+      let e = cursorAt(scratch, 0)
+      if e.isSymbol:
+        result = pool.strings[symToIdent(e.symId)]
+
+proc semExceptionType(c: var SemContext; dest: var TokenBuf; it: var Item) =
+  ## Emits exactly ONE node for the arm's type, an error or not: the arm is
+  ## `(except <type> <body>)` and every later pass reads it by position.
+  let info = it.n.info
+  let orig = it.n
+  let start = dest.len
+  let typ = semLocalType(c, dest, it.n)
+  if typ.typeKind == ErrT:
+    let code = errorCodeValueName(c, orig)
+    if code.len > 0:
+      dest.shrink start
+      buildErr c, dest, info, "`" & code & "` is an `ErrorCode` value, not a type; write `except ErrorCode as e:` and test `e == " &
+        code & "`"
+  elif raisesFamily(typ) == NotRaisable:
+    combineErr c, dest, start, info, "`except` takes `ErrorCode` or a `ref` object type, not `" &
+      typeToString(typ) & "`"
 
 proc semTry(c: var SemContext; dest: var TokenBuf; it: var Item) =
   let info = it.n.info
-  takeToken dest, it.n
-  withNewScope c:
-    semStmtBranch c, dest, it, true
-  while it.n.substructureKind == ExceptU:
-    openScope(c)
-    takeToken dest, it.n
-    if it.n.kind == DotToken:
-      takeToken dest, it.n
-    elif it.n.exprKind in CallKinds and it.n.firstSon.kind == Ident and pool.strings[it.n.firstSon.litId] == "as":
-      # `Type as e`:
-      inc it.n
-      inc it.n
-      let start = dest.len
-      let etyp = semExceptionType(c, dest, it)
-      dest.shrink start
-      var decl = createTokenBuf(8)
-      decl.addParLe(LetS, info)
-      decl.takeTree it.n # name
-      skipParRi it.n
-      decl.addEmpty() # export marker
-      decl.addEmpty() # pragmas
-      decl.addSubtree etyp
-      decl.addEmpty() # value
-      decl.addParRi()
-      var dd = beginRead(decl)
-      semLocal c, dest, dd, LetY
-    elif it.n.stmtKind == LetS:
-      # resem the local declaration:
-      semLocal(c, dest, it.n, LetY)
-    else:
-      discard semExceptionType(c, dest, it)
-    inc c.routine.inExcept
-    semStmtBranch c, dest, it, true
-    dec c.routine.inExcept
-    takeParRi dest, it.n
-    closeScope(c)
-  if it.n.substructureKind == FinU:
-    takeToken dest, it.n
+  takeInto dest, it.n:
     withNewScope c:
-      semStmt c, dest, it.n, true
-    takeParRi dest, it.n
-  takeParRi dest, it.n
+      semStmtBranch c, dest, it, true
+    while it.n.hasMore and it.n.substructureKind == ExceptU:
+      openScope(c)
+      takeInto dest, it.n:
+        if it.n.isDotToken:
+          takeTree dest, it.n
+        elif it.n.exprKind in CallKinds and it.n.childCursor.isIdent and pool.strings[it.n.childCursor.strId] == "as":
+          # `Type as e`:
+          let asStart = it.n
+          it.n = sub(it.n)
+          inc it.n
+          let start = dest.len
+          semExceptionType(c, dest, it)
+          var decl = createTokenBuf(8)
+          decl.addParLe(LetS, info)
+          decl.takeTree it.n # name
+          it.n = asStart; skip it.n
+          decl.addEmpty() # export marker
+          decl.addEmpty() # pragmas
+          # the type as emitted, an error included, and not as interned: the
+          # type cache would hand back the FIRST such error and its position
+          decl.addSubtree readonlyCursorAt(dest, start)
+          dest.shrink start
+          decl.addEmpty() # value
+          decl.addParRi()
+          var dd = beginRead(decl)
+          semLocal c, dest, dd, LetY
+        elif it.n.stmtKind == LetS:
+          # resem the local declaration:
+          semLocal(c, dest, it.n, LetY)
+        else:
+          semExceptionType(c, dest, it)
+        inc c.routine.inExcept
+        semStmtBranch c, dest, it, true
+        dec c.routine.inExcept
+      closeScope(c)
+    if it.n.hasMore and it.n.substructureKind == FinU:
+      takeInto dest, it.n:
+        withNewScope c:
+          semStmt c, dest, it.n, true
   if typeKind(it.typ) == AutoT:
     producesVoid c, dest, info, it.typ
+
+proc semUnresolvedWhenBranch(c: var SemContext; dest: var TokenBuf; it: var Item; mode: WhenMode) =
+  ## A branch of a `when` whose condition depends on generic parameters. In a
+  ## checked generic its body is type-checked at definition time like an `if`
+  ## branch, so the `when` has the branches' common type and a tail `when` is
+  ## classified as the result expression or as statements right here. Only
+  ## the fields of a generic object stay untyped until instantiation.
+  case mode
+  of NormalWhen:
+    withNewScope c:
+      semStmtBranch c, dest, it, true
+  of ObjectWhen:
+    var ctx = createUntypedContext(addr c, UntypedGeneric)
+    semTemplBody ctx, dest, it.n
 
 proc semWhenImpl(c: var SemContext; dest: var TokenBuf; it: var Item; mode: WhenMode;
                  state: var SemObjectState) =
   let start = dest.len
   let info = it.n.info
-  takeToken dest, it.n
+  dest.addParLe(it.n.cursorTagId, it.n.info)
+  let whenStart = it.n
+  it.n = sub(it.n)
   var leaveUnresolved = false
-  if it.n.substructureKind == ElifU:
-    while it.n.substructureKind == ElifU:
-      takeToken dest, it.n
+  if it.n.hasMore and it.n.substructureKind == ElifU:
+    while it.n.hasMore and it.n.substructureKind == ElifU:
+      dest.addParLe(it.n.cursorTagId, it.n.info)
+      let elifStart = it.n
+      it.n = sub(it.n)
       let condStart = dest.len
       var phase = SemcheckBodies
       swap c.phase, phase
-      semConstBoolExpr c, dest, it.n, allowUnresolved = c.routine.inGeneric > 0
+      semConstBoolExpr c, dest, it.n, allowUnresolved = c.inGenericDefinition > 0
       swap c.phase, phase
       let condValue = cursorAt(dest, condStart).exprKind
-      endRead(dest)
       if not leaveUnresolved:
         if condValue == TrueX:
           dest.shrink start
@@ -2039,24 +2546,26 @@ proc semWhenImpl(c: var SemContext; dest: var TokenBuf; it: var Item; mode: When
             semExprMissingPhases c, dest, it, SemcheckSignatures
           of ObjectWhen:
             semObjectComponent c, dest, it.n, state
-          skipParRi it.n # finish elif
+          it.n = elifStart; skip it.n # finish elif
           while it.n.hasMore: skip it.n
-          consumeParRi it.n
+          it.n = whenStart; skip it.n
           return
         elif condValue != FalseX:
           # erroring/unresolved condition, leave entire statement as unresolved
           leaveUnresolved = true
       if leaveUnresolved:
         # might have been set above
-        var ctx = createUntypedContext(addr c, UntypedGeneric)
-        semTemplBody ctx, dest, it.n
+        semUnresolvedWhenBranch c, dest, it, mode
       else:
         takeTree dest, it.n
-      takeParRi dest, it.n
+      dest.addParRi(it.n.endInfo)
+      it.n = elifStart; skip it.n
   else:
-    buildErr c, dest, it.n.info, "illformed AST: `elif` inside `if` expected"
-  if it.n.substructureKind == ElseU:
-    takeToken dest, it.n
+    buildErr c, dest, it.n.endInfo, "illformed AST: `elif` inside `if` expected"
+  if it.n.hasMore and it.n.substructureKind == ElseU:
+    dest.addParLe(it.n.cursorTagId, it.n.info)
+    let elseStart = it.n
+    it.n = sub(it.n)
     if not leaveUnresolved:
       dest.shrink start
       case mode
@@ -2064,21 +2573,24 @@ proc semWhenImpl(c: var SemContext; dest: var TokenBuf; it: var Item; mode: When
         semExprMissingPhases c, dest, it, SemcheckSignatures
       of ObjectWhen:
         semObjectComponent c, dest, it.n, state
-      skipParRi it.n # finish else
+      it.n = elseStart; skip it.n # finish else
       while it.n.hasMore: skip it.n
-      consumeParRi it.n
+      it.n = whenStart; skip it.n
       return
     else:
-      var ctx = createUntypedContext(addr c, UntypedGeneric)
-      semTemplBody ctx, dest, it.n
-    takeParRi dest, it.n
-  takeParRi dest, it.n
+      semUnresolvedWhenBranch c, dest, it, mode
+    dest.addParRi(it.n.endInfo)
+    it.n = elseStart; skip it.n
+  dest.addParRi(it.n.endInfo)
+  it.n = whenStart; skip it.n
   if not leaveUnresolved:
     # none of the branches evaluated, output nothing
     dest.shrink start
     producesVoid c, dest, info, it.typ
-  else:
+  elif mode == ObjectWhen:
     it.typ = c.types.untypedType
+  elif typeKind(it.typ) == AutoT:
+    producesVoid c, dest, info, it.typ
 
 proc semWhen(c: var SemContext; dest: var TokenBuf; it: var Item) =
   case c.phase
@@ -2104,21 +2616,19 @@ proc semCaseOfValueImpl(c: var SemContext; dest: var TokenBuf; it: var Item; sel
   while it.n.hasMore:
     let info = it.n.info
     if isRangeExpr(it.n):
-      inc it.n # call tag
-      skip it.n # `..`
-      dest.buildTree RangeU, it.n.info:
+      it.n.into: # call
+        skip it.n # `..`
+        dest.buildTree RangeU, it.n.info:
+          let a = evalConstIntExpr(c, dest, it.n, selectorType)
+          let b = evalConstIntExpr(c, dest, it.n, selectorType)
+          if seen.doesOverlapOrIncl(a, b):
+            buildErr c, dest, info, "overlapping values"
+    elif it.n.substructureKind == RangeU:
+      takeInto dest, it.n:
         let a = evalConstIntExpr(c, dest, it.n, selectorType)
         let b = evalConstIntExpr(c, dest, it.n, selectorType)
         if seen.doesOverlapOrIncl(a, b):
           buildErr c, dest, info, "overlapping values"
-      inc it.n # right paren of call
-    elif it.n.substructureKind == RangeU:
-      takeToken dest, it.n
-      let a = evalConstIntExpr(c, dest, it.n, selectorType)
-      let b = evalConstIntExpr(c, dest, it.n, selectorType)
-      if seen.doesOverlapOrIncl(a, b):
-        buildErr c, dest, info, "overlapping values"
-      takeParRi dest, it.n
     else:
       if it.n.exprKind == CurlyX:
         var beforeSetType = dest.len
@@ -2128,23 +2638,21 @@ proc semCaseOfValueImpl(c: var SemContext; dest: var TokenBuf; it: var Item; sel
         var curlyExpr = Item(n: it.n, typ: typeToCursor(c, dest, beforeSetType))
 
         shrink(dest, beforeSetType)
-        inc it.n
 
         var beforeExpr = dest.len
         semExpr c, dest, curlyExpr
         shrink(dest, beforeExpr)
 
-        semCaseOfValueImpl(c, dest, it, selectorType, seen)
-        skipParRi(it.n)
+        it.n.into:
+          semCaseOfValueImpl(c, dest, it, selectorType, seen)
       else:
         evalConstCaseBranch(c, dest, it, selectorType, seen, info)
 
 proc semCaseOfValue(c: var SemContext; dest: var TokenBuf; it: var Item; selectorType: TypeCursor;
                     seen: var seq[(xint, xint)]) =
   if it.n.substructureKind == RangesU:
-    takeToken dest, it.n
-    semCaseOfValueImpl(c, dest, it, selectorType, seen)
-    takeParRi dest, it.n
+    takeInto dest, it.n:
+      semCaseOfValueImpl(c, dest, it, selectorType, seen)
   else:
     buildErr c, dest, it.n.info, "`ranges` within `of` expected"
     skip it.n
@@ -2152,33 +2660,34 @@ proc semCaseOfValue(c: var SemContext; dest: var TokenBuf; it: var Item; selecto
 proc semCaseOfValueString(c: var SemContext; dest: var TokenBuf; it: var Item; selectorType: TypeCursor;
                           seen: var HashSet[StrId]) =
   if it.n.substructureKind == RangesU:
-    takeToken dest, it.n
-    while it.n.hasMore:
-      let info = it.n.info
-      let s = evalConstStrExpr(c, dest, it.n, selectorType) # will error if range is given
-      if s != StrId(0): # otherwise error
-        # use literal id as value:
-        if seen.containsOrIncl(s):
-          buildErr c, dest, info, "value already handled"
-    takeParRi dest, it.n
+    takeInto dest, it.n:
+      while it.n.hasMore:
+        let info = it.n.info
+        let s = evalConstStrExpr(c, dest, it.n, selectorType) # will error if range is given
+        if s != StrId(0): # otherwise error
+          # use literal id as value:
+          if seen.containsOrIncl(s):
+            buildErr c, dest, info, "value already handled"
   else:
     buildErr c, dest, it.n.info, "`ranges` within `of` expected"
     skip it.n
 
-proc checkExhaustiveness(c: var SemContext; dest: var TokenBuf; info: PackedLineInfo; selectorType: TypeCursor; seen: seq[(xint, xint)]) =
+proc checkExhaustiveness(c: var SemContext; dest: var TokenBuf; info: NifLineInfo; selectorType: TypeCursor; seen: seq[(xint, xint)]) =
   var total = createXint(0'i32)
   for s in items(seen):
     total = total + s[1] - s[0] + createXint(1'i32)
 
+  # Peel the selector down to the enum declaration. This was a loop with a fuel
+  # counter, but it could never take a second hop: the only assignment to `typ`
+  # was followed by `break`, so every other path left `typ` -- and therefore the
+  # whole loop state -- exactly as it was and simply burned the fuel. An alias
+  # chain (`type A = B`) is still not followed; the `total == lengthOrd` count
+  # below is what covers those.
   var typ = selectorType
-  var counter = 20
-  while typ.kind == Symbol:
-    dec counter
-    if counter <= 0: break
+  if typ.isSymbol:
     let impl = getTypeSection(typ.symId)
     if impl.kind == TypeY and impl.body.typeKind in {EnumT, HoleyEnumT, AnumT}:
       typ = impl.body
-      break
 
   if typ.typeKind != HoleyEnumT:
     # quick check based on the `total` count:
@@ -2197,19 +2706,18 @@ proc checkExhaustiveness(c: var SemContext; dest: var TokenBuf; info: PackedLine
       while field.hasMore:
         let f = takeLocal(field, SkipFinalParRi)
         let v: xint
-        var vnode = f.val.firstSon # skip tuple tag
+        var vnode = f.val.childCursor # skip tuple tag
         case vnode.kind
         of IntLit:
-          v = createXint pool.integers[vnode.intId]
+          v = createXint vnode.intVal
         of UIntLit:
-          v = createXint pool.uintegers[vnode.uintId]
+          v = createXint vnode.uintVal
         else:
           var dummyDest = createTokenBuf(4)
           v = semEnumOrdinalValue(c, dummyDest, vnode)
         if not seen.contains(v):
           if missing.len > 0: missing.add ", "
-          var isGlobal = false
-          missing.add extractBasename(pool.syms[f.name.symId], isGlobal)
+          missing.add pool.symBasename(f.name.symId)
     if missing.len > 0:
       buildErr c, dest, info, "not all cases are covered; missing: {" & missing & "}"
   else:
@@ -2244,7 +2752,7 @@ proc findSumTypeInfo(selectorType: TypeCursor): SumTypeInfo =
     inc body
     discard skipInvoke(body)
     # Follow symbol to inner object type for ref/ptr objects:
-    if body.kind == Symbol:
+    if body.isSymbol:
       let innerRes = tryLoadSym(body.symId)
       if innerRes.status != LacksNothing: return
       let innerDecl = asTypeDecl(innerRes.decl)
@@ -2262,7 +2770,7 @@ proc findSumTypeInfo(selectorType: TypeCursor): SumTypeInfo =
   if not field.hasMore or field.substructureKind != FldU: return
   let fld = asLocal(field)
   var discrimType = fld.typ
-  if discrimType.kind == Symbol:
+  if discrimType.isSymbol:
     let typeRes = tryLoadSym(discrimType.symId)
     if typeRes.status == LacksNothing:
       let td = asTypeDecl(typeRes.decl)
@@ -2276,12 +2784,16 @@ type
     sym: SymId
     typ: TypeCursor
 
-proc findBranchFields(objTypeSym: SymId; efldSym: SymId): seq[SumTypeBranchField] =
-  ## Find the fields belonging to the branch identified by `efldSym`.
-  ## Matches by name so it works across generic instantiations where
-  ## the efld syms differ from the original definition.
-  result = @[]
-  let res = tryLoadSym(objTypeSym)
+proc sumTypeObjDecl(ownerTypeSym: SymId): TypeDecl =
+  ## The object type declaration behind a sum type's owner. For
+  ## `type T = ref object` the owner is `T` and the object is the split-off
+  ## `T.Obj`, which carries its own, freshly named, copies of `T`'s typevars --
+  ## so the caller needs the object's declaration, not the alias's.
+  ## `result.body` is the `(object ...)` itself, which for an inline
+  ## `(ref (object ...))` body is one level below `result`'s own body.
+  ## `result.kind` is `TypeY` iff an object was found.
+  result = default(TypeDecl)
+  let res = tryLoadSym(ownerTypeSym)
   if res.status != LacksNothing: return
   var decl = asTypeDecl(res.decl)
   if decl.kind != TypeY: return
@@ -2290,36 +2802,47 @@ proc findBranchFields(objTypeSym: SymId; efldSym: SymId): seq[SumTypeBranchField
     inc body
     discard skipInvoke(body)
     # Follow symbol to inner object type:
-    if body.kind == Symbol:
+    if body.isSymbol:
       decl = asTypeDecl(tryLoadSym(body.symId).decl)
       if decl.kind != TypeY: return
       body = decl.body
   if body.typeKind != ObjectT: return
-  let obj = asObjectDecl(body)
+  result = decl
+  result.body = body
+
+proc findBranchFields(ownerTypeSym: SymId; efldSym: SymId): seq[SumTypeBranchField] =
+  ## Find the fields belonging to the branch identified by `efldSym`.
+  ## Matches by name so it works across generic instantiations where
+  ## the efld syms differ from the original definition.
+  result = @[]
+  let decl = sumTypeObjDecl(ownerTypeSym)
+  if decl.kind != TypeY: return
+  let obj = asObjectDecl(decl.body)
   var n = obj.body
-  inc n  # past (object
+  n = sub(n)  # past (object; bounds the walk under vpr
   skip n  # parent type / inheritance slot
   while n.substructureKind in {FldU, GfldU}:
     skip n
   if n.substructureKind != CaseU: return
-  inc n
+  n = sub(n)  # past (case
   skip n # skip discriminator fld
   let efldName = symToIdent(efldSym)
   while n.hasMore:
     if n.substructureKind == OfU:
-      inc n
+      let ofStart = n
+      n = sub(n)
       var found = false
       if n.substructureKind == RangesU:
         var scan = n
-        inc scan
+        scan = sub(scan)  # throwaway copy
         while scan.hasMore:
-          if scan.kind == Symbol and sameIdent(scan.symId, efldName):
+          if scan.isSymbol and sameIdent(scan.symId, efldName):
             found = true
             break
           skip scan
       skip n # skip ranges
       if found and n.substructureKind == StmtsU:
-        inc n
+        n = sub(n)
         while n.hasMore:
           if n.substructureKind in {FldU, GfldU}:
             let f = asLocal(n)
@@ -2328,7 +2851,7 @@ proc findBranchFields(objTypeSym: SymId; efldSym: SymId): seq[SumTypeBranchField
         return
       else:
         skip n # skip stmts
-      inc n # skip of parri
+      n = ofStart; skip n # past the of's (elided) close
     else:
       skip n
 
@@ -2338,10 +2861,10 @@ proc getEfldOrdinal(sym: SymId): xint =
     var n = res.decl
     skipToLocalType n
     skip n # skip type → now at value
-    if n.kind == ParLe: # TupX
+    if n.isTagLit: # TupX
       inc n
-      if n.kind == IntLit:
-        return createXint pool.integers[n.intId]
+      if n.isIntLit:
+        return createXint n.intVal
   return createNaN()
 
 type
@@ -2349,7 +2872,7 @@ type
     ident: StrId
     fieldSym: SymId
     fieldType: TypeCursor
-    info: PackedLineInfo
+    info: NifLineInfo
 
 proc findOneofEfld(c: var SemContext; name: StrId): SymId =
   result = SymId(0)
@@ -2378,99 +2901,97 @@ proc semSumTypeCaseOfValue(c: var SemContext; dest: var TokenBuf; it: var Item;
     buildErr c, dest, it.n.info, "`ranges` within `of` expected"
     skip it.n
     return
-  takeToken dest, it.n
   bindings.setLen 0
-  while it.n.hasMore:
-    let info = it.n.info
-    if it.n.exprKind in CallKinds:
-      inc it.n
-      if it.n.kind == Ident:
-        let branchName = it.n.litId
-        let efldSym = findOneofEfld(c, branchName)
-        if efldSym == SymId(0):
-          buildErr c, dest, info, "undeclared sum type branch: " & pool.strings[branchName]
-          while it.n.hasMore: skip it.n
-          consumeParRi it.n
-          continue
-        dest.add symToken(efldSym, info)
-        inc it.n
-        let ordVal = getEfldOrdinal(efldSym)
-        if not ordVal.isNaN:
-          if seen.containsOrIncl(ordVal):
-            buildErr c, dest, info, "value already handled"
-        let branchFields = findBranchFields(objTypeSym, efldSym)
-        var fieldIdx = 0
-        while it.n.hasMore:
-          if it.n.kind == Ident and fieldIdx < branchFields.len:
-            bindings.add SumTypeBinding(
-              ident: it.n.litId,
-              fieldSym: branchFields[fieldIdx].sym,
-              fieldType: branchFields[fieldIdx].typ,
-              info: it.n.info)
-          elif it.n.kind == Ident:
-            buildErr c, dest, it.n.info, "too many bindings for sum type branch"
+  takeInto dest, it.n:
+    while it.n.hasMore:
+      let info = it.n.info
+      if it.n.exprKind in CallKinds:
+        let callStart = it.n
+        it.n = sub(it.n)
+        if it.n.isIdent:
+          let branchName = it.n.strId
+          let efldSym = findOneofEfld(c, branchName)
+          if efldSym == SymId(0):
+            buildErr c, dest, info, "undeclared sum type branch: " & pool.strings[branchName]
+            while it.n.hasMore: skip it.n
+            it.n = callStart; skip it.n
+            continue
+          dest.addSymUse(efldSym, info)
           inc it.n
-          inc fieldIdx
-        skipParRi it.n # skip call ')'
-      elif it.n.exprKind == CurlyX:
-        inc it.n # skip curly tag
-        var firstEfld = SymId(0)
-        var firstBranchFields: seq[SumTypeBranchField] = @[]
-        while it.n.hasMore:
-          if it.n.kind == Ident:
-            let branchName = it.n.litId
-            let efldSym = findOneofEfld(c, branchName)
-            if efldSym == SymId(0):
-              buildErr c, dest, it.n.info, "undeclared sum type branch: " & pool.strings[branchName]
-            else:
-              dest.add symToken(efldSym, it.n.info)
-              let ordVal = getEfldOrdinal(efldSym)
-              if not ordVal.isNaN:
-                if seen.containsOrIncl(ordVal):
-                  buildErr c, dest, it.n.info, "value already handled"
-              if firstEfld == SymId(0):
-                firstEfld = efldSym
-                firstBranchFields = findBranchFields(objTypeSym, efldSym)
-              else:
-                let otherFields = findBranchFields(objTypeSym, efldSym)
-                if otherFields.len != firstBranchFields.len or
-                    (otherFields.len > 0 and otherFields[0].sym != firstBranchFields[0].sym):
-                  buildErr c, dest, it.n.info,
-                    "branches in set pattern must come from the same `of` declaration"
-          inc it.n
-        skipParRi it.n # skip curly ')'
-        if firstEfld != SymId(0):
+          let ordVal = getEfldOrdinal(efldSym)
+          if not ordVal.isNaN:
+            if seen.containsOrIncl(ordVal):
+              buildErr c, dest, info, "value already handled"
+          let branchFields = findBranchFields(objTypeSym, efldSym)
           var fieldIdx = 0
           while it.n.hasMore:
-            if it.n.kind == Ident and fieldIdx < firstBranchFields.len:
+            if it.n.isIdent and fieldIdx < branchFields.len:
               bindings.add SumTypeBinding(
-                ident: it.n.litId,
-                fieldSym: firstBranchFields[fieldIdx].sym,
-                fieldType: firstBranchFields[fieldIdx].typ,
+                ident: it.n.strId,
+                fieldSym: branchFields[fieldIdx].sym,
+                fieldType: branchFields[fieldIdx].typ,
                 info: it.n.info)
-            elif it.n.kind == Ident:
+            elif it.n.isIdent:
               buildErr c, dest, it.n.info, "too many bindings for sum type branch"
             inc it.n
             inc fieldIdx
+          it.n = callStart; skip it.n # skip call ')'
+        elif it.n.exprKind == CurlyX:
+          var firstEfld = SymId(0)
+          var firstBranchFields: seq[SumTypeBranchField] = @[]
+          it.n.into: # curly
+            while it.n.hasMore:
+              if it.n.isIdent:
+                let branchName = it.n.strId
+                let efldSym = findOneofEfld(c, branchName)
+                if efldSym == SymId(0):
+                  buildErr c, dest, it.n.info, "undeclared sum type branch: " & pool.strings[branchName]
+                else:
+                  dest.addSymUse(efldSym, it.n.info)
+                  let ordVal = getEfldOrdinal(efldSym)
+                  if not ordVal.isNaN:
+                    if seen.containsOrIncl(ordVal):
+                      buildErr c, dest, it.n.info, "value already handled"
+                  if firstEfld == SymId(0):
+                    firstEfld = efldSym
+                    firstBranchFields = findBranchFields(objTypeSym, efldSym)
+                  else:
+                    let otherFields = findBranchFields(objTypeSym, efldSym)
+                    if otherFields.len != firstBranchFields.len or
+                        (otherFields.len > 0 and otherFields[0].sym != firstBranchFields[0].sym):
+                      buildErr c, dest, it.n.info,
+                        "branches in set pattern must come from the same `of` declaration"
+              inc it.n
+          if firstEfld != SymId(0):
+            var fieldIdx = 0
+            while it.n.hasMore:
+              if it.n.isIdent and fieldIdx < firstBranchFields.len:
+                bindings.add SumTypeBinding(
+                  ident: it.n.strId,
+                  fieldSym: firstBranchFields[fieldIdx].sym,
+                  fieldType: firstBranchFields[fieldIdx].typ,
+                  info: it.n.info)
+              elif it.n.isIdent:
+                buildErr c, dest, it.n.info, "too many bindings for sum type branch"
+              inc it.n
+              inc fieldIdx
+          else:
+            while it.n.hasMore:
+              inc it.n
+          it.n = callStart; skip it.n # skip call ')'
         else:
-          while it.n.hasMore:
-            inc it.n
-        skipParRi it.n # skip call ')'
+          buildErr c, dest, info, "identifier expected for sum type branch name"
+          while it.n.hasMore: skip it.n
+          it.n = callStart; skip it.n
       else:
-        buildErr c, dest, info, "identifier expected for sum type branch name"
-        while it.n.hasMore: skip it.n
-        consumeParRi it.n
-    else:
-      evalConstCaseBranch(c, dest, it, selectorType, seen, info)
-  takeParRi dest, it.n
+        evalConstCaseBranch(c, dest, it, selectorType, seen, info)
 
 proc semObjectCaseBranch(c: var SemContext; dest: var TokenBuf; it: var Item;
                          state: var SemObjectState) =
   if it.n.stmtKind == StmtsS:
-    takeToken dest, it.n
-    while it.n.hasMore:
-      semObjectComponent c, dest, it.n, state
-    takeParRi dest, it.n
+    takeInto dest, it.n:
+      while it.n.hasMore:
+        semObjectComponent c, dest, it.n, state
   elif it.n.substructureKind == NilU:
     # An empty branch (`of X: discard`) parses to a bare `(nil)` body. Emit a
     # well-formed empty `(stmts)` instead so downstream variant walkers (type
@@ -2486,30 +3007,30 @@ proc semObjectCaseBranch(c: var SemContext; dest: var TokenBuf; it: var Item;
     dest.addParRi()
 
 proc buildEfld(buf: var TokenBuf; sym: SymId; parentType: SymId;
-               ordinal: int; name: StrId; info: PackedLineInfo;
+               ordinal: int; name: StrId; info: NifLineInfo;
                exported: bool) =
   buf.addParLe(EfldY, info)
-  buf.add symdefToken(sym, info)
+  buf.addSymDef(sym, info)
   if exported:
-    buf.add identToken(pool.strings.getOrIncl("x"), info)
+    buf.addIdent(pool.strings.getOrIncl("x"), info)
   else:
     buf.addDotToken()
   buf.addDotToken()
-  buf.add symToken(parentType, info)
+  buf.addSymUse(parentType, info)
   buf.addParLe(TupX, info)
-  buf.add intToken(pool.integers.getOrIncl(int64(ordinal)), info)
+  buf.addIntLit(int64(ordinal), info)
   buf.addStrLit pool.strings[name], info
   buf.addParRi()
   buf.addParRi()
 
 proc synthSumTypeDiscriminator(c: var SemContext; dest: var TokenBuf;
-                                it: var Item; info: PackedLineInfo;
+                                it: var Item; info: NifLineInfo;
                                 state: var SemObjectState): TypeCursor =
   skip it.n # skip the empty (fld . . . . .)
 
   type BranchInfo = object
     name: StrId
-    info: PackedLineInfo
+    info: NifLineInfo
   var branches: seq[BranchInfo] = @[]
   var seen = initHashSet[StrId]()
   var scan = it.n
@@ -2518,8 +3039,8 @@ proc synthSumTypeDiscriminator(c: var SemContext; dest: var TokenBuf;
       if scan.substructureKind == RangesU:
         scan.into:                              # (ranges ...)
           while scan.hasMore:
-            if scan.kind == Ident:
-              let name = scan.litId
+            if scan.isIdent:
+              let name = scan.strId
               if seen.containsOrIncl(name):
                 buildErr c, dest, scan.info, "duplicate sum type branch name: " & pool.strings[name]
               else:
@@ -2531,21 +3052,22 @@ proc synthSumTypeDiscriminator(c: var SemContext; dest: var TokenBuf;
 
   var typeNameStr = "`sumtype"
   c.makeGlobalSym(typeNameStr)
-  let oneofTypeSym = pool.syms.getOrIncl(typeNameStr)
+  let oneofTypeSym = pool.symId(typeNameStr)
 
   var efldSyms: seq[(SymId, StrId)] = @[]
   var typeBuf = createTokenBuf(30)
   typeBuf.addParLe(TypeY, info)
-  typeBuf.add symdefToken(oneofTypeSym, info)
+  typeBuf.addSymDef(oneofTypeSym, info)
   typeBuf.addDotToken()
   typeBuf.addDotToken()
   typeBuf.addDotToken()
   typeBuf.addParLe(AnumT, info)
   typeBuf.addSubtree c.types.uint8Type
-  # Store the owning object type sym so that generic type inference
-  # can trace efld → anum → object type (works cross-module):
+  # Store the owning type sym so that constructor type inference can trace
+  # efld → anum → owner type (works cross-module). For a `ref`/`ptr` object
+  # this is the outer alias, so that `Add(...)` yields the `ref`:
   if state.ownerSym != SymId(0):
-    typeBuf.add symToken(state.ownerSym, info)
+    typeBuf.addSymUse(state.ownerSym, info)
   else:
     typeBuf.addDotToken()
   for i, b in branches:
@@ -2573,16 +3095,16 @@ proc synthSumTypeDiscriminator(c: var SemContext; dest: var TokenBuf;
 
   var fldNameStr = "`kind"
   c.makeFieldSym(fldNameStr)
-  let fldSym = pool.syms.getOrIncl(fldNameStr)
+  let fldSym = pool.symId(fldNameStr)
   dest.addParLe(FldY, info)
-  dest.add symdefToken(fldSym, info)
+  dest.addSymDef(fldSym, info)
   if state.isExported:
-    dest.add identToken(pool.strings.getOrIncl("x"), info)
+    dest.addIdent(pool.strings.getOrIncl("x"), info)
   else:
     dest.addDotToken()
   dest.addDotToken()
   let typePos = dest.len
-  dest.add symToken(oneofTypeSym, info)
+  dest.addSymUse(oneofTypeSym, info)
   dest.addDotToken()
   dest.addParRi()
 
@@ -2591,7 +3113,9 @@ proc synthSumTypeDiscriminator(c: var SemContext; dest: var TokenBuf;
 proc semCaseImpl(c: var SemContext; dest: var TokenBuf; it: var Item; mode: CaseMode;
                  state: var SemObjectState) =
   let info = it.n.info
-  takeToken dest, it.n
+  dest.addParLe(it.n.cursorTagId, it.n.info)
+  let caseStart = it.n
+  it.n = sub(it.n)
   var selectorType = default(Cursor)
   var isSumType = false
   var stInfo = SumTypeInfo(valid: false)
@@ -2615,10 +3139,10 @@ proc semCaseImpl(c: var SemContext; dest: var TokenBuf; it: var Item; mode: Case
         needsExprClose = true
         var tmpName = "`case"
         c.makeLocalSym(tmpName)
-        let tmpSym = pool.syms.getOrIncl(tmpName)
+        let tmpSym = pool.symId(tmpName)
         let tmpDeclStart = dest.len
         dest.addParLe(VarS, info)
-        dest.add symdefToken(tmpSym, info)
+        dest.addSymDef(tmpSym, info)
         dest.addDotToken()
         dest.addDotToken()
         dest.addSubtree selectorType
@@ -2629,14 +3153,14 @@ proc semCaseImpl(c: var SemContext; dest: var TokenBuf; it: var Item; mode: Case
         let s = Sym(kind: VarY, name: tmpSym, pos: tmpDeclStart)
         discard addNonOverloadable(c.currentScope, pool.strings.getOrIncl(tmpName), s)
         savedSelector = createTokenBuf(1)
-        savedSelector.add symToken(tmpSym, info)
+        savedSelector.addSymUse(tmpSym, info)
       if stInfo.isRef:
         dest.addParLe(DdotX, info)
       else:
         dest.addParLe(DotX, info)
       for i in 0 ..< savedSelector.len:
         dest.add savedSelector[i]
-      dest.add symToken(stInfo.discrimSym, info)
+      dest.addSymUse(stInfo.discrimSym, info)
       dest.addIntLit(0, info)
       dest.addParRi()
       if needsExprClose:
@@ -2645,7 +3169,7 @@ proc semCaseImpl(c: var SemContext; dest: var TokenBuf; it: var Item; mode: Case
   of ObjectCase:
     var probe = it.n
     inc probe
-    if probe.kind == DotToken:
+    if probe.isDotToken:
       selectorType = synthSumTypeDiscriminator(c, dest, it, info,
         state)
     else:
@@ -2654,7 +3178,6 @@ proc semCaseImpl(c: var SemContext; dest: var TokenBuf; it: var Item; mode: Case
       let field = cursorAt(dest, selectorStart)
       let fieldType = asLocal(field).typ
       let fieldTypePos = cursorToPosition(dest, fieldType)
-      endRead(dest)
       selectorType = typeToCursor(c, dest, fieldTypePos)
       if not isOrdinalType(selectorType):
         buildErr c, dest, info, "selector must be of an ordinal type"
@@ -2663,9 +3186,11 @@ proc semCaseImpl(c: var SemContext; dest: var TokenBuf; it: var Item; mode: Case
   var seen: seq[(xint, xint)] = @[]
   var seenStr = initHashSet[StrId]()
   var bindings: seq[SumTypeBinding] = @[]
-  if it.n.substructureKind == OfU:
-    while it.n.substructureKind == OfU:
-      takeToken dest, it.n
+  if it.n.hasMore and it.n.substructureKind == OfU:
+    while it.n.hasMore and it.n.substructureKind == OfU:
+      dest.addParLe(it.n.cursorTagId, it.n.info)
+      let ofStart = it.n
+      it.n = sub(it.n)
       if isSumType:
         semSumTypeCaseOfValue c, dest, it, selectorType, stInfo.objTypeSym, seen, bindings
       elif isString:
@@ -2681,14 +3206,16 @@ proc semCaseImpl(c: var SemContext; dest: var TokenBuf; it: var Item; mode: Case
             let objDecl = getTypeSection(stInfo.objTypeSym)
             typeBindings = bindInvokeArgs(objDecl, stInfo.invokeArgs)
           withNewScope c:
-            takeToken dest, it.n
+            dest.addParLe(it.n.cursorTagId, it.n.info)
+            let bodyStart = it.n
+            it.n = sub(it.n)
             for b in bindings:
               var bindName = pool.strings[b.ident]
               c.makeLocalSym(bindName)
-              let bindSym = pool.syms.getOrIncl(bindName)
+              let bindSym = pool.symId(bindName)
               let declStart = dest.len
               dest.addParLe(PatternvarS, b.info)
-              dest.add symdefToken(bindSym, b.info)
+              dest.addSymDef(bindSym, b.info)
               dest.addDotToken()
               dest.addDotToken()
               dest.addParLe(MutT, b.info)
@@ -2704,7 +3231,7 @@ proc semCaseImpl(c: var SemContext; dest: var TokenBuf; it: var Item; mode: Case
                 dest.addParLe(DotX, b.info)
               for i in 0 ..< savedSelector.len:
                 dest.add savedSelector[i]
-              dest.add symToken(b.fieldSym, b.info)
+              dest.addSymUse(b.fieldSym, b.info)
               dest.addIntLit(0, b.info)
               dest.addParRi()
               dest.addParRi()
@@ -2714,28 +3241,48 @@ proc semCaseImpl(c: var SemContext; dest: var TokenBuf; it: var Item; mode: Case
                 buildErr c, dest, b.info, "attempt to redeclare: " & pool.strings[b.ident]
             while it.n.hasMore:
               semStmt c, dest, it.n, false
-            takeParRi dest, it.n
+            dest.addParRi(it.n.endInfo)
+            it.n = bodyStart; skip it.n
         else:
           withNewScope c:
             semStmtBranch c, dest, it, true
       of ObjectCase:
         semObjectCaseBranch(c, dest, it, state)
-      takeParRi dest, it.n
+      dest.addParRi(it.n.endInfo)
+      it.n = ofStart; skip it.n
   else:
-    buildErr c, dest, it.n.info, "illformed AST: `of` inside `case` expected"
-  if it.n.substructureKind == ElseU:
-    takeToken dest, it.n
-    case mode
-    of NormalCase:
-      withNewScope c:
-        semStmtBranch c, dest, it, true
-    of ObjectCase:
-      semObjectCaseBranch(c, dest, it, state)
-    takeParRi dest, it.n
+    buildErr c, dest, it.n.endInfo, "illformed AST: `of` inside `case` expected"
+  if it.n.hasMore and it.n.substructureKind == ElseU:
+    takeInto dest, it.n:
+      case mode
+      of NormalCase:
+        withNewScope c:
+          semStmtBranch c, dest, it, true
+      of ObjectCase:
+        semObjectCaseBranch(c, dest, it, state)
   elif not isString:
-    checkExhaustiveness c, dest, it.n.info, selectorType, seen
+    # `info` (the case head) — the close's info is elided under vpr and
+    # the diagnostic should point at the `case` statement anyway:
+    checkExhaustiveness c, dest, info, selectorType, seen
 
-  takeParRi dest, it.n
+  # `of`* `else`? is the whole grammar this pass implements, but nifler parses
+  # every branch form Nim's `case` admits — including the `elif` chain Nim allows
+  # after the `of`s. Anything still unconsumed here used to be dropped WITHOUT a
+  # diagnostic: the `of` loop stopped at the first `elif`, the `else` test then
+  # saw an `elif` and declined, and the close below sealed a `case` missing every
+  # branch from the `elif` onwards. That is a compiler silently deleting code —
+  # a `case`+`elif` in `hexer/coro_transform` compiled clean and produced a hexer
+  # whose `coroTr` had lost its default branch, which broke the self-host. Say so
+  # instead. (Supporting the form — desugaring the tail into an `if` inside the
+  # `else` — is a separate change; erroring is what keeps it from being silent.)
+  while it.n.hasMore:
+    let what = if it.n.substructureKind == ElifU: "`elif`" else: "this"
+    buildErr c, dest, it.n.info,
+      what & " branch in a `case` is not supported; use `else:` with a nested `if`"
+    skip it.n
+
+  dest.addParRi(it.n.endInfo)
+  it.n = caseStart; skip it.n
   if typeKind(it.typ) == AutoT:
     producesVoid c, dest, info, it.typ
 
@@ -2747,21 +3294,21 @@ proc semCase(c: var SemContext; dest: var TokenBuf; it: var Item) =
 proc semForLoopVar(c: var SemContext; dest: var TokenBuf; it: var Item; loopvarType: TypeCursor; loopvarTypeMod = NoType) =
   if stmtKind(it.n) == LetS:
     let declStart = dest.len
-    takeToken dest, it.n
-    let delayed = handleSymDef(c, dest, it.n, LetY)
-    c.addSym dest, delayed
-    wantDot c, dest, it.n # export marker must be empty
-    # The loop variable may carry pragmas (e.g. `{.inject.}` from a template, as
-    # `mapIt`/`toSeq` use); copy the slot through rather than requiring it empty.
-    takeTree dest, it.n # pragmas
-    if loopvarTypeMod != NoType and loopvarType.typeKind notin TypeModifiers:
-      dest.buildTree loopvarTypeMod, it.n.info:
+    var delayed = default(DelayedSym)
+    takeInto dest, it.n:
+      delayed = handleSymDef(c, dest, it.n, LetY)
+      c.addSym dest, delayed
+      wantDot c, dest, it.n # export marker must be empty
+      # The loop variable may carry pragmas (e.g. `{.inject.}` from a template, as
+      # `mapIt`/`toSeq` use); copy the slot through rather than requiring it empty.
+      takeTree dest, it.n # pragmas
+      if loopvarTypeMod != NoType and loopvarType.typeKind notin TypeModifiers:
+        dest.buildTree loopvarTypeMod, it.n.info:
+          copyTree dest, loopvarType
+      else:
         copyTree dest, loopvarType
-    else:
-      copyTree dest, loopvarType
-    skip it.n # skip over the type which might have been set already as we tend to re-sem stuff
-    wantDot c, dest, it.n # value
-    takeParRi dest, it.n
+      skip it.n # skip over the type which might have been set already as we tend to re-sem stuff
+      wantDot c, dest, it.n # value
     publish c, dest, delayed.s.name, declStart
   else:
     buildErr c, dest, it.n.info, "illformed AST: `let` inside `unpackflat` expected"
@@ -2774,7 +3321,7 @@ proc isIterator(c: var SemContext; dest: var TokenBuf; s: SymId): bool =
   if res.decl.symKind == IteratorY:
     return true
   # First-class iter value: a local/param of `itertype`.
-  if res.decl.symKind in {LetY, VarY, CursorY, ParamY, ConstY, GletY, TletY, GvarY, TvarY}:
+  if res.decl.symKind in {LetY, VarY, CursorY, ParamY, StaticParamY, ConstY, GletY, TletY, GvarY, TvarY}:
     let local = asLocal(res.decl)
     result = local.typ.typeKind == ItertypeT
   else:
@@ -2786,42 +3333,73 @@ proc semForLoopTupleVar(c: var SemContext; dest: var TokenBuf; it: var Item; tup
   if tup.typeKind in TypeModifiers:
     loopvarTypeMod = tup.typeKind
     inc tup
-  inc tup
+  tup = sub(tup)
   while it.n.hasMore and tup.hasMore:
     let field = getTupleFieldType(tup)
     if it.n.substructureKind == UnpacktupU:
-      takeToken dest, it.n
-      if field.skipModifier.typeKind == TupleT:
-        semForLoopTupleVar c, dest, it, field, loopvarTypeMod
-      else:
-        buildErr c, dest, it.n.info, "tuple types expected, but got: " & $field
-      takeParRi dest, it.n
+      takeInto dest, it.n:
+        if field.skipModifier.typeKind == TupleT:
+          semForLoopTupleVar c, dest, it, field, loopvarTypeMod
+        else:
+          buildErr c, dest, it.n.info, "tuple types expected, but got: " & typeToString(field)
     else:
       semForLoopVar c, dest, it, field, loopvarTypeMod
     skip tup
-  if it.n.kind == ParRi:
-    if tup.kind == ParRi:
+  if not it.n.hasMore:
+    if not tup.hasMore:
       discard "all fine"
     else:
-      buildErr c, dest, it.n.info, "too few for loop variables"
+      buildErr c, dest, it.n.endInfo, "too few for loop variables"
   else:
     buildErr c, dest, it.n.info, "too many for loop variables"
+    # drain the rest; the caller entered the unpack scope and its
+    # `takeInto` epilogue consumes the close
     while it.n.hasMore: skip it.n
-    consumeParRi it.n
 
 include semfields
+
+proc returnsIterType(c: var SemContext; dest: var TokenBuf; callee: Cursor): bool =
+  ## A `for`-head callee that is not a plain symbol but a resolved CALL:
+  ## `for x in take(it, 2)():`, `for x in relay()():` — the chained form of
+  ## composing iterator factories. Sem has no type navigator, but it does not
+  ## need one here: the inner call's routine declares the `itertype` it hands
+  ## back.
+  if callee.exprKind notin CallKinds: return false
+  let fn = childCursor(callee)
+  if not fn.isSymbol: return false
+  let sym = fetchSym(c, fn.symId)
+  let res = declToCursor(c, dest, sym)
+  if res.status != LacksNothing or not res.decl.symKind.isRoutine: return false
+  result = asRoutine(res.decl).retType.typeKind == ItertypeT
 
 proc isIteratorCall(c: var SemContext; dest: var TokenBuf; beforeCall: int): bool {.inline.} =
   result = dest.len > beforeCall+1
   if result:
     let callKind =
-      if dest[beforeCall].kind == ParLe and rawTagIsNimonyExpr(tagEnum(dest[beforeCall])):
+      if dest[beforeCall].kind == TagLit and rawTagIsNimonyExpr(tagEnum(dest[beforeCall])):
         cast[NimonyExpr](tagEnum(dest[beforeCall]))
       else:
         NoExpr
-    result = callKind in CallKinds and
-      dest[beforeCall+1].kind == Symbol and
-      c.isIterator(dest, dest[beforeCall+1].symId)
+    if callKind in CallKinds:
+      # head+1 may be a line-info suffix; go through the child cursor
+      let callee = childCursor(readonlyCursorAt(dest, beforeCall))
+      result =
+        if callee.isSymbol: c.isIterator(dest, callee.symId)
+        else: returnsIterType(c, dest, callee)
+    else:
+      result = false
+
+proc isRecursiveInlineIterCall(c: var SemContext; dest: var TokenBuf; beforeCall: int): bool =
+  ## An inline iterator is expanded into its caller, so one that loops over
+  ## itself would be expanded forever.
+  result = false
+  let callee = childCursor(readonlyCursorAt(dest, beforeCall))
+  if callee.isSymbol:
+    var r = c.routine
+    while r != nil:
+      if r.kind == IteratorY and r.sym == callee.symId:
+        return ClosureP notin r.pragmas and PassiveP notin r.pragmas
+      r = r.parent
 
 proc isIdentCall(c: var SemContext; dest: var TokenBuf; beforeCall: int): bool {.inline.} =
   # A call whose fn is unresolved at sem time and needs re-resolution at
@@ -2834,24 +3412,26 @@ proc isIdentCall(c: var SemContext; dest: var TokenBuf; beforeCall: int): bool {
   result = dest.len > beforeCall+1
   if result:
     let callKind =
-      if dest[beforeCall].kind == ParLe and rawTagIsNimonyExpr(tagEnum(dest[beforeCall])):
+      if dest[beforeCall].kind == TagLit and rawTagIsNimonyExpr(tagEnum(dest[beforeCall])):
         cast[NimonyExpr](tagEnum(dest[beforeCall]))
       else:
         NoExpr
     if callKind notin CallKinds:
       return false
-    let fnTok = dest[beforeCall+1]
-    if fnTok.kind == Ident:
+    # head+1 may be a line-info suffix; go through the child cursor
+    let fnCur = childCursor(readonlyCursorAt(dest, beforeCall))
+    if not fnCur.hasMore:
+      result = false
+    elif fnCur.kind == Ident:
       result = true
-    elif fnTok.kind == ParLe:
-      let fnExpr = exprKind(fnTok)
-      result = fnExpr in {OchoiceX, CchoiceX}
+    elif fnCur.isTagLit:
+      result = fnCur.exprKind in {OchoiceX, CchoiceX}
     else:
       result = false
 
 proc tryForLoopPlugin(c: var SemContext; dest: var TokenBuf; it: var Item;
-                      beforeCall: int; info: PackedLineInfo;
-                      loopVarType: TypeCursor): bool =
+                      forHeadPos, beforeCall: int; info: NifLineInfo;
+                      loopVarType: TypeCursor; forStart: Cursor): bool =
   ## When a `for` loop's iterator resolves to a routine with a `.plugin`
   ## pragma, invoke the plugin with the for-loop context instead of doing
   ## normal iterator resolution. The plugin receives:
@@ -2865,19 +3445,24 @@ proc tryForLoopPlugin(c: var SemContext; dest: var TokenBuf; it: var Item;
   ## macros. This lets plugins do type- and effect-aware transformations.
   result = false
   if dest.len <= beforeCall + 1 or
-     dest[beforeCall].exprKind notin CallKinds or
-     dest[beforeCall + 1].kind != Symbol: return
-  let res = declToCursor(c, dest, fetchSym(c, dest[beforeCall + 1].symId))
+     dest[beforeCall].exprKind notin CallKinds: return
+  # not `dest[beforeCall + 1]`: the call head may carry a line-info suffix
+  let fn = childCursor(readonlyCursorAt(dest, beforeCall))
+  if not fn.isSymbol: return
+  let res = declToCursor(c, dest, fetchSym(c, fn.symId))
   if res.status != LacksNothing or not isRoutine(res.decl.symKind): return
   let routine = asRoutine(res.decl, SkipExclBody)
   let pp = extractPragma(routine.pragmas, PluginP)
-  if cursorIsNil(pp) or pp.kind != StringLit: return
+  if cursorIsNil(pp) or pp.kind != StrLit: return
   result = true
 
   # Extract the sem'd call from dest so we can pass the call args to the plugin
   var callBuf = createTokenBuf(dest.len - beforeCall)
+  # balanced span: raw copy keeps its seals
   for tok in beforeCall ..< dest.len: callBuf.add dest[tok]
-  dest.shrink beforeCall - 1
+  # drop the sem'd call plus the `(for` head (whose width can exceed one
+  # token: line-info suffixes)
+  dest.shrink forHeadPos
 
   # Type the loop variable(s) against the iterator's element type and
   # sem-check the loop body into a temporary buffer, so the plugin gets a
@@ -2887,39 +3472,43 @@ proc tryForLoopPlugin(c: var SemContext; dest: var TokenBuf; it: var Item;
   withNewScope c:
     case substructureKind(it.n)
     of UnpackflatU:
-      takeToken vb, it.n
-      var n2 = it.n
-      skip n2
-      let hasMultiVars = n2.hasMore
-      if hasMultiVars:
+      takeInto vb, it.n:
+        var n2 = it.n
+        skip n2
+        let hasMultiVars = n2.hasMore
+        if hasMultiVars:
+          if loopVarType.skipModifier.typeKind == TupleT:
+            semForLoopTupleVar c, vb, it, loopVarType
+          else:
+            while it.n.hasMore:
+              let autoType = c.types.autoType
+              semForLoopVar c, vb, it, autoType
+        else:
+          semForLoopVar c, vb, it, loopVarType
+    of UnpacktupU:
+      takeInto vb, it.n:
         if loopVarType.skipModifier.typeKind == TupleT:
           semForLoopTupleVar c, vb, it, loopVarType
         else:
-          while it.n.hasMore:
-            semForLoopVar c, vb, it, c.types.autoType
-      else:
-        semForLoopVar c, vb, it, loopVarType
-      takeParRi vb, it.n
-    of UnpacktupU:
-      takeToken vb, it.n
-      if loopVarType.skipModifier.typeKind == TupleT:
-        semForLoopTupleVar c, vb, it, loopVarType
-      else:
-        buildErr c, vb, it.n.info, "tuple types expected, but got: " & $loopVarType
-      takeParRi vb, it.n
-    else:
+          buildErr c, vb, it.n.info, "tuple types expected, but got: " & typeToString(loopVarType)
+    of NoSub, NilU, NotnilU, UncheckedU, KvU, VvU, RangeU, RangesU, ParamU, StaticParamU, TypevarU,
+       StaticTypevarU, EfldU, FldU, GfldU, WhenU, ElifU, ElseU, TypevarsU, CaseU, OfU,
+       StmtsU, ParamsU, PragmasU, EitherU, JoinU, CallargsU, ForcallU, ExceptU, FinU,
+       DeferexpansionU, NeedtypesU:
       buildErr c, vb, it.n.info, "illformed AST: `unpackflat` or `unpacktup` inside `for` expected"
       skip it.n
     inc c.routine.inLoop
+    c.routine.breakTargets.add SymId(0)
     semStmt c, vb, it.n, true
+    discard c.routine.breakTargets.pop()
     dec c.routine.inLoop
-  inc it.n # skip the for's closing ')'
+  it.n = forStart; skip it.n # skip the for's closing ')'
 
   # Build plugin input:
   # (forcall <iter-name> (callargs <arg1> ...) (unpackflat ...) <body>)
   var b = createTokenBuf(30)
   b.addParLe ForcallU, info
-  b.add identToken(symToIdent(routine.name.symId), info)
+  b.addIdent(symToIdent(routine.name.symId), info)
   # (callargs ...)
   b.addParLe CallargsU, info
   var callC = beginRead(callBuf)
@@ -2936,7 +3525,7 @@ proc tryForLoopPlugin(c: var SemContext; dest: var TokenBuf; it: var Item;
 
   # Run plugin, then re-sem the output into dest
   var pluginOutput = createTokenBuf(30)
-  runPlugin(c, pluginOutput, pp.info, pool.strings[pp.litId], b.toString)
+  runPlugin(c, pluginOutput, pp.info, pool.strings[pp.strId], b)
   var expandedItem = Item(n: cursorAt(pluginOutput, 0), typ: c.types.autoType)
   semExpr c, dest, expandedItem
   producesNoReturn c, dest, info, it.typ
@@ -2944,28 +3533,40 @@ proc tryForLoopPlugin(c: var SemContext; dest: var TokenBuf; it: var Item;
 proc semFor(c: var SemContext; dest: var TokenBuf; it: var Item) =
   let info = it.n.info
   let orig = it.n
-  takeToken dest, it.n
+  let forHeadPos = dest.len
+  dest.addParLe(it.n.cursorTagId, it.n.info)
+  let forStart = it.n
+  it.n = sub(it.n)
   var iterCall = Item(n: it.n, typ: c.types.autoType)
   let callInfo = iterCall.n.info
   let beforeCall = dest.len
   semExpr c, dest, iterCall, {PreferIterators, KeepMagics}
   it.n = iterCall.n
-  if tryForLoopPlugin(c, dest, it, beforeCall, info, iterCall.typ):
+  if tryForLoopPlugin(c, dest, it, forHeadPos, beforeCall, info, iterCall.typ, forStart):
     return
   var isMacroLike = false
-  if dest[beforeCall].exprKind == ErrX:
+  if hasErrorSince(dest, beforeCall):
+    # Not just `dest[beforeCall]`: the error can sit below the head. An
+    # undeclared callee leaves a reconstructed `(call (err ...) args)` behind,
+    # and handing that to the implicit-iterator fallback below buries the
+    # precise "undeclared identifier: 'x'" under the generic "cannot call
+    # expression of type auto" (nim-lang/nimony#2553).
     discard "already produced an error"
   elif isIteratorCall(c, dest, beforeCall):
-    discard "fine"
-  elif dest[beforeCall].kind == ParLe and
+    if isRecursiveInlineIterCall(c, dest, beforeCall):
+      dest.shrink beforeCall
+      buildErr c, dest, callInfo, "recursion is not supported in inline iterators"
+  elif dest[beforeCall].kind == TagLit and
       (dest[beforeCall].tagId == TagId(FieldsTagId) or
        dest[beforeCall].tagId == TagId(FieldpairsTagId) or
        dest[beforeCall].tagId == TagId(InternalFieldPairsTagId)):
     var callBuf = createTokenBuf(dest.len - beforeCall)
+    # balanced span: raw copy keeps its seals
     for tok in beforeCall ..< dest.len: callBuf.add dest[tok]
-    dest.shrink beforeCall-1
+    # drop the sem'd call plus the `(for` head (width can exceed one token)
+    dest.shrink forHeadPos
     var call = beginRead(callBuf)
-    semForFields c, dest, it, call, orig
+    semForFields c, dest, it, call, orig, forStart
     return
   elif iterCall.typ.typeKind == UntypedT or
       # for iterators from concepts in generic context:
@@ -2995,6 +3596,8 @@ proc semFor(c: var SemContext; dest: var TokenBuf; it: var Item) =
       var callBuf = createTokenBuf(32)
       callBuf.addParLe(CallX, callInfo)
       discard buildSymChoice(c, callBuf, pool.strings.getOrIncl(name), info, FindAll)
+      # balanced span: raw copy keeps its seals and leaves the pending
+      # CallX as the only open tag for the close below
       for tok in beforeCall ..< dest.len: callBuf.add dest[tok]
       callBuf.addParRi()
       let argType = iterCall.typ
@@ -3002,13 +3605,15 @@ proc semFor(c: var SemContext; dest: var TokenBuf; it: var Item) =
       shrink dest, beforeCall
       semCall c, dest, iterCall, {PreferIterators}
       if isIteratorCall(c, dest, beforeCall):
-        discard "fine"
+        if isRecursiveInlineIterCall(c, dest, beforeCall):
+          dest.shrink beforeCall
+          buildErr c, dest, callInfo, "recursion is not supported in inline iterators"
       elif iterCall.typ.typeKind == UntypedT or
           # for iterators from concepts in generic context:
           isIdentCall(c, dest, beforeCall):
         isMacroLike = true
       else:
-        if dest[beforeCall].kind == ParLe and dest[beforeCall].tagId == nifstreams.ErrT:
+        if dest[beforeCall].kind == TagLit and dest[beforeCall].tagId == nifpools.ErrT:
           # original nim gives `items` overload errors so preserve them
           discard
         else:
@@ -3017,29 +3622,30 @@ proc semFor(c: var SemContext; dest: var TokenBuf; it: var Item) =
   withNewScope c:
     case substructureKind(it.n)
     of UnpackflatU:
-      takeToken dest, it.n
-      var n2 = it.n
-      skip n2
-      let hasMultiVars = n2.hasMore
-      if hasMultiVars:
+      takeInto dest, it.n:
+        var n2 = it.n
+        skip n2
+        let hasMultiVars = n2.hasMore
+        if hasMultiVars:
+          if iterCall.typ.skipModifier.typeKind == TupleT:
+            semForLoopTupleVar c, dest, it, iterCall.typ
+          else:
+            # error handling
+            while it.n.hasMore:
+              let autoType = c.types.autoType
+              semForLoopVar c, dest, it, autoType
+        else:
+          semForLoopVar c, dest, it, iterCall.typ
+    of UnpacktupU:
+      takeInto dest, it.n:
         if iterCall.typ.skipModifier.typeKind == TupleT:
           semForLoopTupleVar c, dest, it, iterCall.typ
         else:
-          # error handling
-          while it.n.hasMore:
-            semForLoopVar c, dest, it, c.types.autoType
-      else:
-        semForLoopVar c, dest, it, iterCall.typ
-
-      takeParRi dest, it.n
-    of UnpacktupU:
-      takeToken dest, it.n
-      if iterCall.typ.skipModifier.typeKind == TupleT:
-        semForLoopTupleVar c, dest, it, iterCall.typ
-      else:
-        buildErr c, dest, it.n.info, "tuple types expected, but got: " & $iterCall.typ
-      takeParRi dest, it.n
-    else:
+          buildErr c, dest, it.n.info, "tuple types expected, but got: " & typeToString(iterCall.typ)
+    of NoSub, NilU, NotnilU, UncheckedU, KvU, VvU, RangeU, RangesU, ParamU, StaticParamU, TypevarU,
+       StaticTypevarU, EfldU, FldU, GfldU, WhenU, ElifU, ElseU, TypevarsU, CaseU, OfU,
+       StmtsU, ParamsU, PragmasU, EitherU, JoinU, CallargsU, ForcallU, ExceptU, FinU,
+       DeferexpansionU, NeedtypesU:
       buildErr c, dest, it.n.info, "illformed AST: `unpackflat` or `unpacktup` inside `for` expected"
       skip it.n
 
@@ -3047,181 +3653,257 @@ proc semFor(c: var SemContext; dest: var TokenBuf; it: var Item) =
       takeTree dest, it.n # don't touch the body
     else:
       inc c.routine.inLoop
+      c.routine.breakTargets.add SymId(0)
       semStmt c, dest, it.n, true
+      discard c.routine.breakTargets.pop()
       dec c.routine.inLoop
 
-  takeParRi dest, it.n
+  dest.addParRi(it.n.endInfo)
+  it.n = forStart; skip it.n
   producesNoReturn c, dest, info, it.typ
 
 proc semReturn(c: var SemContext; dest: var TokenBuf; it: var Item) =
   let info = it.n.info
-  takeToken dest, it.n
-  let noRoutine = c.routine.kind == NoSym
-  if noRoutine:
-    buildErr c, dest, info, "`return` only allowed within a routine"
-  if it.n.kind == DotToken:
-    # Templates have no `result` symbol — the `return` is text-substituted
-    # into the caller, so the meaning depends on the caller's signature.
-    # Preserve the dot and let template expansion resolve it.
-    # With NO enclosing routine there is no `returnType` cursor at all: reading
-    # its `typeKind` asserts in nifcursors (`c.p != nil and c.rem > 0`), which
-    # turned a plain error into a compiler crash.
-    if not noRoutine and c.routine.kind != TemplateY and
-       c.routine.returnType.typeKind != VoidT:
-      dest.addSymUse c.routine.resId, info
-      inc it.n # skips the dot
+  takeInto dest, it.n:
+    let noRoutine = c.routine.kind == NoSym
+    if noRoutine:
+      buildErr c, dest, info, "`return` only allowed within a routine"
+    if it.n.isDotToken:
+      # Templates have no `result` symbol — the `return` is text-substituted
+      # into the caller, so the meaning depends on the caller's signature.
+      # Preserve the dot and let template expansion resolve it. An iterator's
+      # return type is what it yields: it has no `result` to return either.
+      # With NO enclosing routine there is no `returnType` cursor at all: reading
+      # its `typeKind` asserts in nifcursors (`c.p != nil and c.rem > 0`), which
+      # turned a plain error into a compiler crash (fork fix 3574a13a).
+      if not noRoutine and c.routine.kind notin {TemplateY, IteratorY} and
+         c.routine.returnType.typeKind != VoidT:
+        dest.addSymUse c.routine.resId, info
+        inc it.n # skips the dot
+      else:
+        takeTree dest, it.n
     else:
-      takeToken dest, it.n
-  else:
-    var a = Item(n: it.n, typ: c.routine.returnType)
-    # `return` within a template refers to the caller, so
-    # we allow any type here; and outside a routine there is no expected type to
-    # check against, so the error above stands on its own.
-    if c.routine.kind == TemplateY or noRoutine:
-      a.typ = c.types.autoType
-    semExpr c, dest, a
-    it.n = a.n
-  takeParRi dest, it.n
+      var a = Item(n: it.n, typ: c.routine.returnType)
+      # `return` within a template refers to the caller, so
+      # we allow any type here; and outside a routine there is no expected type to
+      # check against, so the error above stands on its own.
+      if c.routine.kind == TemplateY or noRoutine:
+        a.typ = c.types.autoType
+      semExpr c, dest, a
+      it.n = a.n
   producesNoReturn c, dest, info, it.typ
 
 proc semRaise(c: var SemContext; dest: var TokenBuf; it: var Item) =
   let info = it.n.info
-  takeToken dest, it.n
-  if c.routine.kind == NoSym:
-    buildErr c, dest, info, "`raise` only allowed within a routine"
-  elif not c.routine.pragmas.contains(RaisesP) and CanRaiseFeature notin c.features:
-    buildErr c, dest, info, "`raise` only allowed within a routine with `raises` pragma"
-  if it.n.kind == DotToken:
-    if c.routine.inExcept == 0:
-      buildErr c, dest, info,
-        "bare `raise` is only allowed inside an `except` block"
-    takeToken dest, it.n
-  else:
-    var a = Item(n: it.n, typ: c.types.autoType)
-    semExpr c, dest, a
-    # Type check: raised type must be a subtype of the .raises pragma type
-    if not cursorIsNil(c.routine.raisesType) and typeKind(c.routine.raisesType) != AutoT:
-      # Allow exact match or subtype (inheritance).
-      # If both are `ref T` heap-exception types, peel the ref so the
-      # inheritance check below can compare the underlying object types.
-      # The local names below are chosen to avoid collisions with the
-      # `expectedType` parameter on `SemExpressionExecutor` (semdata.nim) —
-      # `makeLocalSym` only guarantees per-module uniqueness, so naming
-      # this `expectedType` would share its `pool.syms` ID with that
-      # parameter and the borrow check would resolve to the wrong decl.
-      var raisedRefT = skipModifier(a.typ)
-      var raisesRefT = skipModifier(c.routine.raisesType)
-      if raisedRefT.typeKind == RefT and raisesRefT.typeKind == RefT:
-        inc raisedRefT
-        inc raisesRefT
-      var compatible = sameTrees(raisedRefT, raisesRefT)
-      # Check if raisedRefT is a subtype of raisesRefT (inheritance)
-      if not compatible and raisedRefT.kind == Symbol and raisesRefT.kind == Symbol:
-        # Use sigmatch's inheritance checking instead of manual chain walking
-        var m = createMatch(addr c)
-        matchObjectInheritance(m, raisesRefT, raisedRefT, raisesRefT.symId, raisedRefT.symId, NoType)
-        compatible = not m.err
-      if not compatible:
-        c.typeMismatch dest, info, a.typ, c.routine.raisesType
-    it.n = a.n
-  takeParRi dest, it.n
+  # A template's body is checked where it is DECLARED, but whether it may
+  # raise is a property of where it is EXPANDED: the expansion is checked again
+  # in that routine. An error written into the stored body here would be copied
+  # into every expansion as an extra child of the `raise`.
+  let inTemplate = c.routine.kind == TemplateY
+  takeInto dest, it.n:
+    if c.routine.kind == NoSym:
+      buildErr c, dest, info, "`raise` only allowed within a routine"
+    elif not inTemplate and not c.routine.pragmas.contains(RaisesP) and
+        CanRaiseFeature notin c.features:
+      buildErr c, dest, info, "`raise` only allowed within a routine with `raises` pragma"
+    if it.n.isDotToken:
+      if c.routine.inExcept == 0 and not inTemplate:
+        buildErr c, dest, info,
+          "bare `raise` is only allowed inside an `except` block"
+      takeTree dest, it.n
+    else:
+      var a = Item(n: it.n, typ: c.types.autoType)
+      semExpr c, dest, a
+      # Type check: raised type must be a subtype of the .raises pragma type
+      if not cursorIsNil(c.routine.raisesType) and typeKind(c.routine.raisesType) != AutoT:
+        # Allow exact match or subtype (inheritance).
+        # If both are `ref T` heap-exception types, peel the ref so the
+        # inheritance check below can compare the underlying object types.
+        # The local names below are chosen to avoid collisions with the
+        # `expectedType` parameter on `SemExpressionExecutor` (semdata.nim) —
+        # `makeLocalSym` only guarantees per-module uniqueness, so naming
+        # this `expectedType` would share its `pool.syms` ID with that
+        # parameter and the borrow check would resolve to the wrong decl.
+        var raisedRefT = skipModifierAndOwned(a.typ)
+        var raisesRefT = skipModifier(c.routine.raisesType)
+        if raisedRefT.typeKind == RefT and raisesRefT.typeKind == RefT:
+          inc raisedRefT
+          inc raisesRefT
+        var compatible = sameTrees(raisedRefT, raisesRefT)
+        # Check if raisedRefT is a subtype of raisesRefT (inheritance)
+        if not compatible and raisedRefT.isSymbol and raisesRefT.isSymbol:
+          # Use sigmatch's inheritance checking instead of manual chain walking
+          var m = createMatch(addr c)
+          matchObjectInheritance(m, raisesRefT, raisedRefT, raisesRefT.symId, raisedRefT.symId, NoType)
+          compatible = not m.err
+        if not compatible:
+          let raisesType = c.routine.raisesType
+          c.typeMismatch dest, info, a.typ, raisesType
+      it.n = a.n
   producesNoReturn c, dest, info, it.typ
 
 proc semYield(c: var SemContext; dest: var TokenBuf; it: var Item) =
   let info = it.n.info
-  takeToken dest, it.n
-  if c.routine.kind != IteratorY and not c.routine.pragmas.contains(PassiveP):
-    buildErr c, dest, info, "`yield` only allowed within an `iterator`"
-  if it.n.kind == DotToken:
-    takeToken dest, it.n
-  else:
-    let expectedType =
-      if c.routine.pragmas.contains(PassiveP) or c.routine.kind == NoSym:
-        # No enclosing routine: `returnType` is an empty cursor, and reading it
-        # asserts in nifcursors. The error was already reported above.
-        c.types.autoType
-      else: c.routine.returnType
-    var a = Item(n: it.n, typ: expectedType)
-    semExpr c, dest, a
-    it.n = a.n
-  takeParRi dest, it.n
+  takeInto dest, it.n:
+    if c.routine.kind != IteratorY and not c.routine.pragmas.contains(PassiveP):
+      buildErr c, dest, info, "`yield` only allowed within an `iterator`"
+    if it.n.isDotToken:
+      takeTree dest, it.n
+    else:
+      let expectedType =
+        if c.routine.pragmas.contains(PassiveP) or c.routine.kind == NoSym:
+          # No enclosing routine: `returnType` is an empty cursor, and reading it
+          # asserts in nifcursors. The error was already reported above
+          # (fork fix 3574a13a).
+          c.types.autoType
+        else: c.routine.returnType
+      var a = Item(n: it.n, typ: expectedType)
+      semExpr c, dest, a
+      it.n = a.n
   producesVoid c, dest, info, it.typ
 
 proc semTypedBinaryArithmetic(c: var SemContext; dest: var TokenBuf; it: var Item) =
   let beforeExpr = dest.len
-  takeToken dest, it.n
-  let typeStart = dest.len
-  semLocalTypeImpl c, dest, it.n, InLocalDecl
-  let typ = typeToCursor(c, dest, typeStart)
-  semExpr c, dest, it
-  semExpr c, dest, it
-  takeParRi dest, it.n
+  var typ = default(TypeCursor)
+  takeInto dest, it.n:
+    let typeStart = dest.len
+    semLocalTypeImpl c, dest, it.n, InLocalDecl
+    typ = typeToCursor(c, dest, typeStart)
+    semExpr c, dest, it
+    semExpr c, dest, it
   commonType c, dest, it, beforeExpr, typ
 
 proc semShift(c: var SemContext; dest: var TokenBuf; it: var Item) =
   let beforeExpr = dest.len
-  takeToken dest, it.n
-  let typeStart = dest.len
-  semLocalTypeImpl c, dest, it.n, InLocalDecl
-  let typ = typeToCursor(c, dest, typeStart)
-  semExpr c, dest, it
-  var shift = Item(n: it.n, typ: c.types.autoType)
-  let shiftInfo = shift.n.info
-  let beforeShift = dest.len
-  semExpr c, dest, shift
-  it.n = shift.n
-  if dest[beforeShift].exprKind != ErrX and shift.typ.typeKind notin {IntT, UIntT}:
-    c.buildErr dest, shiftInfo, "expected integer for shift operand"
-  takeParRi dest, it.n
+  var typ = default(TypeCursor)
+  takeInto dest, it.n:
+    let typeStart = dest.len
+    semLocalTypeImpl c, dest, it.n, InLocalDecl
+    typ = typeToCursor(c, dest, typeStart)
+    semExpr c, dest, it
+    var shift = Item(n: it.n, typ: c.types.autoType)
+    let shiftInfo = shift.n.info
+    let beforeShift = dest.len
+    semExpr c, dest, shift
+    it.n = shift.n
+    if dest[beforeShift].exprKind != ErrX and shift.typ.typeKind notin {IntT, UIntT}:
+      c.buildErr dest, shiftInfo, "expected integer for shift operand"
   commonType c, dest, it, beforeExpr, typ
 
 proc semCmp(c: var SemContext; dest: var TokenBuf; it: var Item) =
   let beforeExpr = dest.len
-  takeToken dest, it.n
-  let typeStart = dest.len
-  semLocalTypeImpl c, dest, it.n, InLocalDecl
-  let typ = typeToCursor(c, dest, typeStart)
-  var operand = Item(n: it.n, typ: typ)
-  semExpr c, dest, operand
-  semExpr c, dest, operand
-  it.n = operand.n
-  takeParRi dest, it.n
-  commonType c, dest, it, beforeExpr, c.types.boolType
+  takeInto dest, it.n:
+    let typeStart = dest.len
+    semLocalTypeImpl c, dest, it.n, InLocalDecl
+    let typ = typeToCursor(c, dest, typeStart)
+    var operand = Item(n: it.n, typ: typ)
+    semExpr c, dest, operand
+    semExpr c, dest, operand
+    it.n = operand.n
+  let boolType = c.types.boolType
+  commonType c, dest, it, beforeExpr, boolType
 
 proc literal(c: var SemContext; dest: var TokenBuf; it: var Item; literalType: TypeCursor) =
   let beforeExpr = dest.len
-  takeToken dest, it.n
+  takeTree dest, it.n
   let expected = it.typ
   it.typ = literalType
   commonType c, dest, it, beforeExpr, expected
 
 proc literalB(c: var SemContext; dest: var TokenBuf; it: var Item; literalType: TypeCursor) =
   let beforeExpr = dest.len
-  takeToken dest, it.n
   var literalType = literalType
-  if it.n.hasMore:
-    let typeStart = dest.len
-    semLocalTypeImpl c, dest, it.n, InLocalDecl
-    literalType = typeToCursor(c, dest, typeStart)
-    if it.n.hasMore and it.n.exprKind == NilX:
-      skip it.n
-  takeParRi dest, it.n
+  takeInto dest, it.n:
+    if it.n.hasMore:
+      let typeStart = dest.len
+      semLocalTypeImpl c, dest, it.n, InLocalDecl
+      literalType = typeToCursor(c, dest, typeStart)
+      if it.n.hasMore and it.n.exprKind == NilX:
+        skip it.n
   let expected = it.typ
   it.typ = literalType
   commonType c, dest, it, beforeExpr, expected
 
 proc semNil(c: var SemContext; dest: var TokenBuf; it: var Item) =
-  literalB c, dest, it, c.types.nilType
+  let beforeExpr = dest.len
+  let nilType = c.types.nilType
+  literalB c, dest, it, nilType
+  # A `nil` that `commonType` resolved against a pointer-like type is emitted
+  # as `(nil T)`: later passes compute the type of an `if` or `case`
+  # expression from its branches and must not see `nilt` there (#2605).
+  let t = typeForNil(it.typ)
+  if not cursorIsNil(t) and beforeExpr < dest.len:
+    var lit = cursorAt(dest, beforeExpr)
+    if lit.exprKind == NilX and not lit.childCursor.hasMore:
+      var typed = createTokenBuf(8)
+      typed.addParLe(NilX, lit.info)
+      typed.addSubtree t
+      typed.addParRi()
+      endRead lit
+      dest.replace cursorAt(typed, 0), beforeExpr
+    else:
+      endRead lit
 
 proc semTypedUnaryArithmetic(c: var SemContext; dest: var TokenBuf; it: var Item) =
   let beforeExpr = dest.len
-  takeToken dest, it.n
-  let typeStart = dest.len
-  semLocalTypeImpl c, dest, it.n, InLocalDecl
-  let typ = typeToCursor(c, dest, typeStart)
-  semExpr c, dest, it
-  takeParRi dest, it.n
+  var typ = default(TypeCursor)
+  takeInto dest, it.n:
+    let typeStart = dest.len
+    semLocalTypeImpl c, dest, it.n, InLocalDecl
+    typ = typeToCursor(c, dest, typeStart)
+    semExpr c, dest, it
   commonType c, dest, it, beforeExpr, typ
+
+proc escapingDelayParam(c: var SemContext; dest: var TokenBuf; fn: Cursor): Local =
+  ## `delay(f(...))` builds a continuation this chain does not run. It is handed
+  ## to a scheduler, may resume on another thread, and in the spawn shape
+  ## (`submit(delay(f(x)), h)`) outlives the frame that built it outright. A
+  ## `var`/`out`/`lent` parameter is an alias of a location the caller owns, and
+  ## the coroutine frame stores it as a bare pointer — so it dangles as soon as
+  ## the caller moves on, with nothing at the use site to say so.
+  ##
+  ## Answers the first such parameter of `f`, or a `Local` whose `name` is nil.
+  result = default(Local)
+  if not fn.isSymbol: return
+  let res = declToCursor(c, dest, fetchSym(c, fn.symId))
+  if res.status != LacksNothing or not isRoutine(res.decl.symKind): return
+  var params = asRoutine(res.decl, SkipExclBody).params
+  if params.substructureKind != ParamsU: return
+  params = sub(params) # bounded probe: sealed decl bufs elide the ParRi, so a
+                       # raw `inc` would read past an empty (params)
+  while params.hasMore:
+    let p = asLocal(params)
+    if p.typ.typeKind in {MutT, OutT, LentT}:
+      return p
+    skip params
+
+proc undelayableResult(c: var SemContext; dest: var TokenBuf; fn: Cursor): string =
+  ## What `f` hands back that a delayed call has nowhere to put: the
+  ## continuation runs later, often on a worker, after the expression that
+  ## built it is gone. A result or an error must be handled inside the task.
+  ## Answers "" when there is none.
+  result = ""
+  if not fn.isSymbol: return
+  let res = declToCursor(c, dest, fetchSym(c, fn.symId))
+  if res.status != LacksNothing or not isRoutine(res.decl.symKind): return
+  let r = asRoutine(res.decl, SkipExclBody)
+  if not isVoidType(r.retType):
+    result = "returns `" & typeToString(r.retType) & "`, but nothing can receive the value"
+  elif hasPragma(r.pragmas, RaisesP):
+    result = "is `.raises`, but nothing can receive the error"
+
+proc delayResultErr(c: var SemContext; dest: var TokenBuf; info: NifLineInfo;
+                    fn: Cursor; what: string) =
+  buildErr c, dest, info,
+    "`delay` hands `" & asNimCode(fn.symId) & "` to a scheduler, which runs it after this expression is gone; `" &
+      asNimCode(fn.symId) & "` " & what & " there. Handle it inside the task instead"
+
+proc delayEscapeErr(c: var SemContext; dest: var TokenBuf; info: NifLineInfo;
+                    fn: Cursor; p: Local) =
+  buildErr c, dest, info,
+    "`delay` hands `" & asNimCode(fn.symId) & "` to a scheduler, so its continuation can outlive this frame; parameter `" &
+      asNimCode(p.name.symId) & ": " & typeToString(p.typ) &
+      "` would alias a location that is already gone. Take it as `sink` instead"
 
 proc semDelay(c: var SemContext; dest: var TokenBuf; it: var Item) =
   # delay() no-arg -> (delay0)
@@ -3230,57 +3912,63 @@ proc semDelay(c: var SemContext; dest: var TokenBuf; it: var Item) =
   let beforeExpr = dest.len
   let expected = it.typ
   let info = it.n.info
-  inc it.n  # skip (delay tag (always DelayX from addFn)
-  if it.n.kind == ParRi:
+  let delayStart = it.n
+  it.n = sub(it.n)  # skip (delay tag (always DelayX from addFn)
+  if not it.n.hasMore:
     # delay() no-arg form: produces (delay0)
     dest.addParLe(Delay0X, info)
     dest.addParRi()
-    inc it.n
-  elif it.n.exprKind in CallKinds and (var probe = it.n; skip probe; probe.kind == ParRi):
-    # delay(call) form: the inner call is delay's SOLE child (the original,
-    # not-yet-flattened shape). Produce (delay fn args) by stripping the call
-    # wrapper.
-    dest.addParLe(DelayX, info)
-    it.n.into:                         # descend past inner call's tag
-      while it.n.hasMore:
-        takeTree dest, it.n            # copy fn and args verbatim (already semchecked)
-    dest.addParRi()
-    skipParRi it.n                     # skip outer delay's )
-  elif it.n.kind != ParRi:
-    # already-flattened (delay fn args…) form. This occurs when a generic
-    # proc body — semchecked (and thus flattened by THIS proc) once during
-    # the first pass — is re-semmed during generic instantiation. Unlike the
-    # first pass (where normal call-argument semchecking has already semmed the
-    # inner call before dispatching here), instantiation re-sem hands us the
-    # RAW generic `(delay fn args)` and never re-sems the delayed callee. A
-    # verbatim copy therefore leaves a generic delayed callee uninstantiated
-    # (e.g. `delay raceW(f, result)` with raceW a generic `.passive` proc stays
-    # `raceW.0.` instead of `raceW.0.I<hash>`), so hexer's coro transform skips
-    # it (`isConcrete == false`), no `.coro` frame type is emitted, and both
-    # lengc-native and lengjs assert in `loadForeign` ("Symbol not found").
-    # Reconstruct the call and re-sem it — exactly how the rest of the instance
-    # body is re-semmed — so the callee is instantiated for the current type
-    # args, then re-flatten to (delay fn args).
+    it.n = delayStart; skip it.n
+  elif it.n.exprKind in CallKinds and (var probe = it.n; skip probe; not probe.hasMore):
+    # delay(call): the call is delay's sole child, the shape before flattening.
+    let fn = childCursor(it.n)
+    let escaping = escapingDelayParam(c, dest, fn)
+    let unreceived = undelayableResult(c, dest, fn)
+    if not cursorIsNil(escaping.name):
+      delayEscapeErr c, dest, info, fn, escaping
+      it.n = delayStart; skip it.n
+    elif unreceived.len > 0:
+      delayResultErr c, dest, info, fn, unreceived
+      it.n = delayStart; skip it.n
+    else:
+      dest.addParLe(DelayX, info)
+      it.n.into:                       # descend past inner call's tag
+        while it.n.hasMore:
+          takeTree dest, it.n          # copy fn and args verbatim (already semchecked)
+      dest.addParRi()
+      it.n = delayStart; skip it.n     # skip outer delay's )
+  elif it.n.hasMore:
+    # (delay fn args), the flattened shape: a generic body re-semmed on
+    # instantiation. Re-sem it as a call so a generic callee is instantiated,
+    # then flatten again; copied verbatim the callee stays uninstantiated and
+    # hexer emits no coro frame for it.
     var callBuf = createTokenBuf(16)
     callBuf.addParLe(CallX, info)
     while it.n.hasMore:
       takeTree callBuf, it.n           # fn + args → (call fn args)
     callBuf.addParRi()
-    skipParRi it.n                     # skip delay's )
+    it.n = delayStart; skip it.n       # skip delay's )
     var call = Item(n: cursorAt(callBuf, 0), typ: c.types.autoType)
     var callDest = createTokenBuf(16)
     semExpr c, callDest, call          # instantiates a generic callee
-    dest.addParLe(DelayX, info)
     var semmed = cursorAt(callDest, 0)
-    semmed.into:                       # strip the (call …) wrapper
-      while semmed.hasMore:
-        takeTree dest, semmed
-    dest.addParRi()
+    let fn = childCursor(semmed)
+    let escaping = escapingDelayParam(c, dest, fn)
+    let unreceived = undelayableResult(c, dest, fn)
+    if not cursorIsNil(escaping.name):
+      delayEscapeErr c, dest, info, fn, escaping
+    elif unreceived.len > 0:
+      delayResultErr c, dest, info, fn, unreceived
+    else:
+      dest.addParLe(DelayX, info)
+      semmed.into:                     # strip the (call …) wrapper
+        while semmed.hasMore:
+          takeTree dest, semmed
+      dest.addParRi()
   else:
     buildErr c, dest, it.n.info, "`delay` takes a call expression or no argument"
-    while it.n.hasMore:                # consume ALL children before the )
-      skip it.n
-    skipParRi it.n
+    skip it.n
+    it.n = delayStart; skip it.n
   it.typ = c.types.continuationType
   commonType c, dest, it, beforeExpr, expected
 
@@ -3290,22 +3978,19 @@ proc semSuspend(c: var SemContext; dest: var TokenBuf; it: var Item) =
   let beforeExpr = dest.len
   let expected = it.typ
   let info = it.n.info
-  inc it.n  # skip (suspend tag (always SuspendX from addFn)
-  if it.n.kind == ParRi:
+  let suspendStart = it.n
+  it.n = sub(it.n)  # skip (suspend tag (always SuspendX from addFn)
+  if not it.n.hasMore:
     dest.addParLe(SuspendX, info)
     dest.addParRi()
-    inc it.n
+    it.n = suspendStart; skip it.n
   else:
     buildErr c, dest, it.n.info, "`suspend` takes no argument"
     skip it.n
-    skipParRi it.n
-  # `suspend` is declared `{.magic: "Suspend".}` with a VOID return type. The
-  # first sem pass never routes through here (SuspendX isn't in
-  # MagicCallNeedsSemcheck), so it types the call as void. Generic-instantiation
-  # re-sem DOES dispatch SuspendX here, so we must produce the same void type —
-  # otherwise the re-semmed `(suspend)` looks like a non-void expression and the
-  # discard check fires ("expression of type Continuation must be discarded"),
-  # breaking every generic `.passive` proc that suspends (e.g. a generic race).
+    it.n = suspendStart; skip it.n
+  # `suspend` is declared void. The first pass never comes through here
+  # (SuspendX is not in MagicCallNeedsSemcheck); instantiation re-sem does, and
+  # a Continuation-typed result would fail the discard check.
   it.typ = c.types.voidType
   commonType c, dest, it, beforeExpr, expected
 
@@ -3325,23 +4010,22 @@ proc semArrayConstrElem(c: var SemContext, dest: var TokenBuf, elem: var Item, i
       indexType = it2
     elif arrCtx.firstKeyType.typeKind != AutoT:
       indexType = arrCtx.firstKeyType
-    inc elem.n # skip KvU
-    var key = Item(n: elem.n, typ: indexType)
-    var keyBuf = createTokenBuf(16)
-    semExpr c, keyBuf, key
-    if arrCtx.firstKeyType.typeKind == AutoT:
-      arrCtx.firstKeyType = key.typ
-    let val = evalOrdinal(c, cursorAt(keyBuf, 0))
-    if not isNaN(val):
-      if not arrCtx.hasFirstIdx:
-        arrCtx.firstIdx = val
-        arrCtx.hasFirstIdx = true
-      elif val - arrCtx.currentIndex != createXint(1'i64):
-        c.buildErr(dest, cursorAt(keyBuf, 0).info, "invalid order in array constructor")
-      arrCtx.currentIndex = val
-    elem.n = key.n
-    semExpr c, dest, elem
-    skipParRi elem.n
+    elem.n.into: # skip KvU
+      var key = Item(n: elem.n, typ: indexType)
+      var keyBuf = createTokenBuf(16)
+      semExpr c, keyBuf, key
+      if arrCtx.firstKeyType.typeKind == AutoT:
+        arrCtx.firstKeyType = key.typ
+      let val = evalOrdinal(c, cursorAt(keyBuf, 0))
+      if not isNaN(val):
+        if not arrCtx.hasFirstIdx:
+          arrCtx.firstIdx = val
+          arrCtx.hasFirstIdx = true
+        elif val - arrCtx.currentIndex != createXint(1'i64):
+          c.buildErr(dest, cursorAt(keyBuf, 0).info, "invalid order in array constructor")
+        arrCtx.currentIndex = val
+      elem.n = key.n
+      semExpr c, dest, elem
   else:
     if arrCtx.hasFirstIdx:
       inc arrCtx.currentIndex
@@ -3354,9 +4038,10 @@ proc semBracket(c: var SemContext; dest: var TokenBuf, it: var Item; flags: set[
   let info = it.n.info
 
   var orig = it.n
-  inc it.n
+  let bracketStart = it.n
+  it.n = sub(it.n)
   dest.addParLe(AconstrX, info)
-  if it.n.kind == ParRi:
+  if not it.n.hasMore:
     # empty array
     case it.typ.typeKind
     of AutoT:
@@ -3365,18 +4050,21 @@ proc semBracket(c: var SemContext; dest: var TokenBuf, it: var Item; flags: set[
         dest.addSubtree it.typ
       else:
         buildErr c, dest, info, "empty array needs a specified type"
-      takeParRi dest, it.n
+      dest.addParRi(it.n.endInfo)
+      it.n = bracketStart; skip it.n
     of ArrayT:
       dest.addSubtree it.typ
-      takeParRi dest, it.n
+      dest.addParRi(it.n.endInfo)
+      it.n = bracketStart; skip it.n
     of NoType, ErrT, AtT, AndT, OrT, NotT, ProcT, FuncT, IteratorT, ConverterT, MethodT, MacroT,
        TemplateT, ObjectT, EnumT, ProctypeT, IT, UT, FT, CT, BoolT, VoidT, PtrT, VarargsT,
-       StaticT, TupleT, OnumT, AnumT, RefT, MutT, OutT, LentT, SinkT, NiltT, ConceptT,
+       StaticT, TupleT, ClosureTupleT, OnumT, AnumT, RefT, MutT, OutT, LentT, SinkT, OwnedT, NiltT, ConceptT,
        DistinctT, ItertypeT, RangetypeT, UarrayT, SetT, SymkindT, TypekindT, TypedescT,
-       UntypedT, TypedT, CstringT, PointerT, OrdinalT:
+       UntypedT, TypedT, CstringT, PointerT, OrdinalT, PluginCallT:
       # unknown expected type, give empty literal auto type, then match it
       dest.addSubtree c.types.autoType
-      takeParRi dest, it.n
+      dest.addParRi(it.n.endInfo)
+      it.n = bracketStart; skip it.n
       let expected = it.typ
       it.typ = c.types.autoType
       commonType c, dest, it, exprStart, expected
@@ -3394,9 +4082,9 @@ proc semBracket(c: var SemContext; dest: var TokenBuf, it: var Item; flags: set[
   of AutoT: discard
   of NoType, ErrT, AtT, AndT, OrT, NotT, ProcT, FuncT, IteratorT, ConverterT, MethodT, MacroT,
      TemplateT, ObjectT, EnumT, ProctypeT, IT, UT, FT, CT, BoolT, VoidT, PtrT, VarargsT,
-     StaticT, TupleT, OnumT, AnumT, RefT, MutT, OutT, LentT, SinkT, NiltT, ConceptT,
+     StaticT, TupleT, ClosureTupleT, OnumT, AnumT, RefT, MutT, OutT, LentT, SinkT, OwnedT, NiltT, ConceptT,
      DistinctT, ItertypeT, RangetypeT, UarrayT, SetT, SymkindT, TypekindT, TypedescT,
-     UntypedT, TypedT, CstringT, PointerT, OrdinalT:
+     UntypedT, TypedT, CstringT, PointerT, OrdinalT, PluginCallT:
     discard
 
   var ctx = ArrayConstrContext(
@@ -3416,7 +4104,8 @@ proc semBracket(c: var SemContext; dest: var TokenBuf, it: var Item; flags: set[
     semArrayConstrElem(c, dest, elem, it, ctx)
     inc count
   it.n = elem.n
-  takeParRi dest, it.n
+  dest.addParRi(it.n.endInfo)
+  it.n = bracketStart; skip it.n
   let typeStart = dest.len
   dest.buildTree ArrayT, info:
     dest.addSubtree elem.typ
@@ -3436,10 +4125,10 @@ proc semBracket(c: var SemContext; dest: var TokenBuf, it: var Item; flags: set[
     discard
   of NoType, ErrT, AtT, AndT, OrT, NotT, ProcT, FuncT, IteratorT, ConverterT, MethodT, MacroT,
      TemplateT, ObjectT, EnumT, ProctypeT, IT, UT, FT, CT, BoolT, VoidT, PtrT, VarargsT,
-     StaticT, TupleT, OnumT, AnumT, RefT, MutT, OutT, LentT, SinkT, NiltT, ConceptT,
+     StaticT, TupleT, ClosureTupleT, OnumT, AnumT, RefT, MutT, OutT, LentT, SinkT, OwnedT, NiltT, ConceptT,
      DistinctT, ItertypeT, RangetypeT, UarrayT, SetT, SymkindT, TypekindT, TypedescT,
-     UntypedT, TypedT, CstringT, PointerT, OrdinalT:
-    var convMatch = default(Match)
+     UntypedT, TypedT, CstringT, PointerT, OrdinalT, PluginCallT:
+    var convMatch = createMatch(addr c)
     let convArg = CallArg(n: orig, typ: it.typ)
     if tryConverterMatch(c, convMatch, expected, convArg):
       discard "matching converter found (e.g. `toOpenArray`)"
@@ -3448,14 +4137,17 @@ proc semBracket(c: var SemContext; dest: var TokenBuf, it: var Item; flags: set[
 
   dest.shrink typeStart
   dest.insert it.typ, typeInsertPos
+  # the aconstr was sealed above; the inserted type grew its contents:
+  widenSealed dest, exprStart, subtreeWidth(it.typ)
   commonType c, dest, it, exprStart, expected
 
 proc semCurly(c: var SemContext; dest: var TokenBuf, it: var Item; flags: set[SemFlag]) =
   let exprStart = dest.len
   let info = it.n.info
-  inc it.n
+  let curlyStart = it.n
+  it.n = sub(it.n)
   dest.addParLe(SetconstrX, info)
-  if it.n.kind == ParRi:
+  if not it.n.hasMore:
     # empty set
     case it.typ.typeKind
     of AutoT:
@@ -3464,18 +4156,21 @@ proc semCurly(c: var SemContext; dest: var TokenBuf, it: var Item; flags: set[Se
         dest.addSubtree it.typ
       else:
         buildErr c, dest, info, "empty set needs a specified type"
-      takeParRi dest, it.n
+      dest.addParRi(it.n.endInfo)
+      it.n = curlyStart; skip it.n
     of SetT:
       dest.addSubtree it.typ
-      takeParRi dest, it.n
+      dest.addParRi(it.n.endInfo)
+      it.n = curlyStart; skip it.n
     of NoType, ErrT, AtT, AndT, OrT, NotT, ProcT, FuncT, IteratorT, ConverterT, MethodT, MacroT,
        TemplateT, ObjectT, EnumT, ProctypeT, IT, UT, FT, CT, BoolT, VoidT, PtrT, ArrayT, VarargsT,
-       StaticT, TupleT, OnumT, AnumT, RefT, MutT, OutT, LentT, SinkT, NiltT, ConceptT,
+       StaticT, TupleT, ClosureTupleT, OnumT, AnumT, RefT, MutT, OutT, LentT, SinkT, OwnedT, NiltT, ConceptT,
        DistinctT, ItertypeT, RangetypeT, UarrayT, SymkindT, TypekindT, TypedescT,
-       UntypedT, TypedT, CstringT, PointerT, OrdinalT:
+       UntypedT, TypedT, CstringT, PointerT, OrdinalT, PluginCallT:
       # unknown expected type, give empty literal auto type, then match it
       dest.addSubtree c.types.autoType
-      takeParRi dest, it.n
+      dest.addParRi(it.n.endInfo)
+      it.n = curlyStart; skip it.n
       let expected = it.typ
       it.typ = c.types.autoType
       commonType c, dest, it, exprStart, expected
@@ -3493,19 +4188,28 @@ proc semCurly(c: var SemContext; dest: var TokenBuf, it: var Item; flags: set[Se
   of AutoT: discard
   of NoType, ErrT, AtT, AndT, OrT, NotT, ProcT, FuncT, IteratorT, ConverterT, MethodT, MacroT,
      TemplateT, ObjectT, EnumT, ProctypeT, IT, UT, FT, CT, BoolT, VoidT, PtrT, ArrayT, VarargsT,
-     StaticT, TupleT, OnumT, AnumT, RefT, MutT, OutT, LentT, SinkT, NiltT, ConceptT,
+     StaticT, TupleT, ClosureTupleT, OnumT, AnumT, RefT, MutT, OutT, LentT, SinkT, OwnedT, NiltT, ConceptT,
      DistinctT, ItertypeT, RangetypeT, UarrayT, SymkindT, TypekindT, TypedescT,
-     UntypedT, TypedT, CstringT, PointerT, OrdinalT:
+     UntypedT, TypedT, CstringT, PointerT, OrdinalT, PluginCallT:
     buildErr c, dest, info, "invalid expected type for set constructor: " & typeToString(it.typ)
   var elemStart = dest.len
   var elemInfo = elem.n.info
   while elem.n.hasMore:
     if isRangeExpr(elem.n):
-      inc elem.n # call tag
-      skip elem.n # `..`
-      dest.buildTree RangeU, elem.n.info:
-        elemStart = dest.len
-        elemInfo = elem.n.info
+      elem.n.into: # call
+        skip elem.n # `..`
+        dest.buildTree RangeU, elem.n.info:
+          elemStart = dest.len
+          elemInfo = elem.n.info
+          semExpr c, dest, elem
+          if freshElemType:
+            # do not save modifier in set type unless it was annotated as such
+            # also do not expect it from subsequent elements
+            removeModifier(elem.typ)
+            freshElemType = false
+          semExpr c, dest, elem
+    elif elem.n.substructureKind == RangeU:
+      takeInto dest, elem.n:
         semExpr c, dest, elem
         if freshElemType:
           # do not save modifier in set type unless it was annotated as such
@@ -3513,17 +4217,6 @@ proc semCurly(c: var SemContext; dest: var TokenBuf, it: var Item; flags: set[Se
           removeModifier(elem.typ)
           freshElemType = false
         semExpr c, dest, elem
-      inc elem.n # right paren of call
-    elif elem.n.substructureKind == RangeU:
-      takeToken dest, elem.n
-      semExpr c, dest, elem
-      if freshElemType:
-        # do not save modifier in set type unless it was annotated as such
-        # also do not expect it from subsequent elements
-        removeModifier(elem.typ)
-        freshElemType = false
-      semExpr c, dest, elem
-      takeParRi dest, elem.n
     else:
       semExpr c, dest, elem
       if freshElemType:
@@ -3542,7 +4235,8 @@ proc semCurly(c: var SemContext; dest: var TokenBuf, it: var Item; flags: set[Se
     if length.isNaN or length > MaxSetElements:
       c.buildErr dest, elemInfo, "type " & typeToString(elem.typ) & " is too large to be a set element type"
   it.n = elem.n
-  takeParRi dest, it.n
+  dest.addParRi(it.n.endInfo)
+  it.n = curlyStart; skip it.n
   let typeStart = dest.len
   dest.buildTree SetT, info:
     dest.addSubtree elem.typ
@@ -3550,74 +4244,75 @@ proc semCurly(c: var SemContext; dest: var TokenBuf, it: var Item; flags: set[Se
   it.typ = typeToCursor(c, dest, typeStart)
   dest.shrink typeStart
   dest.insert it.typ, typeInsertPos
+  # the setconstr was sealed above; the inserted type grew its contents:
+  widenSealed dest, exprStart, subtreeWidth(it.typ)
   commonType c, dest, it, exprStart, expected
 
 proc semArrayConstr(c: var SemContext; dest: var TokenBuf; it: var Item) =
   let start = dest.len
   let expected = it.typ
   let info = it.n.info
-  takeToken dest, it.n
-  it.typ = semLocalType(c, dest, it.n)
-  # XXX type length not enforced
-  var elem = Item(n: it.n, typ: c.types.autoType)
-  let t = skipModifier(it.typ)
-  if t.typeKind == ArrayT:
-    elem.typ = t
-    inc elem.typ
-  elif t.typeKind == UarrayT:
-    # `(aconstr (uarray T) e1 …)` is the internal IR for a static array
-    # literal of unspecified length (used by exprexec's ptr-to-nif rule
-    # wrapped in `addr` to form the seq's `data` pointer). Element type
-    # is the uarray's inner T; hexer's lengcgen hoists the literal to an
-    # anonymous module-level static array and rewrites the surrounding
-    # `addr` to point at it.
-    elem.typ = t
-    inc elem.typ # past uarray tag → element type
-  else:
-    c.buildErr dest, info, "expected array type for array constructor, got: " & typeToString(t)
-  while elem.n.hasMore:
-    semExpr c, dest, elem
-  it.n = elem.n
-  takeParRi dest, it.n
+  takeInto dest, it.n:
+    it.typ = semLocalType(c, dest, it.n)
+    # XXX type length not enforced
+    var elem = Item(n: it.n, typ: c.types.autoType)
+    let t = skipModifier(it.typ)
+    if t.typeKind == ArrayT:
+      elem.typ = t
+      inc elem.typ
+    elif t.typeKind == UarrayT:
+      # `(aconstr (uarray T) e1 …)` is the internal IR for a static array
+      # literal of unspecified length (used by exprexec's ptr-to-nif rule
+      # wrapped in `addr` to form the seq's `data` pointer). Element type
+      # is the uarray's inner T; hexer's lengcgen hoists the literal to an
+      # anonymous module-level static array and rewrites the surrounding
+      # `addr` to point at it.
+      elem.typ = t
+      inc elem.typ # past uarray tag → element type
+    else:
+      c.buildErr dest, info, "expected array type for array constructor, got: " & typeToString(t)
+    while elem.n.hasMore:
+      semExpr c, dest, elem
+    it.n = elem.n
   commonType c, dest, it, start, expected
 
 proc semSetConstr(c: var SemContext; dest: var TokenBuf; it: var Item) =
   let start = dest.len
   let expected = it.typ
   let info = it.n.info
-  takeToken dest, it.n
-  it.typ = semLocalType(c, dest, it.n)
-  var elem = Item(n: it.n, typ: c.types.autoType)
-  let t = skipModifier(it.typ)
-  if t.typeKind == SetT:
-    elem.typ = t
-    inc elem.typ
-  else:
-    c.buildErr dest, info, "expected set type for set constructor, got: " & typeToString(t)
-  while elem.n.hasMore:
-    if elem.n.substructureKind == RangeU:
-      takeToken dest, elem.n
-      semExpr c, dest, elem
-      semExpr c, dest, elem
-      takeParRi dest, elem.n
+  takeInto dest, it.n:
+    it.typ = semLocalType(c, dest, it.n)
+    var elem = Item(n: it.n, typ: c.types.autoType)
+    let t = skipModifier(it.typ)
+    if t.typeKind == SetT:
+      elem.typ = t
+      inc elem.typ
     else:
-      semExpr c, dest, elem
-  it.n = elem.n
-  takeParRi dest, it.n
+      c.buildErr dest, info, "expected set type for set constructor, got: " & typeToString(t)
+    while elem.n.hasMore:
+      if elem.n.substructureKind == RangeU:
+        takeInto dest, elem.n:
+          semExpr c, dest, elem
+          semExpr c, dest, elem
+      else:
+        semExpr c, dest, elem
+    it.n = elem.n
   commonType c, dest, it, start, expected
 
 proc semSuf(c: var SemContext; dest: var TokenBuf, it: var Item) =
   let exprStart = dest.len
-  takeToken dest, it.n
+  dest.addParLe(it.n.cursorTagId, it.n.info)
+  let sufStart = it.n
+  it.n = sub(it.n)
   var num = Item(n: it.n, typ: c.types.autoType)
   semExpr c, dest, num
   it.n = num.n
-  if it.n.kind != StringLit:
+  if it.n.kind != StrLit:
     c.buildErr dest, it.n.info, "string literal expected for suf"
     skip it.n
     return
   let expected = it.typ
-  case pool.strings[it.n.litId]
+  case pool.strings[it.n.strId]
   of "i": it.typ = c.types.intType
   of "i8": it.typ = c.types.int8Type
   of "i16": it.typ = c.types.int16Type
@@ -3634,44 +4329,50 @@ proc semSuf(c: var SemContext; dest: var TokenBuf, it: var Item) =
   of "R", "T": it.typ = c.types.stringType
   of "C": it.typ = c.types.cstringType
   else:
-    c.buildErr dest, it.n.info, "unknown suffix: " & pool.strings[it.n.litId]
-  takeToken dest, it.n # suffix
-  takeParRi dest, it.n # right paren
+    c.buildErr dest, it.n.info, "unknown suffix: " & pool.strings[it.n.strId]
+  takeTree dest, it.n # suffix
+  dest.addParRi(it.n.endInfo) # right paren
+  it.n = sufStart; skip it.n
   commonType c, dest, it, exprStart, expected
 
 proc semTup(c: var SemContext; dest: var TokenBuf, it: var Item) =
   let exprStart = dest.len
   let origExpected = it.typ
-  dest.add parLeToken(TupconstrX, it.n.info)
-  inc it.n
-  if it.n.kind == ParRi:
+  dest.addParLe(TupconstrX, it.n.info)
+  let tupStart = it.n
+  it.n = sub(it.n)
+  if not it.n.hasMore:
     it.typ = c.types.emptyTupleType
     dest.addSubtree it.typ
-    takeParRi dest, it.n
+    dest.addParRi(it.n.endInfo)
+    it.n = tupStart; skip it.n
     commonType c, dest, it, exprStart, origExpected
     return
   let typePos = dest.len
   var expected = origExpected
   var doExpected = expected.typeKind == TupleT
   if doExpected:
-    inc expected # skip tag, now at fields
+    expected = sub(expected) # skip tag, now at fields
   let named = it.n.substructureKind == KvU
   var typ = createTokenBuf(32)
-  typ.add parLeToken(TupleT, it.n.info)
+  typ.addParLe(TupleT, it.n.info)
   while it.n.hasMore:
+    var kvStart = default(Cursor)
     if named:
       if it.n.substructureKind != KvU:
         c.buildErr dest, it.n.info, "expected field name for named tuple constructor"
       else:
-        typ.add it.n
-        takeToken dest, it.n
+        typ.addParLe(it.n.cursorTagId, it.n.info)
+        dest.addParLe(it.n.cursorTagId, it.n.info)
+        kvStart = it.n
+        it.n = sub(it.n)
         let nameCursor = it.n
         let name = takeIdent(it.n)
         let nameStart = dest.len
         if name == StrId(0):
           c.buildErr dest, nameCursor.info, "invalid tuple field name", nameCursor
         else:
-          dest.add identToken(name, nameCursor.info)
+          dest.addIdent(name, nameCursor.info)
         for tok in nameStart ..< dest.len:
           typ.add dest[tok]
     var elem = Item(n: it.n, typ: c.types.autoType)
@@ -3680,7 +4381,7 @@ proc semTup(c: var SemContext; dest: var TokenBuf, it: var Item) =
       elem.typ = getTupleFieldType(expected)
       freshElemType = false
       skip expected
-      if expected.kind == ParRi:
+      if not expected.hasMore:
         # happens if expected tuple type has less fields than constructor
         doExpected = false
     semExpr c, dest, elem
@@ -3691,9 +4392,14 @@ proc semTup(c: var SemContext; dest: var TokenBuf, it: var Item) =
     typ.addSubtree elem.typ # type
     if named:
       # should be KvX
-      takeParRi dest, it.n
+      dest.addParRi(it.n.endInfo)
+      # kvStart stays nil on the malformed (named but not KvU) path, where the
+      # classic code's `leaveScope(it.n, default)` was a benign no-op:
+      if not cursorIsNil(kvStart):
+        it.n = kvStart; skip it.n
       typ.addParRi()
-  takeParRi dest, it.n
+  dest.addParRi(it.n.endInfo)
+  it.n = tupStart; skip it.n
   typ.addParRi()
   let typeStart = dest.len
   var t = typ.cursorAt(0)
@@ -3701,166 +4407,139 @@ proc semTup(c: var SemContext; dest: var TokenBuf, it: var Item) =
   it.typ = typeToCursor(c, dest, typeStart)
   dest.shrink typeStart
   dest.insert it.typ, typePos
+  # the tupconstr was sealed above; the inserted type grew its contents:
+  widenSealed dest, exprStart, subtreeWidth(it.typ)
   commonType c, dest, it, exprStart, origExpected
 
 proc semTupleConstr(c: var SemContext; dest: var TokenBuf, it: var Item) =
   let start = dest.len
   let expected = it.typ
   let info = it.n.info
-  takeToken dest, it.n
-  it.typ = semLocalType(c, dest, it.n)
-  var t = skipModifier(it.typ)
-  if t.typeKind != TupleT:
-    dest.shrink start
-    c.buildErr dest, info, "expected tuple type for tuple constructor, got: " & typeToString(t)
-    return
-  inc t
-  while it.n.hasMore:
-    let named = it.n.substructureKind == KvU
-    if named:
-      takeToken dest, it.n
-      takeTree dest, it.n
-    var elem = Item(n: it.n, typ: c.types.autoType)
+  takeInto dest, it.n:
+    it.typ = semLocalType(c, dest, it.n)
+    var t = skipModifier(it.typ)
+    if t.typeKind != TupleT:
+      dest.shrink start
+      c.buildErr dest, info, "expected tuple type for tuple constructor, got: " & typeToString(t)
+      return
+    t = sub(t)
+    while it.n.hasMore:
+      let named = it.n.substructureKind == KvU
+      var kvStart = default(Cursor)
+      if named:
+        dest.addParLe(it.n.cursorTagId, it.n.info)
+        kvStart = it.n
+        it.n = sub(it.n)
+        takeTree dest, it.n
+      var elem = Item(n: it.n, typ: c.types.autoType)
+      if t.hasMore:
+        elem.typ = getTupleFieldType(t)
+        skip t
+      else:
+        c.buildErr dest, info, "tuple type " & typeToString(it.typ) & " too short for tuple constructor"
+      semExpr c, dest, elem
+      it.n = elem.n
+      if named:
+        dest.addParRi(it.n.endInfo)
+        # reset only reachable inside `if named:`, where kvStart was set above;
+        # guard defends the classic default-CursorScope no-op just in case:
+        if not cursorIsNil(kvStart):
+          it.n = kvStart; skip it.n
     if t.hasMore:
-      elem.typ = getTupleFieldType(t)
-      skip t
-    else:
-      c.buildErr dest, info, "tuple type " & typeToString(it.typ) & " too short for tuple constructor"
-    semExpr c, dest, elem
-    it.n = elem.n
-    if named:
-      takeParRi dest, it.n
-  if t.hasMore:
-    c.buildErr dest, info, "tuple type " & typeToString(it.typ) & " too long for tuple constructor"
-  takeParRi dest, it.n
+      c.buildErr dest, info, "tuple type " & typeToString(it.typ) & " too long for tuple constructor"
   commonType c, dest, it, start, expected
 
-proc callDefault(c: var SemContext; dest: var TokenBuf; typ: Cursor; info: PackedLineInfo) =
+proc callDefault(c: var SemContext; dest: var TokenBuf; typ: Cursor; info: NifLineInfo) =
   var callBuf = createTokenBuf(16)
   callBuf.addParLe(CallX, info)
   discard buildSymChoice(c, callBuf, pool.strings.getOrIncl("default"), info, FindAll)
   callBuf.addSubtree typ
   callBuf.addParRi()
+  if containsGenericParams(typ):
+    # In a generic body the default's overloads (e.g. `default[I: Ordinal;
+    # T: HasDefault](array[I, T])`) cannot be matched against a type that
+    # still carries generic params: a symbolic array length like `bump(N)`
+    # is no ordinal index type, and an abstract element `T` satisfies no
+    # concrete `default` overload. Defer the call unresolved; instantiation
+    # re-`semExpr`s it with a concrete type, where the array length folds
+    # (`semArrayType`) and the proper overload matches.
+    dest.addSubtree cursorAt(callBuf, 0)
+    return
   var it = Item(n: cursorAt(callBuf, 0), typ: c.types.autoType)
   semCall c, dest, it, {}
 
 proc buildObjConstrField(c: var SemContext; dest: var TokenBuf; field: Local;
-                         setFields: Table[SymId, Cursor]; info: PackedLineInfo;
-                         bindings: Table[SymId, Cursor]; depth: int) =
+                         setFields: Table[SymId, Cursor]; info: NifLineInfo;
+                         bindings: Table[SymId, Cursor]; depth: int;
+                         isUnion = false) =
   let fieldSym = field.name.symId
   if setFields.hasKey(fieldSym):
     dest.addSubtree setFields.getOrQuit(fieldSym)
+  elif isUnion:
+    # A union has ONE active member: filling the unset members with
+    # defaults emits sibling designated initializers, and C's
+    # last-initializer-wins semantics zero out the member the user
+    # actually set (black-clear-color class of bug). Emit nothing.
+    discard
   else:
     dest.addParLe(KvU, info)
-    dest.add symToken(fieldSym, info)
-    var typ = field.typ
-    if bindings.len != 0:
-      # fields in generic type AST contain generic params of the type
-      # for invoked object types, bindings are built from the given arguments
-      # and the field type is instantiated based on them here
-      typ = instantiateType(c, typ, bindings)
-    if field.val.kind != DotToken and bindings.len == 0:
-      # A DECLARED FIELD DEFAULT (`labelCounter: int = 1`) wins over the type's
-      # zero. Without this every field NOT named in `T(a: x)` — and every field
-      # of `default(T)` — silently got `default(fieldType)`, so a type that
-      # states its own starting value never actually had it. `field.val` is
-      # already semchecked at the declaration, so it can be spliced as-is.
-      #
-      # ⚠️ NOT DONE FOR AN INVOKED GENERIC TYPE (`bindings.len != 0`), where the
-      # default still mentions the type's typevars. Substituting it with
-      # `instantiateExprIntoBuf` — the obvious move, and what the first version of
-      # this did — re-sems the expression into `dest` and emits a tree the
-      # post-sem phase validator walks off the end of: it SIGSEGVs in
-      # `collectChildKinds` on tests/nimony/converter/tgenericconverter.nim, and
-      # also breaks tests/nimony/track/ttype_usage.nim. Measured against a
-      # baseline run of the same suite: 587/594 before, 585/594 with the
-      # substitution, 587/594 with this guard — those two were the ONLY delta
-      # (the 7 `nosystem/*` failures are pre-existing in both).
-      #
-      # The gap this leaves is NARROWER than "generics don't work": `bindings` is
-      # only non-empty for an INVOKED object type reached through the parent /
-      # instantiation walk, so an ordinary `G[int](v: 3)` still takes the splice
-      # path and honours its defaults (measured: `n: int = 5` gives 5). What is
-      # still dropped is a field default on an invoked generic reached with live
-      # bindings — a named, small gap instead of a silent wrong answer everywhere.
-      dest.addSubtree field.val
+    dest.addSymUse(fieldSym, info)
+    if not field.val.isDotToken:
+      # The field declares a constant default value (`x: int = -1`); the spec
+      # requires construction to use it rather than the type's zero default.
+      # The value is already typed (semchecked at the type declaration), so
+      # emit it directly — instantiating only if it carries generic params.
+      if bindings.len != 0 and containsGenericParams(field.val):
+        var v = Item(n: field.val, typ: c.types.autoType)
+        instantiateExprIntoBuf(c, dest, v, bindings)
+      else:
+        dest.addSubtree field.val
     else:
+      var typ = field.typ
+      if bindings.len != 0:
+        # fields in generic type AST contain generic params of the type
+        # for invoked object types, bindings are built from the given arguments
+        # and the field type is instantiated based on them here
+        typ = instantiateType(c, typ, bindings)
       callDefault c, dest, typ, info
     if depth != 0:
       dest.addIntLit(depth, info)
     dest.addParRi()
 
-proc caseHasSetField(c: var SemContext; n: Cursor; setFields: Table[SymId, Cursor]): (bool, SymId)
-proc emitNestedCase(c: var SemContext; dest: var TokenBuf; n: var Cursor;
-                    setFields: Table[SymId, Cursor]; info: PackedLineInfo;
-                    bindings: Table[SymId, Cursor]; depth: int)
+proc buildObjConstrFields(c: var SemContext; dest: var TokenBuf; n: var Cursor;
+                          setFields: Table[SymId, Cursor]; info: NifLineInfo;
+                          bindings: Table[SymId, Cursor]; depth = 0;
+                          isUnion = false)
 
 proc fieldsPresentInInitExpr(c: var SemContext; n: Cursor; setFields: Table[SymId, Cursor]): (bool, SymId) =
-  var n = n
-  inc n
+  # A branch body is not a flat field list: it can contain a nested `case`
+  # section, so walk it with the field iterator instead of `takeLocal` in a
+  # loop (which would read the `(case ...)` node as a local and run the
+  # cursor off its bounds).
+  var n = sub(n)
   result = (false, SymId(0))
-  if n.substructureKind == NilU:
-    return
-  while n.hasMore:
-    if n.substructureKind == CaseU:
-      # a nested variant inside this branch: recurse into the nested case,
-      # scanning its discriminator and every branch for a set field.
-      let (nestedHas, nestedSym) = caseHasSetField(c, n, setFields)
-      if nestedHas:
-        result = (true, nestedSym)
-        break
-      skip n
-    else:
-      let local = takeLocal(n, SkipFinalParRi)
-      if local.name.symId in setFields:
-        result = (true, local.name.symId)
-        break
-
-proc caseHasSetField(c: var SemContext; n: Cursor; setFields: Table[SymId, Cursor]): (bool, SymId) =
-  ## `n` is at a `(case (fld sel) (of ...) (of/else ...))` node. Returns whether
-  ## the discriminator or any (possibly deeply nested) branch field is set.
-  result = (false, SymId(0))
-  var n = n
-  inc n # (case -> selector fld
-  let sel = takeLocal(n, SkipFinalParRi)
-  if sel.name.symId in setFields:
-    return (true, sel.name.symId)
-  while n.hasMore:
-    case n.substructureKind
-    of OfU:
-      inc n # (of -> (ranges ...)
-      skip n # skip ranges -> branch body
-      let (has, sym) = fieldsPresentInInitExpr(c, n, setFields)
-      if has:
-        return (true, sym)
-      skip n # skip branch body
-      skipParRi n # close (of
-    of ElseU:
-      inc n # (else -> branch body
-      let (has, sym) = fieldsPresentInInitExpr(c, n, setFields)
-      if has:
-        return (true, sym)
-      skip n # skip branch body
-      skipParRi n # close (else
-    else:
+  var iter = initObjFieldIter()
+  while nextField(iter, n):
+    let local = takeLocal(n, SkipFinalParRi)
+    if local.name.symId in setFields:
+      result = (true, local.name.symId)
       break
 
 proc asNimSym(symId: SymId): string =
-  result = pool.syms[symId]
-  extractBasename(result)
+  result = pool.symBasename(symId)
 
-template conflictingBranchesError(c: var SemContext; dest: var TokenBuf, info: PackedLineInfo, prevFields: SymId, currentFields: SymId) =
+template conflictingBranchesError(c: var SemContext; dest: var TokenBuf, info: NifLineInfo, prevFields: SymId, currentFields: SymId) =
   c.buildErr dest, info, "The fields '" & asNimSym(prevFields) &
               "' and '" & asNimSym(currentFields) & "' cannot be initialized together, " &
               "because they are from conflicting branches in the case object."
 
-template badDiscriminatorError(c: var SemContext; dest: var TokenBuf, info: PackedLineInfo, field: SymId, discriminator: SymId) =
+template badDiscriminatorError(c: var SemContext; dest: var TokenBuf, info: NifLineInfo, field: SymId, discriminator: SymId) =
   c.buildErr dest, info,
     onRaiseQuit(("cannot prove that it's safe to initialize '$1' with " &
     "the runtime value for the discriminator '$2'.") %
     [asNimSym(field), asNimSym(discriminator)])
 
-template wrongBranchError(c: var SemContext; dest: var TokenBuf, info: PackedLineInfo, field: SymId,
+template wrongBranchError(c: var SemContext; dest: var TokenBuf, info: NifLineInfo, field: SymId,
       discriminator: SymId, discriminatorVal: Cursor) =
   c.buildErr dest, info,
       onRaiseQuit(("a case selecting discriminator '$1' with value '$2' " &
@@ -3868,29 +4547,53 @@ template wrongBranchError(c: var SemContext; dest: var TokenBuf, info: PackedLin
       "are in conflict with this value.") %
       [asNimSym(discriminator), asNimCode(discriminatorVal), asNimSym(field)])
 
-proc caseBranchMatchesExpr(c: var SemContext; dest: var TokenBuf; branch, matched: Cursor; selectorType: Cursor): bool =
+proc caseBranchMatchesExprRaw(c: var SemContext; dest: var TokenBuf; branch, matched: Cursor; selectorType: Cursor): bool =
   result = false
   var branch = branch
-  inc branch
+  branch = sub(branch)
   while branch.hasMore:
     case branch.substructureKind
     of RangeU:
-      inc branch
-      let a = evalConstIntExpr(c, dest, branch, selectorType)
-      let b = evalConstIntExpr(c, dest, branch, selectorType)
+      branch.into:
+        let a = evalConstIntExpr(c, dest, branch, selectorType)
+        let b = evalConstIntExpr(c, dest, branch, selectorType)
 
-      var matched = matched
-      let value = evalConstIntExpr(c, dest, matched, selectorType)
-      if value >= a and value <= b:
-        return true
-      skipParRi(branch)
-    of NoSub, NilU, NotnilU, KvU, VvU, RangesU, ParamU, TypevarU, StaticTypevarU, EfldU, FldU,
+        var matched = matched
+        let value = evalConstIntExpr(c, dest, matched, selectorType)
+        if value >= a and value <= b:
+          return true
+    of NoSub, NilU, NotnilU, KvU, VvU, RangesU, ParamU, StaticParamU, TypevarU, StaticTypevarU, EfldU, FldU,
        WhenU, ElifU, ElseU, TypevarsU, CaseU, OfU, StmtsU, ParamsU, PragmasU,
        EitherU, JoinU, UnpackflatU, UnpacktupU, ExceptU, FinU, UncheckedU, GfldU,
-       CallargsU, ForcallU:
+       CallargsU, ForcallU, DeferexpansionU, NeedtypesU:
       if sameTrees(branch, matched):
         return true
       skip branch
+
+proc isConstDiscriminator(c: var SemContext; n: Cursor): bool =
+  ## Is the (semchecked) discriminator value spelled as a constant, i.e. the
+  ## way the `of` labels it is compared against are? Deliberately no constant
+  ## EVALUATION: that re-runs sem and can shell out to a sub-compile.
+  case n.kind
+  of IntLit, UIntLit, CharLit:
+    result = true
+  of Symbol:
+    result = fetchSym(c, n.symId).kind == EfldY
+  of TagLit:
+    result = n.exprKind in {TrueX, FalseX}
+  else:
+    result = false
+
+proc caseBranchMatchesExpr(c: var SemContext; dest: var TokenBuf; branch, matched: Cursor;
+                           selectorType: Cursor): bool =
+  ## `evalConstIntExpr` semchecks the range bounds *into* `dest`, but here `dest`
+  ## is the object constructor currently being built: leaving the scratch output
+  ## behind produces `(oconstr T (kv ...) <leftovers>)` which later passes -- they
+  ## expect nothing but `kv` children -- choke on. The bounds were already checked
+  ## at the type declaration, so throw the scratch tokens away again.
+  let destStart = dest.len
+  result = caseBranchMatchesExprRaw(c, dest, branch, matched, selectorType)
+  dest.shrink destStart
 
 type
   BranchState = enum
@@ -3904,7 +4607,7 @@ proc getValueInKv(n: Cursor): Cursor =
   skip result
 
 proc fieldsPresentInBranch(c: var SemContext; dest: var TokenBuf; n: var Cursor; selector: Local;
-                setFields: Table[SymId, Cursor]; info: PackedLineInfo;
+                setFields: Table[SymId, Cursor]; info: NifLineInfo;
                 bindings: Table[SymId, Cursor]; depth: int) =
   var lastFieldSymId = SymId(0)
   var isBranchSelected = false
@@ -3915,90 +4618,80 @@ proc fieldsPresentInBranch(c: var SemContext; dest: var TokenBuf; n: var Cursor;
     while n.hasMore:
       case n.substructureKind
       of OfU:
-        inc n
-        var state: BranchState
-        if setFields.hasKey(selectorSymId):
-          let discriminatorVal = getValueInKv(setFields.getOrQuit(selectorSymId))
-          if caseBranchMatchesExpr(c, dest, n, discriminatorVal, selector.typ):
-            state = ThisBranch
-            isBranchSelected = true
+        n.into:
+          var state: BranchState
+          if setFields.hasKey(selectorSymId):
+            let discriminatorVal = getValueInKv(setFields.getOrQuit(selectorSymId))
+            if caseBranchMatchesExpr(c, dest, n, discriminatorVal, selector.typ):
+              state = ThisBranch
+              isBranchSelected = true
+            else:
+              state = Unknown
           else:
-            state = Unknown
-        else:
-          state = NoSelector
-        skip n
-
-        if bestBranch == default(Cursor):
-          bestBranch = n
-        let (hasField, presentFieldSymId) = fieldsPresentInInitExpr(c, n, setFields)
-        if hasField:
-          if lastFieldSymId != SymId(0):
-            conflictingBranchesError c, dest, info, lastFieldSymId, presentFieldSymId
-          elif state == Unknown:
-            wrongBranchError(c, dest, info, presentFieldSymId, selectorSymId, getValueInKv(setFields.getOrQuit(selectorSymId)))
-          inc n # stmt
-          while n.hasMore:
-            if n.substructureKind == CaseU:
-              emitNestedCase(c, dest, n, setFields, info, bindings, depth)
-            else:
-              let field = takeLocal(n, SkipFinalParRi)
-              buildObjConstrField(c, dest, field, setFields, info, bindings, depth)
-          skipParRi n
-          lastFieldSymId = presentFieldSymId
-        else:
+            state = NoSelector
           skip n
 
-        skipParRi n
+          if bestBranch == default(Cursor):
+            bestBranch = n
+          let (hasField, presentFieldSymId) = fieldsPresentInInitExpr(c, n, setFields)
+          if hasField:
+            if lastFieldSymId != SymId(0):
+              conflictingBranchesError c, dest, info, lastFieldSymId, presentFieldSymId
+            elif state == Unknown:
+              wrongBranchError(c, dest, info, presentFieldSymId, selectorSymId, getValueInKv(setFields.getOrQuit(selectorSymId)))
+            n.into: # stmt
+              buildObjConstrFields(c, dest, n, setFields, info, bindings, depth)
+            lastFieldSymId = presentFieldSymId
+          elif state == ThisBranch:
+            # The constructor selects this branch but sets none of its fields:
+            # they still get their defaults. `oconstr` is total (doc/tags.md),
+            # and the native back end stores exactly what is listed.
+            n.into: # stmt
+              buildObjConstrFields(c, dest, n, setFields, info, bindings, depth)
+          else:
+            skip n
       of ElseU:
-        inc n
-        let (hasField, presentFieldSymId) = fieldsPresentInInitExpr(c, n, setFields)
-        if hasField:
-          if lastFieldSymId != SymId(0):
-            conflictingBranchesError c, dest, info, lastFieldSymId, presentFieldSymId
-          elif isBranchSelected and setFields.hasKey(selectorSymId):
-            wrongBranchError(c, dest, info, presentFieldSymId, selectorSymId, getValueInKv(setFields.getOrQuit(selectorSymId)))
-          inc n # stmt
-          while n.hasMore:
-            if n.substructureKind == CaseU:
-              emitNestedCase(c, dest, n, setFields, info, bindings, depth)
-            else:
-              let field = takeLocal(n, SkipFinalParRi)
-              buildObjConstrField(c, dest, field, setFields, info, bindings, depth)
-          skipParRi n # stmt
-          lastFieldSymId = presentFieldSymId
-        else:
-          skip n
-        skipParRi n
-      of NoSub, NilU, NotnilU, KvU, VvU, RangeU, RangesU, ParamU, TypevarU, StaticTypevarU, EfldU, FldU,
+        n.into:
+          let (hasField, presentFieldSymId) = fieldsPresentInInitExpr(c, n, setFields)
+          if hasField:
+            if lastFieldSymId != SymId(0):
+              conflictingBranchesError c, dest, info, lastFieldSymId, presentFieldSymId
+            elif isBranchSelected and setFields.hasKey(selectorSymId):
+              wrongBranchError(c, dest, info, presentFieldSymId, selectorSymId, getValueInKv(setFields.getOrQuit(selectorSymId)))
+            n.into: # stmt
+              buildObjConstrFields(c, dest, n, setFields, info, bindings, depth)
+            lastFieldSymId = presentFieldSymId
+          elif not isBranchSelected and lastFieldSymId == SymId(0) and
+              setFields.hasKey(selectorSymId) and
+              isConstDiscriminator(c, getValueInKv(setFields.getOrQuit(selectorSymId))):
+            # A constant discriminator no `of` matched selects the `else`
+            # branch; its fields get their defaults (see the `of` arm above).
+            n.into: # stmt
+              buildObjConstrFields(c, dest, n, setFields, info, bindings, depth)
+          else:
+            skip n
+      of NoSub, NilU, NotnilU, KvU, VvU, RangeU, RangesU, ParamU, StaticParamU, TypevarU, StaticTypevarU, EfldU, FldU,
          WhenU, ElifU, TypevarsU, CaseU, StmtsU, ParamsU, PragmasU,
          EitherU, JoinU, UnpackflatU, UnpacktupU, ExceptU, FinU, UncheckedU, GfldU,
-         CallargsU, ForcallU:
+         CallargsU, ForcallU, DeferexpansionU, NeedtypesU:
         error "illformed AST inside case object: ", n
 
   if selectorSymId notin setFields:
     if lastFieldSymId != SymId(0):
       badDiscriminatorError(c, dest, info, lastFieldSymId, selectorSymId)
     elif bestBranch != default(Cursor):
-      inc bestBranch # stmt
-      while bestBranch.hasMore:
-        if bestBranch.substructureKind == NilU:
-          skip bestBranch
-          break
-        if bestBranch.substructureKind == CaseU:
-          emitNestedCase(c, dest, bestBranch, setFields, info, bindings, depth)
-        else:
-          let field = takeLocal(bestBranch, SkipFinalParRi)
-          buildObjConstrField(c, dest, field, setFields, info, bindings, depth)
-      skipParRi bestBranch
+      bestBranch.peekInto: # stmt
+        buildObjConstrFields(c, dest, bestBranch, setFields, info, bindings, depth)
 
 proc buildObjConstrFields(c: var SemContext; dest: var TokenBuf; n: var Cursor;
-                          setFields: Table[SymId, Cursor]; info: PackedLineInfo;
-                          bindings: Table[SymId, Cursor]; depth = 0) =
+                          setFields: Table[SymId, Cursor]; info: NifLineInfo;
+                          bindings: Table[SymId, Cursor]; depth = 0;
+                          isUnion = false) =
   var iter = initObjFieldIter()
   while nextField(iter, n, keepCase = true):
     if n.substructureKind == CaseU:
       var body = n
-      inc body
+      body = sub(body) # bound the branch walk; `body` is a copy
       # selector
       let field = takeLocal(body, SkipFinalParRi)
       buildObjConstrField(c, dest, field, setFields, info, bindings, depth)
@@ -4007,23 +4700,10 @@ proc buildObjConstrFields(c: var SemContext; dest: var TokenBuf; n: var Cursor;
       skip n
     else:
       let field = takeLocal(n, SkipFinalParRi)
-      buildObjConstrField(c, dest, field, setFields, info, bindings, depth)
-
-proc emitNestedCase(c: var SemContext; dest: var TokenBuf; n: var Cursor;
-                    setFields: Table[SymId, Cursor]; info: PackedLineInfo;
-                    bindings: Table[SymId, Cursor]; depth: int) =
-  ## `n` is at a nested `(case ...)` appearing inside a variant branch body.
-  ## Emit its discriminator field and recurse into the selected/best branch,
-  ## then advance `n` past the whole case. Mirrors `buildObjConstrFields`.
-  var body = n
-  inc body
-  let field = takeLocal(body, SkipFinalParRi)
-  buildObjConstrField(c, dest, field, setFields, info, bindings, depth)
-  fieldsPresentInBranch(c, dest, body, field, setFields, info, bindings, depth)
-  skip n
+      buildObjConstrField(c, dest, field, setFields, info, bindings, depth, isUnion)
 
 proc buildDefaultObjConstr(c: var SemContext; dest: var TokenBuf; typ: Cursor;
-                           setFields: Table[SymId, Cursor]; info: PackedLineInfo;
+                           setFields: Table[SymId, Cursor]; info: NifLineInfo;
                            prebuiltBindings = initTable[SymId, Cursor]()) =
   var constrKind = NoExpr
   var objImpl = typ
@@ -4032,7 +4712,7 @@ proc buildDefaultObjConstr(c: var SemContext; dest: var TokenBuf; typ: Cursor;
     inc objImpl
   let invokeArgs = skipInvoke(objImpl)
   var objDecl = default(TypeDecl)
-  if objImpl.kind == Symbol:
+  if objImpl.isSymbol:
     objDecl = getTypeSection(objImpl.symId)
     if objDecl.kind == TypeY:
       objImpl = objDecl.objBody
@@ -4054,19 +4734,19 @@ proc buildDefaultObjConstr(c: var SemContext; dest: var TokenBuf; typ: Cursor;
     # bindings weren't prebuilt, build here:
     bindings = bindInvokeArgs(objDecl, invokeArgs)
   # same field order as old nim VM: starting with most shallow base type
-  if obj.parentType.kind != DotToken:
+  if not obj.parentType.isDotToken:
     # copy original bindings to bring back when iterating the original type:
     let origBindings = bindings
-    var bindingBuf = default(TokenBuf) # to store subsequent parent args
+    var bindingBuf = initTokenBuf() # to store subsequent parent args
     var parentType = obj.parentType
     var depth = 1
-    while parentType.kind != DotToken:
+    while not parentType.isDotToken:
       var parentImpl = parentType
       if parentImpl.typeKind in {RefT, PtrT}:
         inc parentImpl
       let parentInvokeArgs = skipInvoke(parentImpl)
       var parentDecl = default(TypeDecl)
-      if parentImpl.kind == Symbol:
+      if parentImpl.isSymbol:
         parentDecl = getTypeSection(parentImpl.symId)
         if parentDecl.kind == TypeY:
           parentImpl = parentDecl.objBody
@@ -4076,7 +4756,7 @@ proc buildDefaultObjConstr(c: var SemContext; dest: var TokenBuf; typ: Cursor;
         error "invalid parent object type", parentImpl
 
       # build bindings for parent type:
-      var newBindingBuf = default(TokenBuf)
+      var newBindingBuf = initTokenBuf()
       let newBindings = bindSubsInvokeArgs(c, parentDecl, newBindingBuf, bindings, parentInvokeArgs)
       # set to current bindings so the next parent type can substitute based on them:
       bindingBuf = newBindingBuf
@@ -4084,26 +4764,29 @@ proc buildDefaultObjConstr(c: var SemContext; dest: var TokenBuf; typ: Cursor;
 
       let parent = asObjectDecl(parentImpl)
       var currentField = parent.body
-      inc currentField   # past (object
+      currentField = sub(currentField)   # past (object; bound the walk
       if parent.kind == ObjectT:
         skip currentField  # parent type / inheritance slot
-      if currentField.kind != DotToken:
+      if currentField.hasMore and not currentField.isDotToken:
         buildObjConstrFields(c, dest, currentField, setFields, info, bindings, depth)
       parentType = parent.parentType
       inc depth
     # bring back original bindings:
     bindings = origBindings
   var currentField = obj.body
-  inc currentField   # past (object
+  currentField = sub(currentField)   # past (object; bound the walk
   if obj.kind == ObjectT:
     skip currentField  # parent type / inheritance slot
-  if currentField.kind != DotToken:
-    buildObjConstrFields(c, dest, currentField, setFields, info, bindings)
+  if currentField.hasMore and not currentField.isDotToken:
+    let isUnion = objDecl.kind == TypeY and hasPragma(objDecl.pragmas, UnionP)
+    buildObjConstrFields(c, dest, currentField, setFields, info, bindings, isUnion = isUnion)
   dest.addParRi()
 
 proc getAnumOwnerType(efldSym: SymId): SymId =
-  ## Given an efld symbol, trace efld → anum type → owning object type.
-  ## The owner is stored in the anum body after the base type.
+  ## Given an efld symbol, trace efld → anum type → owning type. The owner is
+  ## stored in the anum body after the base type. It is the type as the user
+  ## spelled it: for `type T = ref object` that is `T`, not the split-off
+  ## `T.Obj`, so a constructor produces a `ref`.
   let efldRes = tryLoadSym(efldSym)
   if efldRes.status != LacksNothing or efldRes.decl.substructureKind != EfldU:
     return SymId(0)
@@ -4122,7 +4805,7 @@ proc getAnumOwnerType(efldSym: SymId): SymId =
   var body = anumDecl.body
   inc body # skip AnumT tag
   skip body # skip base type
-  if body.kind == Symbol:
+  if body.isSymbol:
     return body.symId
   return SymId(0)
 
@@ -4130,13 +4813,13 @@ proc inferTypevarFromTypes(formal, actual: Cursor; inferred: var Table[SymId, Cu
   ## Walk formal and actual types in parallel, extracting typevar bindings.
   var f = formal
   var a = actual
-  if f.kind == Symbol:
+  if f.isSymbol:
     let res = tryLoadSym(f.symId)
     if res.status == LacksNothing and res.decl.tagEnum == TypevarTagId:
       if f.symId notin inferred:
         inferred[f.symId] = a
       return
-  if f.kind == ParLe and a.kind == ParLe and f.tagId == a.tagId:
+  if f.isTagLit and a.isTagLit and f.cursorTagId == a.cursorTagId:
     inc f; inc a
     while f.hasMore and a.hasMore:
       inferTypevarFromTypes(f, a, inferred)
@@ -4149,7 +4832,8 @@ proc inferFieldTypes(c: var SemContext; args: Cursor;
   var scan = args
   while scan.hasMore:
     if scan.substructureKind == KvU:
-      inc scan
+      let kvStart = scan
+      scan = sub(scan)
       let fieldName = takeIdent(scan)
       if fieldName != StrId(0) and fieldTypesByName.hasKey(fieldName):
         var valBuf = createTokenBuf(16)
@@ -4159,23 +4843,26 @@ proc inferFieldTypes(c: var SemContext; args: Cursor;
         scan = val.n
       else:
         skip scan
-      if scan.kind == ParRi:
-        inc scan
+      if not scan.hasMore:
+        scan = kvStart; skip scan
       else:
         skip scan
     else:
       skip scan
 
-proc buildInferredInvoke(c: var SemContext; objTypeSym: SymId;
-                          decl: TypeDecl; inferred: Table[SymId, Cursor];
-                          info: PackedLineInfo): TypeCursor =
-  ## Build an InvokeT from inferred type params and instantiate it.
+proc buildInferredInvoke(c: var SemContext; rootSym: SymId;
+                          typevars: Cursor; inferred: Table[SymId, Cursor];
+                          info: NifLineInfo): TypeCursor =
+  ## Build an InvokeT of `rootSym` from inferred type params and instantiate it.
+  ## `typevars` are the ones `inferred` is keyed by; they are matched to
+  ## `rootSym`'s parameters positionally, which is what lets a `ref` sum type
+  ## infer through `T.Obj`'s typevars and invoke `T`.
   ## Returns default if not all params were inferred.
   var typeBuf = createTokenBuf(16)
   typeBuf.addParLe(InvokeT, info)
-  typeBuf.add symToken(objTypeSym, info)
-  var tv = decl.typevars
-  inc tv # skip TypevarsU tag
+  typeBuf.addSymUse(rootSym, info)
+  var tv = typevars
+  tv = sub(tv) # skip TypevarsU tag
   while tv.hasMore:
     let tvar = asLocal(tv)
     let tvSym = tvar.name.symId
@@ -4196,7 +4883,7 @@ proc fieldTypesByNameFromObj(decl: TypeDecl): Table[StrId, TypeCursor] =
   if body.typeKind != ObjectT: return
   let obj = asObjectDecl(body)
   var n = obj.body
-  inc n  # past (object
+  n = sub(n)  # past (object; bound the walk, `n` is a copy
   skip n  # parent type / inheritance slot
   var iter = initObjFieldIter()
   while nextField(iter, n):
@@ -4206,54 +4893,60 @@ proc fieldTypesByNameFromObj(decl: TypeDecl): Table[StrId, TypeCursor] =
 
 proc inferSumTypeFromFields(c: var SemContext; dest: var TokenBuf;
                              efldSym: SymId; args: Cursor;
-                             info: PackedLineInfo): TypeCursor =
+                             info: NifLineInfo): TypeCursor =
   ## Infer generic type for a sum type constructor like `Some(val: 4)`.
-  let objTypeSym = getAnumOwnerType(efldSym)
-  if objTypeSym == SymId(0): return default(TypeCursor)
+  let ownerTypeSym = getAnumOwnerType(efldSym)
+  if ownerTypeSym == SymId(0): return default(TypeCursor)
 
-  let decl = getTypeSection(objTypeSym)
+  let decl = getTypeSection(ownerTypeSym)
   if not decl.isGeneric:
     var typeBuf = createTokenBuf(1)
-    typeBuf.add symToken(objTypeSym, info)
+    typeBuf.addSymUse(ownerTypeSym, info)
     var instDest = createTokenBuf(16)
     var instRead = cursorAt(typeBuf, 0)
     return semLocalType(c, instDest, instRead)
 
-  let branchFields = findBranchFields(objTypeSym, efldSym)
+  # The branch field types are written in terms of the object type's typevars,
+  # which for a `ref`/`ptr` sum type are not the owner alias's:
+  let objDecl = sumTypeObjDecl(ownerTypeSym)
+  if objDecl.kind != TypeY: return default(TypeCursor)
+
+  let branchFields = findBranchFields(ownerTypeSym, efldSym)
   var fieldTypesByName = initTable[StrId, TypeCursor]()
   for bf in branchFields:
     fieldTypesByName[symToIdent(bf.sym)] = bf.typ
 
   var inferred = initTable[SymId, Cursor]()
   inferFieldTypes(c, args, fieldTypesByName, inferred)
-  result = buildInferredInvoke(c, objTypeSym, decl, inferred, info)
+  result = buildInferredInvoke(c, ownerTypeSym, objDecl.typevars, inferred, info)
 
 proc inferObjTypeFromFields(c: var SemContext; objTypeSym: SymId;
                              decl: TypeDecl; args: Cursor;
-                             info: PackedLineInfo): TypeCursor =
+                             info: NifLineInfo): TypeCursor =
   ## Infer generic type for an object constructor like `Foo(x: 4)`.
   let fieldTypesByName = fieldTypesByNameFromObj(decl)
   var inferred = initTable[SymId, Cursor]()
   inferFieldTypes(c, args, fieldTypesByName, inferred)
-  result = buildInferredInvoke(c, objTypeSym, decl, inferred, info)
+  result = buildInferredInvoke(c, objTypeSym, decl.typevars, inferred, info)
 
 proc semSumTypeObjConstr(c: var SemContext; dest: var TokenBuf; it: var Item;
-                          efldSym: SymId; expected: TypeCursor; info: PackedLineInfo) =
+                          efldSym: SymId; expected: TypeCursor; info: NifLineInfo;
+                          oconstrStart: Cursor) =
   let branchInfo = it.n.info
   inc it.n
   var objBuf = createTokenBuf(32)
-  objBuf.add parLeToken(OconstrX, info)
+  objBuf.addParLe(OconstrX, info)
   objBuf.addSubtree expected
   let kindName = pool.strings.getOrIncl("`kind")
   objBuf.addParLe(KvU, branchInfo)
-  objBuf.add identToken(kindName, branchInfo)
-  objBuf.add symToken(efldSym, branchInfo)
+  objBuf.addIdent(kindName, branchInfo)
+  objBuf.addSymUse(efldSym, branchInfo)
   objBuf.addParRi()
   while it.n.hasMore:
     objBuf.addSubtree it.n
     skip it.n
   objBuf.addParRi()
-  skipParRi it.n
+  it.n = oconstrStart; skip it.n
   var objConstr = Item(n: cursorAt(objBuf, 0), typ: expected)
   semObjConstr c, dest, objConstr
   it.typ = objConstr.typ
@@ -4270,17 +4963,17 @@ proc flatFieldDeclOrder(typ: Cursor; order: var seq[SymId]): bool =
   var objImpl = typ
   if objImpl.typeKind in {RefT, PtrT}: inc objImpl
   discard skipInvoke(objImpl)
-  if objImpl.kind != Symbol: return false
+  if not objImpl.isSymbol: return false
   let objDecl = getTypeSection(objImpl.symId)
   if objDecl.kind != TypeY: return false
   var objBody = objDecl.objBody
   if objBody.typeKind != ObjectT: return false
   let obj = asObjectDecl(objBody)
-  if obj.parentType.kind != DotToken: return false   # has a base type
+  if not obj.parentType.isDotToken: return false   # has a base type
   var f = obj.body
-  inc f                # past (object
+  f = sub(f)           # past (object; bound the walk, `f` is a copy
   skip f               # inheritance slot (DotToken for a flat object)
-  if f.kind == DotToken: return false                # no fields
+  if not f.hasMore or f.isDotToken: return false     # no fields
   var iter = initObjFieldIter()
   while nextField(iter, f, keepCase = true):
     if f.substructureKind == CaseU: return false     # variant part
@@ -4288,14 +4981,75 @@ proc flatFieldDeclOrder(typ: Cursor; order: var seq[SymId]): bool =
     order.add field.name.symId
   return true
 
+proc asksForNil(typ: TypeCursor): bool =
+  ## Whether a destination type spells `nil T`, i.e. asks to be handed the `nil`
+  ## an allocation answers with rather than the panic. Shaped like
+  ## `contracts_fir.markedAs` and for its reason: the value-passing wrappers do
+  ## not change a value's nilability, only how it is passed, and `system.new`
+  ## reaches here as `out T`.
+  var t = typ
+  while t.typeKind in {SinkT, MutT, LentT, OutT, OwnedT}:
+    inc t
+  if t.typeKind != RefT: return false
+  var marker = t.childCursor
+  skip marker # the element type
+  result = marker.hasMore and marker.substructureKind == NilU
+
+proc nilableAllocResult(c: var SemContext; typ, expected: TypeCursor;
+                        info: NifLineInfo): TypeCursor =
+  ## An allocation panics on out-of-memory (`doc/internals/failure_modes.md`)
+  ## unless the DESTINATION asked to be handed the `nil` instead by declaring
+  ## itself `nil T`. Stamping the marker onto the constructed type here is what
+  ## carries that request to `trNewobj`, which reads it off the `newobj`'s type to
+  ## choose between panicking and guarding its stores, and to `wantNotNilDeref`,
+  ## which then makes every dereference narrow.
+  ##
+  ## `.raises` overrides an explicit `nil` destination for now: tier 1 maps the
+  ## failure to `ErrorCode.OutOfMemError` and raises it, so the body may go on
+  ## treating the result as not-nil. A `lenientnils` module needs nothing here --
+  ## its `ref` is already `unchecked`, which `trNewobj` reads the same way as
+  ## `nil` and the prover reads as "do not ask" -- so the consequences stay the
+  ## programmer's without this site knowing about the feature.
+  result = typ
+  if typ.typeKind != RefT: return
+  if c.routine.pragmas.contains(RaisesP) or CanRaiseFeature in c.features: return
+  if not asksForNil(expected): return
+  var marker = typ.childCursor
+  skip marker # the element type
+  if not (marker.hasMore and marker.substructureKind == NotnilU): return
+
+  var buf = createTokenBuf(8)
+  buf.addParLe(RefT, info)
+  var ch = typ.childCursor
+  takeTree buf, ch # the element type
+  while ch.hasMore:
+    # keep whatever else the type carries, minus the marker being replaced
+    if ch.substructureKind in {NotnilU, NilU, UncheckedU}: skip ch
+    else: takeTree buf, ch
+  buf.addParPair(NilU, info)
+  buf.addParRi()
+  result = typeToCursor(c, buf, 0)
+
+proc ownedAllocResult(c: var SemContext; typ: TypeCursor; info: NifLineInfo): TypeCursor =
+  ## RFC #575: under `.feature: "ownedRefs"` an object construction yields the
+  ## owning edge to the new cell.
+  result = typ
+  if OwnedRefsFeature notin c.features or typ.typeKind != RefT: return
+  var buf = createTokenBuf(8)
+  buf.addParLe(OwnedT, info)
+  buf.addSubtree typ
+  buf.addParRi()
+  result = typeToCursor(c, buf, 0)
+
 proc semObjConstr(c: var SemContext; dest: var TokenBuf, it: var Item) =
   let exprStart = dest.len
   let expected = it.typ
   let info = it.n.info
-  inc it.n
-  if it.n.kind == Ident:
+  let oconstrStart = it.n
+  it.n = sub(it.n)
+  if it.n.isIdent:
     block sumTypeCheck:
-      let efldSym = findOneofEfld(c, it.n.litId)
+      let efldSym = findOneofEfld(c, it.n.strId)
       if efldSym != SymId(0):
         var inferredExpected = expected
         if expected.typeKind == AutoT:
@@ -4307,38 +5061,37 @@ proc semObjConstr(c: var SemContext; dest: var TokenBuf, it: var Item) =
           if inferredExpected == default(TypeCursor):
             c.buildErr dest, info, "cannot infer generic type for sum type constructor"
             while it.n.hasMore: skip it.n
-            consumeParRi it.n
+            it.n = oconstrStart; skip it.n
             return
-        semSumTypeObjConstr(c, dest, it, efldSym, inferredExpected, info)
+        semSumTypeObjConstr(c, dest, it, efldSym, inferredExpected, info, oconstrStart)
         return
   it.typ = semLocalType(c, dest, it.n)
   dest.shrink exprStart
   var decl = default(TypeDecl)
   var objType = it.typ
-  var isGenericObj = containsGenericParams(objType)
   if objType.typeKind in {RefT, PtrT}:
     inc objType
   var invokeArgs = skipInvoke(objType)
   var typeSym = SymId(0)
-  if objType.kind == Symbol:
+  if objType.isSymbol:
     typeSym = objType.symId
     decl = getTypeSection(typeSym)
     if decl.kind != TypeY:
       # includes typevar case
       c.buildErr dest, info, "expected type for object constructor"
       while it.n.hasMore: skip it.n
-      consumeParRi it.n
+      it.n = oconstrStart; skip it.n
       return
     objType = decl.objBody
     if objType.typeKind != ObjectT:
       c.buildErr dest, info, "expected object type for object constructor"
       while it.n.hasMore: skip it.n
-      consumeParRi it.n
+      it.n = oconstrStart; skip it.n
       return
   else:
     c.buildErr dest, info, "expected type symbol for object constructor"
     while it.n.hasMore: skip it.n
-    consumeParRi it.n
+    it.n = oconstrStart; skip it.n
     return
   if decl.isGeneric and invokeArgs == default(Cursor):
     # Generic object without explicit type params — infer from field values:
@@ -4346,17 +5099,16 @@ proc semObjConstr(c: var SemContext; dest: var TokenBuf, it: var Item) =
     if inferred == default(TypeCursor):
       c.buildErr dest, info, "cannot infer generic type for object constructor"
       while it.n.hasMore: skip it.n
-      consumeParRi it.n
+      it.n = oconstrStart; skip it.n
       return
     it.typ = inferred
     objType = it.typ
     if objType.typeKind in {RefT, PtrT}:
       inc objType
     invokeArgs = skipInvoke(objType)
-    if objType.kind == Symbol:
+    if objType.isSymbol:
       decl = getTypeSection(objType.symId)
       objType = decl.objBody
-    isGenericObj = false
   # build bindings for invoked object type to get proper types for fields:
   let bindings = bindInvokeArgs(decl, invokeArgs)
   var fieldBuf = createTokenBuf(16)
@@ -4368,14 +5120,15 @@ proc semObjConstr(c: var SemContext; dest: var TokenBuf, it: var Item) =
       skip it.n
     else:
       let fieldStart = fieldBuf.len
-      fieldBuf.add it.n
-      inc it.n
+      fieldBuf.addParLe(it.n.cursorTagId, it.n.info)
+      let kvStart = it.n
+      it.n = sub(it.n)
       let fieldInfo = it.n.info
       let fieldNameCursor = it.n
       let fieldName = takeIdent(it.n)
       if fieldName == StrId(0):
         c.buildErr dest, fieldInfo, "identifier expected for object field"
-        skipUntilEnd it.n
+        while it.n.hasMore: skip it.n
       else:
         # A field is never a free-standing global symbol: it lives in its owning
         # object type's scope. Always resolve it by name against `decl` (the type
@@ -4384,8 +5137,9 @@ proc semObjConstr(c: var SemContext; dest: var TokenBuf, it: var Item) =
         # numbered the field differently than the canonical decl). The Symbol form
         # means a prior semcheck pass already validated visibility, so bypass the
         # visibility check in that case.
-        let hasFieldSym = fieldNameCursor.kind == Symbol
-        var field = findObjFieldConsiderVis(c, decl, fieldName, bindings, bypassVis = hasFieldSym)
+        let hasFieldSym = fieldNameCursor.isSymbol
+        var field = findObjFieldConsiderVis(c, decl, fieldName, bindings, fieldInfo,
+                                            bypassVis = hasFieldSym)
         if field.level >= 0:
           if field.sym in setFieldPositions:
             c.buildErr dest, fieldInfo, "field already set: " & pool.strings[fieldName]
@@ -4393,11 +5147,12 @@ proc semObjConstr(c: var SemContext; dest: var TokenBuf, it: var Item) =
           else:
             setFieldPositions[field.sym] = fieldStart
             givenOrder.add field.sym
-            if isGenericObj:
-              # do not save generic field sym
-              fieldBuf.add identToken(fieldName, fieldInfo)
-            else:
-              fieldBuf.add symToken(field.sym, fieldInfo)
+            # Store the resolved field symbol even while the object type is
+            # still generic. Field names are object-scoped and `subs` leaves
+            # field `SymbolDef`s untouched across instantiation, so the sym
+            # stays valid; keeping an `Ident` here instead would drop the
+            # "already validated" evidence that `hasFieldSym` reads.
+            fieldBuf.addSymUse(field.sym, fieldInfo)
             # maybe add inheritance depth too somehow?
             var val = Item(n: it.n, typ: field.typ)
             semExpr c, fieldBuf, val
@@ -4415,8 +5170,8 @@ proc semObjConstr(c: var SemContext; dest: var TokenBuf, it: var Item) =
           # add inheritance level
           fieldBuf.addIntLit(field.level, fieldInfo)
       fieldBuf.addParRi()
-      skipParRi it.n
-  skipParRi it.n
+      it.n = kvStart; skip it.n
+  it.n = oconstrStart; skip it.n
   var setFields = initTable[SymId, Cursor]()
   for field, pos in setFieldPositions:
     setFields[field] = cursorAt(fieldBuf, pos)
@@ -4426,8 +5181,8 @@ proc semObjConstr(c: var SemContext; dest: var TokenBuf, it: var Item) =
   # than silently preserve source order (which would be inconsistent with how
   # named call arguments are already reordered), flag the mismatch: warn when a
   # flat object's fields are written in an order that won't match their
-  # evaluation order (nim-lang/nimony#1056).
-  if not isGenericObj and givenOrder.len >= 2:
+  # evaluation order (nim-lang/nimony#1056; fork patch e883ea94).
+  if givenOrder.len >= 2:
     var declOrder: seq[SymId] = @[]
     if flatFieldDeclOrder(it.typ, declOrder):
       var rank = initTable[SymId, int]()
@@ -4440,17 +5195,21 @@ proc semObjConstr(c: var SemContext; dest: var TokenBuf, it: var Item) =
           break
         prev = r
 
+  # `buildDefaultObjConstr` emits a `newobj` exactly when the type is a `ref`, so
+  # testing the type here is testing "does this allocate". The source node is an
+  # `oconstr` either way.
+  it.typ = nilableAllocResult(c, it.typ, expected, info)
   buildDefaultObjConstr(c, dest, it.typ, setFields, info, bindings)
+  it.typ = ownedAllocResult(c, it.typ, info)
   commonType c, dest, it, exprStart, expected
 
 proc semObjDefault(c: var SemContext; dest: var TokenBuf; it: var Item) =
   let exprStart = dest.len
   let expected = it.typ
   let info = it.n.info
-  inc it.n
-  it.typ = semLocalType(c, dest, it.n)
-  dest.shrink exprStart
-  skipParRi it.n
+  it.n.into:
+    it.typ = semLocalType(c, dest, it.n)
+    dest.shrink exprStart
   buildDefaultObjConstr(c, dest, it.typ, initTable[SymId, Cursor](), info)
   commonType c, dest, it, exprStart, expected
 
@@ -4458,27 +5217,30 @@ proc semNewref(c: var SemContext; dest: var TokenBuf; it: var Item) =
   let exprStart = dest.len
   let expected = it.typ
   let info = it.n.info
-  dest.takeToken it.n
-  let beforeTypeArg = dest.len
-  it.typ = semLocalType(c, dest, it.n)
-  dest.shrink beforeTypeArg
-  if it.typ.typeKind == TypedescT:
-    inc it.typ
-  dest.addSubtree it.typ
-  assert it.typ.typeKind == RefT
-  let typeForDefault = it.typ.firstSon
-  callDefault c, dest, typeForDefault, info
-  skip it.n # type
-  if it.n.hasMore:
-    skip it.n # existing `default(T)` call
-  takeParRi dest, it.n
+  takeInto dest, it.n:
+    let beforeTypeArg = dest.len
+    it.typ = semLocalType(c, dest, it.n)
+    dest.shrink beforeTypeArg
+    if it.typ.typeKind == TypedescT:
+      inc it.typ
+    if it.typ.typeKind == OwnedT:
+      # fresh, so it may initialize the owned location (RFC #575):
+      inc it.typ
+    it.typ = nilableAllocResult(c, it.typ, expected, info)
+    dest.addSubtree it.typ
+    assert it.typ.typeKind == RefT
+    let typeForDefault = it.typ.childCursor
+    callDefault c, dest, typeForDefault, info
+    skip it.n # type
+    if it.n.hasMore:
+      skip it.n # existing `default(T)` call
   commonType c, dest, it, exprStart, expected
 
-proc buildDefaultTuple(c: var SemContext; dest: var TokenBuf; typ: Cursor; info: PackedLineInfo) =
+proc buildDefaultTuple(c: var SemContext; dest: var TokenBuf; typ: Cursor; info: NifLineInfo) =
   dest.addParLe(TupconstrX, info)
   dest.addSubtree typ
   var currentField = typ
-  inc currentField # skip tuple tag
+  currentField = sub(currentField) # skip tuple tag
   while currentField.hasMore:
     let field = getTupleFieldType(currentField)
     callDefault c, dest, field, info
@@ -4489,10 +5251,9 @@ proc semTupleDefault(c: var SemContext; dest: var TokenBuf; it: var Item) =
   let exprStart = dest.len
   let expected = it.typ
   let info = it.n.info
-  inc it.n
-  it.typ = semLocalType(c, dest, it.n)
-  dest.shrink exprStart
-  skipParRi it.n
+  it.n.into:
+    it.typ = semLocalType(c, dest, it.n)
+    dest.shrink exprStart
   buildDefaultTuple(c, dest, it.typ, info)
   commonType c, dest, it, exprStart, expected
 
@@ -4500,15 +5261,14 @@ proc semDefaultDistinct(c: var SemContext; dest: var TokenBuf; it: var Item) =
   let exprStart = dest.len
   let expected = it.typ
   let info = it.n.info
-  inc it.n
-  it.typ = semLocalType(c, dest, it.n)
-  dest.shrink exprStart
-  skipParRi it.n
+  it.n.into:
+    it.typ = semLocalType(c, dest, it.n)
+    dest.shrink exprStart
   var isDistinct = false
   let srcBase = skipDistinct(it.typ, isDistinct)
 
-  dest.add parLeToken(DconvX, info)
-  dest.add it.typ
+  dest.addParLe(DconvX, info)
+  dest.addSubtree it.typ
   callDefault c, dest, srcBase, info
   dest.addParRi()
   commonType c, dest, it, exprStart, expected
@@ -4517,18 +5277,21 @@ proc semTupAt(c: var SemContext; dest: var TokenBuf; it: var Item) =
   # has already been semchecked but we do it again:
   let exprStart = dest.len
   let expected = it.typ
-  takeToken dest, it.n
+  dest.addParLe(it.n.cursorTagId, it.n.info)
+  let tupatStart = it.n
+  it.n = sub(it.n)
   var tup = Item(n: it.n, typ: c.types.autoType)
   let tupInfo = tup.n.info
   semExpr c, dest, tup
   let tupleType = skipModifier(tup.typ)
   if tupleType.typeKind != TupleT:
-    if tupleType.kind == Symbol and getTypeSection(tupleType.symId).kind == TypevarY:
+    if tupleType.isSymbol and getTypeSection(tupleType.symId).kind == TypevarY:
       # for `T: tuple`
       var index = Item(n: tup.n, typ: c.types.autoType)
       semExpr c, dest, index
       it.n = index.n
-      takeParRi dest, it.n
+      dest.addParRi(it.n.endInfo)
+      it.n = tupatStart; skip it.n
       it.typ = c.types.untypedType
     else:
       c.buildErr dest, tupInfo, "expected tuple but got: " & typeToString(tupleType)
@@ -4538,20 +5301,20 @@ proc semTupAt(c: var SemContext; dest: var TokenBuf; it: var Item) =
   let idxInfo = idx.info
   semConstIntExpr c, dest, idx, c.phase
   var idxValue = evalOrdinal(c, cursorAt(dest, idxStart))
-  endRead(dest)
   it.n = idx
   let zero = createXint(0'i64)
   if idxValue.isNaN or idxValue < zero:
     shrink dest, idxStart
     c.buildErr dest, idxInfo, "must be a constant expression >= 0"
-    takeParRi dest, it.n
+    dest.addParRi(it.n.endInfo)
+    it.n = tupatStart; skip it.n
   else:
     it.typ = tupleType
-    inc it.typ
+    it.typ = sub(it.typ)
     # navigate to the proper type within the tuple type:
     let one = createXint(1'i64)
     while true:
-      if it.typ.kind == ParRi:
+      if not it.typ.hasMore:
         shrink dest, idxStart
         c.buildErr dest, idxInfo, "tuple index too large"
         break
@@ -4562,74 +5325,87 @@ proc semTupAt(c: var SemContext; dest: var TokenBuf; it: var Item) =
         break
     if it.typ.hasMore:
       it.typ = getTupleFieldType(it.typ)
-    takeParRi dest, it.n
+    dest.addParRi(it.n.endInfo)
+    it.n = tupatStart; skip it.n
     commonType c, dest, it, exprStart, expected
 
-proc tryExplicitRoutineInst(c: var SemContext; dest: var TokenBuf; syms: Cursor; it: var Item): bool =
+proc collectExplicitInstMatches(c: var SemContext; dest: var TokenBuf; syms: Cursor;
+                                args: Cursor; matches: var int; lastMatch: var Match;
+                                instLastMatch: var bool; errMsg: var string;
+                                errInfo: var NifLineInfo) =
+  ## Walks a symchoice tree (or a bare symbol), adding every sym whose
+  ## typevars match `args` to `dest`. Malformed content is reported via
+  ## `errMsg`/`errInfo` (empty `errMsg` means success).
+  var syms = syms
+  case syms.kind
+  of Symbol:
+    let sym = syms.symId
+    let routine = getProcDecl(sym)
+    let candidate = FnCandidate(kind: routine.kind, sym: sym, typ: routine.params)
+    var m = createMatch(addr c)
+    m.fn = candidate
+    matchTypevars m, candidate, args
+    buildTypeArgs(m)
+    if not m.err:
+      # match
+      dest.addSymUse(sym, syms.info)
+      inc matches
+      lastMatch = m
+      # mark if routine is suitable for instantiation:
+      instLastMatch = routine.kind notin {TemplateY, MacroY} and not routine.exported.isTagLit
+  of TagLit:
+    if syms.exprKind in {CchoiceX, OchoiceX}:
+      syms.loopInto:
+        collectExplicitInstMatches(c, dest, syms, args, matches, lastMatch,
+                                   instLastMatch, errMsg, errInfo)
+        if errMsg.len > 0: return
+        skip syms
+    else:
+      errMsg = "invalid tag in symchoice: " & globalTags.tags[syms.cursorTagId]
+      errInfo = syms.info
+  else:
+    errMsg = "invalid token in symchoice: " & $syms.kind
+    errInfo = syms.info
+
+proc tryExplicitRoutineInst(c: var SemContext; dest: var TokenBuf; syms: Cursor; it: var Item;
+                            atStart: Cursor): bool =
   result = false
   let info = syms.info
   let exprStart = dest.len
   # build symchoice first so we can directly add the matching syms:
-  dest.add parLeToken(AtX, info)
-  dest.add parLeToken(CchoiceX, info)
+  dest.addParLe(AtX, info)
+  dest.addParLe(CchoiceX, info)
   var argBuf = createTokenBuf(16)
   swap dest, argBuf
   var argRead = it.n
   while argRead.hasMore:
     semLocalTypeImpl c, dest, argRead, AllowValues
-  takeParRi dest, argRead
+  # no end sentinel needed: `matchTypevars` walks the flat fragment
+  # hasMore-bounded (a classic physical ParRi would assert in closeTag)
+  argRead = atStart; skip argRead # close of the (at ...) scope entered by the caller
   swap dest, argBuf
   # XXX investigate this further, seems odd and prevents us from eliminating the swaps:
   let args = cursorAt(argBuf, 0)
   var matches = 0
-  var lastMatch = default(Match)
+  var lastMatch = createMatch(addr c)
   var instLastMatch = false
-  var syms = syms
-  var nested = 0
-  while true:
-    # find matching syms
-    case syms.kind
-    of ParLe:
-      if syms.exprKind in {CchoiceX, OchoiceX}:
-        inc nested
-        inc syms
-      else:
-        dest.shrink exprStart
-        c.buildErr dest, syms.info, "invalid tag in symchoice: " & pool.tags[syms.tagId]
-        return
-    of ParRi:
-      dec nested
-      inc syms
-    of Symbol:
-      let sym = syms.symId
-      let routine = getProcDecl(sym)
-      let candidate = FnCandidate(kind: routine.kind, sym: sym, typ: routine.params)
-      var m = createMatch(addr c)
-      m.fn = candidate
-      matchTypevars m, candidate, args
-      buildTypeArgs(m)
-      if not m.err:
-        # match
-        dest.add symToken(sym, syms.info)
-        inc matches
-        lastMatch = m
-        # mark if routine is suitable for instantiation:
-        instLastMatch = routine.kind notin {TemplateY, MacroY} and routine.exported.kind != ParLe
-      inc syms
-    else:
-      dest.shrink exprStart
-      c.buildErr dest, syms.info, "invalid token in symchoice: " & $syms.kind
-      return
-    if nested == 0: break
+  var errMsg = ""
+  var errInfo = info
+  collectExplicitInstMatches(c, dest, syms, args, matches, lastMatch,
+                             instLastMatch, errMsg, errInfo)
+  if errMsg.len > 0:
+    dest.shrink exprStart
+    c.buildErr dest, errInfo, errMsg
+    return
   dest.addParRi() # close symchoice
   if matches == 0:
     dest.shrink exprStart
     result = false
-  elif matches == 1 and c.routine.inGeneric == 0 and instLastMatch:
+  elif matches == 1 and c.inGenericDefinition == 0 and instLastMatch:
     # can instantiate single match
     dest.shrink exprStart
     let inst = c.requestRoutineInstance(lastMatch.fn.sym, lastMatch.typeArgs, lastMatch.inferred, info)
-    dest.add symToken(inst.targetSym, info)
+    dest.addSymUse(inst.targetSym, info)
     it.typ = inst.procType
     it.kind = lastMatch.fn.kind
     it.n = argRead
@@ -4637,18 +5413,22 @@ proc tryExplicitRoutineInst(c: var SemContext; dest: var TokenBuf; syms: Cursor;
   else:
     # multiple matches, leave as subscript of symchoice
     dest.add argBuf
+    dest.addParRi() # close the `(at` (classic argBuf ended in a sentinel ParRi
+                    # that doubled as this close)
     it.n = argRead
     result = true
 
 proc isSinglePar(n: Cursor): bool =
   var n = n
-  inc n
-  result = n.kind == ParRi
+  n = sub(n)
+  result = not n.hasMore
 
-proc tryBuiltinSubscript(c: var SemContext; dest: var TokenBuf; it: var Item; lhs: Item): bool =
-  # it.n is after lhs, at args
+proc tryBuiltinSubscript(c: var SemContext; dest: var TokenBuf; it: var Item; lhs: Item;
+                         atStart: Cursor): bool =
+  # it.n is after lhs, at args; `atStart` is the head of the (at ...) node
+  # captured by the caller — its close is consumed here iff the result is true
   result = false
-  if (lhs.n.kind == Symbol and lhs.kind == TypeY and
+  if (lhs.n.isSymbol and lhs.kind == TypeY and
         isGeneric(getTypeSection(lhs.n.symId))) or
       (lhs.n.typeKind in InvocableTypeMagics and isSinglePar(lhs.n)):
     # lhs is a generic type symbol, this is a generic invocation
@@ -4658,7 +5438,7 @@ proc tryBuiltinSubscript(c: var SemContext; dest: var TokenBuf; it: var Item; lh
     typeExpr.addSubtree lhs.n
     while it.n.hasMore:
       takeTree typeExpr, it.n
-    skipParRi it.n
+    it.n = atStart; skip it.n
     typeExpr.addParRi()
     var typeItem = Item(n: beginRead(typeExpr), typ: it.typ)
     semLocalTypeExpr c, dest, typeItem
@@ -4667,59 +5447,84 @@ proc tryBuiltinSubscript(c: var SemContext; dest: var TokenBuf; it: var Item; lh
   var maybeRoutine = lhs.n
   if maybeRoutine.exprKind in {OchoiceX, CchoiceX}:
     inc maybeRoutine
-  if maybeRoutine.kind == Symbol:
+  if maybeRoutine.isSymbol:
     let res = tryLoadSym(maybeRoutine.symId)
     if res.status == LacksNothing and isRoutine(res.decl.symKind):
       # check for explicit generic routine instantiation
-      result = tryExplicitRoutineInst(c, dest, lhs.n, it)
+      result = tryExplicitRoutineInst(c, dest, lhs.n, it, atStart)
       if result: return
 
-proc semBuiltinSubscript(c: var SemContext; dest: var TokenBuf; it: var Item; lhs: Item) =
+proc semBuiltinSubscript(c: var SemContext; dest: var TokenBuf; it: var Item; lhs: Item;
+                         atStart: Cursor) =
   # it.n is after lhs, at args
-  if tryBuiltinSubscript(c, dest, it, lhs):
+  if tryBuiltinSubscript(c, dest, it, lhs, atStart):
     return
 
   # build call:
   var callBuf = createTokenBuf(16)
   callBuf.addParLe(CallX, lhs.n.info)
-  callBuf.add identToken(pool.strings.getOrIncl("[]"), lhs.n.info)
+  callBuf.addIdent(pool.strings.getOrIncl("[]"), lhs.n.info)
   callBuf.addSubtree lhs.n
   while it.n.hasMore:
     callBuf.takeTree it.n
   callBuf.addParRi()
-  skipParRi it.n
+  it.n = atStart; skip it.n # close of the (at ...) scope entered by the caller
   var call = Item(n: cursorAt(callBuf, 0), typ: it.typ)
   semCall c, dest, call, {}, SubscriptCall
   it.typ = call.typ
 
+proc semPluginCall(c: var SemContext; dest: var TokenBuf; it: var Item) =
+  ## A deferred plugin call, parked by `deferPluginCall`. Its arguments have
+  ## been substituted by now, so drive the plugin again through the ordinary
+  ## call path; a plugin that still cannot answer parks it here once more.
+  let info = it.n.info
+  var callBuf = pluginCallToCall(it.n, info)
+  var call = Item(n: cursorAt(callBuf, 0), typ: it.typ)
+  semCall c, dest, call, {}
+  it.typ = call.typ
+
 proc semSubscript(c: var SemContext; dest: var TokenBuf; it: var Item) =
   var n = it.n
-  inc n # tag
+  let atStart = n
+  n = sub(n) # skip tag; the close is consumed inside
+             # semBuiltinSubscript
   var lhsBuf = createTokenBuf(4)
   var lhs = Item(n: n, typ: c.types.autoType)
   semExpr c, lhsBuf, lhs, {KeepMagics}
   it.n = lhs.n
   lhs.n = cursorAt(lhsBuf, 0)
-  semBuiltinSubscript(c, dest, it, lhs)
+  if lhs.n.isTagLit and lhs.n.cursorTagId == nifpools.ErrT:
+    # The operand is the expression that is wrong, so its diagnostic is the one
+    # to report; a subscript on top of it means nothing. The whole `(at …)`
+    # becomes that one error node, which keeps the enclosing node's arity.
+    # This used to copy the unchecked `(at …)` through instead (#2191): the
+    # operand's error vanished, and outside a generic body nothing re-checked
+    # the tree — `outp = f(1)[0]` reached `derefs` untyped and crashed there
+    # ("callee type not params") without a word about `f(1)`.
+    dest.addSubtree lhs.n
+    it.n = atStart
+    skip it.n
+    it.typ = c.types.autoType
+  else:
+    semBuiltinSubscript(c, dest, it, lhs, atStart)
 
 proc semCurlyat(c: var SemContext; dest: var TokenBuf; it: var Item) =
   let info = it.n.info
-  inc it.n # tag
   var lhsBuf = createTokenBuf(4)
-  var lhs = Item(n: it.n, typ: c.types.autoType)
-  semExpr c, lhsBuf, lhs, {KeepMagics}
-  it.n = lhs.n
-  lhs.n = cursorAt(lhsBuf, 0)
-
-  # `{}` has no builtin meaning; always rewrite to a call to `{}`:
   var callBuf = createTokenBuf(16)
-  callBuf.addParLe(CallX, info)
-  callBuf.add identToken(pool.strings.getOrIncl("{}"), info)
-  callBuf.addSubtree lhs.n
-  while it.n.hasMore:
-    callBuf.takeTree it.n
-  callBuf.addParRi()
-  skipParRi it.n
+  it.n.into: # tag
+    var lhs = Item(n: it.n, typ: c.types.autoType)
+    semExpr c, lhsBuf, lhs, {KeepMagics}
+    it.n = lhs.n
+    lhs.n = cursorAt(lhsBuf, 0)
+
+    # `{}` has no builtin meaning; always rewrite to a call to `{}`:
+    callBuf.addParLe(CallX, info)
+    callBuf.addIdent(pool.strings.getOrIncl("{}"), info)
+    callBuf.addSubtree lhs.n
+    while it.n.hasMore:
+      callBuf.takeTree it.n
+    callBuf.addParRi()
   var call = Item(n: cursorAt(callBuf, 0), typ: it.typ)
   semCall c, dest, call, {}, CurlyatCall
   it.typ = call.typ
@@ -4727,111 +5532,160 @@ proc semCurlyat(c: var SemContext; dest: var TokenBuf; it: var Item) =
 proc semTypedAt(c: var SemContext; dest: var TokenBuf; it: var Item) =
   let beforeExpr = dest.len
   let expected = it.typ
-  takeToken dest, it.n
-  let lhsInfo = it.n.info
-  var lhs = Item(n: it.n, typ: c.types.autoType)
-  semExpr c, dest, lhs
-  it.n = lhs.n
-  var index = Item(n: it.n, typ: c.types.autoType)
-  semExpr c, dest, index
-  it.n = index.n
-  var typ = skipModifier(lhs.typ)
-  if typ.typeKind == PtrT:
-    inc typ
-  case typ.typeKind
-  of ArrayT:
-    it.typ = typ
-    inc it.typ
-    # add array index information to the `ArratX` magic for easy
-    # code generation of index checking:
-    var t = it.typ # at element type
-    skip t # now at the index type
-    if t.typeKind == RangetypeT:
-      inc t # tag
-      skip t # skip base type
-      let first = t
-      skip t # now at last
-      dest.addSubtree t
-      var isZero: bool
-      case first.kind
-      of IntLit:
-        isZero = pool.integers[first.intId] == 0
-      of UIntLit:
-        isZero = pool.uintegers[first.uintId] == 0
-      else:
-        isZero = true
-      if not isZero:
-        dest.addSubtree first
-    # skip the index type information in case we re-semcheck this node
+  takeInto dest, it.n:
+    let lhsInfo = it.n.info
+    var lhs = Item(n: it.n, typ: c.types.autoType)
+    semExpr c, dest, lhs
+    it.n = lhs.n
+    var index = Item(n: it.n, typ: c.types.autoType)
+    semExpr c, dest, index
+    it.n = index.n
+    var typ = skipModifier(lhs.typ)
+    if typ.typeKind == PtrT:
+      inc typ
+    case typ.typeKind
+    of ArrayT:
+      it.typ = typ
+      inc it.typ
+      # add array index information to the `ArratX` magic for easy
+      # code generation of index checking:
+      var t = it.typ # at element type
+      skip t # now at the index type
+      if t.typeKind == RangetypeT:
+        inc t # tag
+        skip t # skip base type
+        let first = t
+        skip t # now at last
+        dest.addSubtree t
+        var isZero: bool
+        case first.kind
+        of IntLit:
+          isZero = first.intVal == 0
+        of UIntLit:
+          isZero = first.uintVal == 0
+        else:
+          isZero = true
+        if not isZero:
+          dest.addSubtree first
+    of UarrayT:
+      it.typ = typ
+      inc it.typ
+    of CstringT:
+      it.typ = c.types.charType
+    of SetT:
+      it.typ = c.types.uint8Type
+    of NoType, ErrT, AtT, AndT, OrT, NotT, ProcT, FuncT, IteratorT, ConverterT, MethodT, MacroT,
+       TemplateT, ObjectT, EnumT, ProctypeT, IT, UT, FT, CT, BoolT, VoidT, PtrT, VarargsT,
+       StaticT, TupleT, ClosureTupleT, OnumT, AnumT, RefT, MutT, OutT, LentT, SinkT, OwnedT, NiltT, ConceptT,
+       DistinctT, ItertypeT, RangetypeT, AutoT, SymkindT, TypekindT, TypedescT, UntypedT, TypedT,
+       PointerT, OrdinalT, PluginCallT:
+      c.buildErr dest, lhsInfo, "invalid lhs type for typed index: " & typeToString(typ)
+    # Skip the index type information in case we re-semcheck this node: a
+    # generic body's `array` index may instantiate to a different lhs type,
+    # so this must happen regardless of the branch taken above.
     while it.n.hasMore:
       skip it.n
-  of UarrayT:
-    it.typ = typ
-    inc it.typ
-  of CstringT:
-    it.typ = c.types.charType
-  of SetT:
-    it.typ = c.types.uint8Type
-  of NoType, ErrT, AtT, AndT, OrT, NotT, ProcT, FuncT, IteratorT, ConverterT, MethodT, MacroT,
-     TemplateT, ObjectT, EnumT, ProctypeT, IT, UT, FT, CT, BoolT, VoidT, PtrT, VarargsT,
-     StaticT, TupleT, OnumT, AnumT, RefT, MutT, OutT, LentT, SinkT, NiltT, ConceptT,
-     DistinctT, ItertypeT, RangetypeT, AutoT, SymkindT, TypekindT, TypedescT, UntypedT, TypedT,
-     PointerT, OrdinalT:
-    c.buildErr dest, lhsInfo, "invalid lhs type for typed index: " & typeToString(typ)
-  takeParRi dest, it.n
   commonType c, dest, it, beforeExpr, expected
 
 proc semConv(c: var SemContext; dest: var TokenBuf; it: var Item) =
   let beforeExpr = dest.len
   let info = it.n.info
-  takeToken dest, it.n
-  var destType = semLocalType(c, dest, it.n)
-  var arg = Item(n: it.n, typ: c.types.autoType)
-  var argBuf = createTokenBuf(16)
-  semExpr c, argBuf, arg
-  it.n = arg.n
-  arg.n = cursorAt(argBuf, 0)
-  semConvArg(c, dest, destType, arg, info, beforeExpr)
-  takeParRi dest, it.n
+  var destType = default(TypeCursor)
+  takeInto dest, it.n:
+    destType = semLocalType(c, dest, it.n)
+    var arg = Item(n: it.n, typ: c.types.autoType)
+    var argBuf = createTokenBuf(16)
+    semExpr c, argBuf, arg
+    it.n = arg.n
+    arg.n = cursorAt(argBuf, 0)
+    semConvArg(c, dest, destType, arg, info, beforeExpr)
   let expected = it.typ
   it.typ = destType
   commonType c, dest, it, beforeExpr, expected
 
+proc closureProcType(c: var SemContext; typ: TypeCursor): TypeCursor =
+  ## `typ` with `.closure` added — the type of a `(toClosure X)` node. Mirrors
+  ## exactly what `typenav.getTypeImpl` computes for that node on the hexer
+  ## side, so frontend and backend agree on what the wrapper is worth.
+  var t = typ
+  let kind = t.typeKind
+  if kind notin {ProctypeT, ItertypeT}: return typ
+  var buf = createTokenBuf(16)
+  buf.addParLe kind, t.info
+  t.into:
+    buf.takeTree t          # nilability
+    buf.takeTree t          # params
+    buf.takeTree t          # return type
+    # pragmas: keep whatever is there and append `(closure)`
+    buf.addParLe PragmasU, t.info
+    if t.isDotToken:
+      inc t
+    else:
+      t.into:
+        while t.hasMore: buf.takeTree t
+    buf.addParPair ClosureP
+    buf.addParRi()
+  buf.addParRi()
+  result = typeToCursor(c, buf, 0)
+
+proc semToClosure(c: var SemContext; dest: var TokenBuf; it: var Item) =
+  ## `(toClosure X)` is produced by `sigmatch.procTypeMatch` when a `nimcall`
+  ## routine is passed to a `.closure.` formal; `lambdalifting` lowers it later.
+  ## The frontend re-sems its own output — generic instantiation, template
+  ## expansion and `const` evaluation all run `semExpr` over an already-sem'd
+  ## tree — so it has to be able to sem this node instead of `bug`ging out
+  ## (issues #2143, #2175, #2176, #2177).
+  ##
+  ## Reporting the CLOSURE-ified type is the load-bearing part: the wrapped
+  ## argument gets re-matched against the same `.closure.` formal, and only a
+  ## type that already says `.closure.` stops `procTypeMatch` from wrapping the
+  ## wrapper. That keeps the single wrap site in the matcher, which is the one
+  ## place that sees every formal — including varargs elements.
+  let expected = it.typ
+  let before = dest.len
+  var inner = Item(n: default(Cursor), typ: c.types.autoType)
+  takeInto dest, it.n:
+    inner.n = it.n
+    semExpr c, dest, inner
+    it.n = inner.n
+  it.typ = closureProcType(c, inner.typ)
+  if classifyType(c, expected) notin {AutoT, VoidT, NoType, ErrT}:
+    commonType c, dest, it, before, expected
+
 proc semDconv(c: var SemContext; dest: var TokenBuf; it: var Item) =
   let beforeExpr = dest.len
   let info = it.n.info
-  takeToken dest, it.n
-  var destType = semLocalType(c, dest, it.n)
-  var x = Item(n: it.n, typ: c.types.autoType)
-  let beforeArg = dest.len
-  semExpr c, dest, x
-  it.n = x.n
+  var destType = default(TypeCursor)
+  takeInto dest, it.n:
+    destType = semLocalType(c, dest, it.n)
+    var x = Item(n: it.n, typ: c.types.autoType)
+    let beforeArg = dest.len
+    semExpr c, dest, x
+    it.n = x.n
 
-  var isDistinct = false
-  let destBase = skipDistinct(destType, isDistinct)
-  let srcBase = skipDistinct(x.typ, isDistinct)
-  if not isDistinct:
-    shrink dest, beforeExpr
-    c.buildErr dest, info, "`dconv` operation only valid for type conversions involving `distinct` types"
-  else:
-    var arg = Item(n: cursorAt(dest, beforeArg), typ: srcBase)
-    var m = createMatch(addr c)
-    typematch m, destBase, arg
-    endRead dest
-    if m.err:
-      when defined(debug):
-        shrink dest, beforeExpr
-        dest.addErrorMsg m
-      else:
-        c.typeMismatch dest,info, x.typ, destType
+    var isDistinct = false
+    let destBase = skipDistinct(destType, isDistinct)
+    let srcBase = skipDistinct(x.typ, isDistinct)
+    if not isDistinct:
+      shrink dest, beforeExpr
+      c.buildErr dest, info, "`dconv` operation only valid for type conversions involving `distinct` types"
     else:
-      # distinct type conversions can also involve conversions
-      # between different integer sizes or object types and then
-      # `m.args` contains these so use them here:
-      shrink dest, beforeArg
-      dest.add m.args
-  it.n = x.n
-  takeParRi dest, it.n
+      var arg = Item(n: cursorAt(dest, beforeArg), typ: srcBase)
+      var m = createMatch(addr c)
+      typematch m, destBase, arg
+      if m.err:
+        when defined(debug):
+          shrink dest, beforeExpr
+          dest.addErrorMsg m
+        else:
+          c.typeMismatch dest,info, x.typ, destType
+      else:
+        # distinct type conversions can also involve conversions
+        # between different integer sizes or object types and then
+        # `m.args` contains these so use them here:
+        shrink dest, beforeArg
+        dest.add m.args
+    it.n = x.n
   let expected = it.typ
   it.typ = destType
   commonType c, dest, it, beforeExpr, expected
@@ -4885,16 +5739,14 @@ proc semProccall(c: var SemContext; dest: var TokenBuf; it: var Item) =
   # Build (proccall fn args...) and call semCall directly so the flat format
   # is emitted without any intermediate nested representation.
   let info = it.n.info
-  inc it.n  # skip (proccall
-  assert it.n.exprKind in CallKinds - {ProccallX}
-  inc it.n  # skip inner (call
   var callBuf = createTokenBuf(16)
-  callBuf.addParLe(ProccallX, info)
-  while it.n.hasMore:
-    takeTree callBuf, it.n
-  callBuf.addParRi()
-  skipParRi it.n  # skip inner call's )
-  skipParRi it.n  # skip outer proccall's )
+  it.n.into:  # skip (proccall
+    assert it.n.exprKind in CallKinds - {ProccallX}
+    callBuf.addParLe(ProccallX, info)
+    it.n.into:  # skip inner (call
+      while it.n.hasMore:
+        takeTree callBuf, it.n
+    callBuf.addParRi()
   var call = Item(n: cursorAt(callBuf, 0), typ: it.typ)
   semCall c, dest, call, {}
   it.typ = call.typ
@@ -4904,33 +5756,32 @@ proc semTableConstructor(c: var SemContext; dest: var TokenBuf; it: var Item; fl
   # ``[(key, value), (key2, value2), (key3, value2)]``
   let info = it.n.info
   let orig = it.n
-  inc it.n
   var arrayBuf = createTokenBuf(16)
   var singleKeys = newSeq[Cursor]()
-  arrayBuf.buildTree BracketX, info:
-    while it.n.hasMore:
-      if it.n.substructureKind == KvU:
-        let kvInfo = it.n.info
-        inc it.n
-        if singleKeys.len != 0:
-          var cur = it.n
-          skip cur
-          assert cur.hasMore
-          for key in singleKeys:
-            arrayBuf.buildTree TupX, key.info:
-              arrayBuf.copyTree key
-              arrayBuf.copyTree cur
+  it.n.into:
+    arrayBuf.buildTree BracketX, info:
+      while it.n.hasMore:
+        if it.n.substructureKind == KvU:
+          let kvInfo = it.n.info
+          it.n.into:
+            if singleKeys.len != 0:
+              var cur = it.n
+              skip cur
+              assert cur.hasMore
+              for key in singleKeys:
+                arrayBuf.buildTree TupX, key.info:
+                  arrayBuf.copyTree key
+                  arrayBuf.copyTree cur
 
-          setLen(singleKeys, 0)
+              setLen(singleKeys, 0)
 
-        arrayBuf.buildTree TupX, kvInfo:
-          arrayBuf.takeTree it.n
-          assert it.n.hasMore
-          arrayBuf.takeTree it.n
-        inc it.n
-      else:
-        singleKeys.add it.n
-        skip it.n
+            arrayBuf.buildTree TupX, kvInfo:
+              arrayBuf.takeTree it.n
+              assert it.n.hasMore
+              arrayBuf.takeTree it.n
+        else:
+          singleKeys.add it.n
+          skip it.n
 
   if singleKeys.len != 0:
     c.buildErr dest, info, "illformed AST: " & asNimCode(orig)
@@ -4938,7 +5789,6 @@ proc semTableConstructor(c: var SemContext; dest: var TokenBuf; it: var Item; fl
   var item = Item(n: beginRead(arrayBuf), typ: it.typ)
   semBracket c, dest, item, flags
   it.typ = item.typ
-  inc it.n
 
 proc semDefer(c: var SemContext; dest: var TokenBuf; it: var Item) =
   let info = it.n.info
@@ -4948,26 +5798,24 @@ proc semDefer(c: var SemContext; dest: var TokenBuf; it: var Item) =
     it.typ = c.types.voidType
     return
 
-  takeToken dest, it.n
-  openScope c
-  semStmt c, dest, it.n, false
-  closeScope c
-  takeParRi dest, it.n
+  takeInto dest, it.n:
+    openScope c
+    semStmt c, dest, it.n, false
+    closeScope c
   c.routine.hasDefer = true
+  it.typ = c.types.voidType
 
 proc expandSymChoice(c: var SemContext; dest: var TokenBuf; n: var Cursor) =
   let info = n.info
-  takeToken dest, n
-  assert n.kind == Symbol
-  var name = pool.syms[n.symId]
-  extractBasename(name)
-  var marker = initHashSet[SymId]()
-  while n.hasMore:
-    assert n.kind == Symbol
-    marker.incl n.symId
-    takeToken dest, n
-  addSymChoiceSyms(c, dest, pool.strings.getOrIncl(name), marker, info)
-  takeParRi dest, n
+  takeInto dest, n:
+    assert n.isSymbol
+    var name = pool.symBasename(n.symId)
+    var marker = initHashSet[SymId]()
+    while n.hasMore:
+      assert n.isSymbol
+      marker.incl n.symId
+      takeTree dest, n
+    addSymChoiceSyms(c, dest, pool.strings.getOrIncl(name), marker, info)
 
 proc semSymChoice(c: var SemContext; dest: var TokenBuf; it: var Item; flags: set[SemFlag] = {}) =
   if it.n.exprKind == OchoiceX:
@@ -4979,51 +5827,59 @@ proc semSymChoice(c: var SemContext; dest: var TokenBuf; it: var Item; flags: se
 proc semExpr*(c: var SemContext; dest: var TokenBuf; it: var Item; flags: set[SemFlag] = {}) =
   case it.n.kind
   of IntLit:
-    literal c, dest, it, c.types.intType
+    let intType = c.types.intType
+    literal c, dest, it, intType
   of UIntLit:
-    literal c, dest, it, c.types.uintType
+    let uintType = c.types.uintType
+    literal c, dest, it, uintType
   of FloatLit:
-    literal c, dest, it, c.types.floatType
-  of StringLit:
-    literal c, dest, it, c.types.stringType
+    let floatType = c.types.floatType
+    literal c, dest, it, floatType
+  of StrLit:
+    let stringType = c.types.stringType
+    literal c, dest, it, stringType
   of CharLit:
-    literal c, dest, it, c.types.charType
+    let charType = c.types.charType
+    literal c, dest, it, charType
   of Ident:
     let start = dest.len
-    let s = semIdentImpl(c, dest, it.n, it.n.litId, flags)
-    semExprSym c, dest, it, s, start, flags
+    var nearestIsUnique = false
+    let s = semIdentImpl(c, dest, it.n, it.n.strId, flags, nearestIsUnique)
+    semExprSym c, dest, it, s, start, flags, nearestIsUnique
     inc it.n
   of Symbol:
     let start = dest.len
     let s = fetchSym(c, it.n.symId)
-    takeToken dest, it.n
+    takeTree dest, it.n
     semExprSym c, dest, it, s, start, flags
-  of ParLe:
+  of TagLit:
     case exprKind(it.n)
     of QuotedX:
       let start = dest.len
-      let s = semQuoted(c, dest, it.n, flags)
-      semExprSym c, dest, it, s, start, flags
+      var nearestIsUnique = false
+      let s = semQuoted(c, dest, it.n, flags, nearestIsUnique)
+      semExprSym c, dest, it, s, start, flags, nearestIsUnique
     of NoExpr:
       case stmtKind(it.n)
       of NoStmt:
         case typeKind(it.n)
         of NoType:
-          buildErr c, dest, it.n.info, "expression expected; tag: " & pool.tags[it.n.tag]
+          buildErr c, dest, it.n.info, "expression expected; tag: " & globalTags.tags[it.n.cursorTagId]
           skip it.n
         of ErrT:
           dest.takeTree it.n
-        of ObjectT, EnumT, HoleyEnumT, AnumT, DistinctT, ConceptT:
+        of ObjectT, EnumT, HoleyEnumT, AnumT, DistinctT, ConceptT, ClosureTupleT:
           buildErr c, dest, it.n.info, "expression expected"
           skip it.n
         of IntT, FloatT, CharT, BoolT, UIntT, VoidT, NiltT, AutoT, SymkindT,
-            PtrT, RefT, MutT, OutT, LentT, SinkT, UarrayT, SetT, StaticT, TypedescT,
+            PtrT, RefT, MutT, OutT, LentT, SinkT, OwnedT, UarrayT, SetT, StaticT, TypedescT,
             TupleT, ArrayT, RangetypeT, VarargsT, UntypedT, TypedT,
             CstringT, PointerT, TypekindT, OrdinalT, RoutineTypes:
           # every valid local type expression
           semLocalTypeExpr c, dest, it
-        of OrT, AndT, NotT, InvokeT:
-          # should be handled in respective expression kinds
+        of OrT, AndT, NotT, InvokeT, PluginCallT:
+          # should be handled in respective expression kinds -- `PluginCallT`
+          # shares its tag with `PluginCallX`, so it never reaches `NoExpr`
           discard
       of PragmaxS:
         semPragmaExpr c, dest, it
@@ -5064,6 +5920,10 @@ proc semExpr*(c: var SemContext; dest: var TokenBuf; it: var Item; flags: set[Se
           semWhile c, dest, it
       of CoroforS:
         buildErr c, dest, it.n.info, "`corofor` is a hexer-internal shape and must not appear in source"
+        skip it.n
+      of LabS, JmpS, AlwaysS:
+        buildErr c, dest, it.n.info, "`" & $stmtKind(it.n) &
+          "` is a hexer-internal shape and must not appear in source"
         skip it.n
       of VarS:
         localSigGuard c:
@@ -5157,28 +6017,31 @@ proc semExpr*(c: var SemContext; dest: var TokenBuf; it: var Item; flags: set[Se
         producesVoid c, dest, info, it.typ
       of EmitS:
         pragmaGuard c:
+          let emitStart = it.n
+          it.n = sub(it.n)
           semEmit c, dest, it
+          it.n = emitStart; skip it.n
       of PragmasS:
         if c.phase == SemcheckTopLevelSyms:
           # Extract feature pragmas even in phase1 so that e.g. lenientnils
           # is known before type declarations are processed:
           var probe = it.n
-          inc probe # skip (pragmas
+          probe = sub(probe) # skip (pragmas; bound the walk
           while probe.hasMore:
             if probe.substructureKind == KvU:
               inc probe # skip (kv
               if probe.pragmaKind == FeatureP:
                 inc probe # skip (feature
-                if probe.kind == StringLit:
-                  let features = parseFeatures(pool.strings[probe.litId])
+                if probe.isStringLit:
+                  let features = parseFeatures(pool.strings[probe.strId])
                   c.features.incl features
                 break
               else:
                 break
             elif probe.pragmaKind == FeatureP:
               inc probe # skip (feature
-              if probe.kind == StringLit:
-                let features = parseFeatures(pool.strings[probe.litId])
+              if probe.isStringLit:
+                let features = parseFeatures(pool.strings[probe.strId])
                 c.features.incl features
               break
             else:
@@ -5189,42 +6052,43 @@ proc semExpr*(c: var SemContext; dest: var TokenBuf; it: var Item; flags: set[Se
       of InclS, ExclS:
         toplevelGuard c:
           semInclExcl c, dest, it
+      of IncS, DecS:
+        toplevelGuard c:
+          semIncDec c, dest, it
       of AssumeS, AssertS:
         pragmaGuard c:
           semAssumeAssert c, dest, it, it.n.stmtKind
       of UsingS:
         semUsing c, dest, it.n
     of FalseX, TrueX, OvfX:
-      literalB c, dest, it, c.types.boolType
+      let boolType = c.types.boolType
+      literalB c, dest, it, boolType
     of InfX, NeginfX, NanX:
-      literalB c, dest, it, c.types.floatType
+      let floatType = c.types.floatType
+      literalB c, dest, it, floatType
     of AndX, OrX, XorX:
       let start = dest.len
-      takeToken dest, it.n
-      semBoolExpr c, dest, it.n
-      semBoolExpr c, dest, it.n
-      takeParRi dest, it.n
+      takeInto dest, it.n:
+        semBoolExpr c, dest, it.n
+        semBoolExpr c, dest, it.n
       let expected = it.typ
       it.typ = c.types.boolType
       commonType c, dest, it, start, expected
     of NotX:
       let start = dest.len
-      takeToken dest, it.n
-      semBoolExpr c, dest, it.n
-      takeParRi dest, it.n
+      takeInto dest, it.n:
+        semBoolExpr c, dest, it.n
       let expected = it.typ
       it.typ = c.types.boolType
       commonType c, dest, it, start, expected
     of EmoveX:
-      takeToken dest, it.n
-      semExpr c, dest, it
-      takeParRi dest, it.n
+      takeInto dest, it.n:
+        semExpr c, dest, it
     of FailedX:
       semFailed c, dest, it
     of ParX:
-      inc it.n
-      semExpr c, dest, it
-      skipParRi it.n
+      it.n.into:
+        semExpr c, dest, it
     of CallX, CmdX, CallstrlitX, InfixX, PrefixX, HcallX:
       toplevelGuard c:
         semCall c, dest, it, flags
@@ -5244,6 +6108,8 @@ proc semExpr*(c: var SemContext; dest: var TokenBuf; it: var Item; flags: set[Se
       semCmp c, dest, it
     of AddX, SubX, MulX, DivX, ModX, BitandX, BitorX, BitxorX, PlussetX, MinussetX, MulsetX, XorsetX:
       semTypedBinaryArithmetic c, dest, it
+    of SuccX, PredX:
+      semSuccPred c, dest, it
     of AshrX, ShrX, ShlX:
       semShift c, dest, it
     of BitnotX, NegX:
@@ -5286,26 +6152,33 @@ proc semExpr*(c: var SemContext; dest: var TokenBuf; it: var Item; flags: set[Se
       semBindSymName c, dest, it
     of IsmainmoduleX:
       semIsMainModule c, dest, it
+    of InstantiationinfoX:
+      semInstantiationInfo c, dest, it
     of AtX:
       semSubscript c, dest, it
+    of PluginCallX:
+      semPluginCall c, dest, it
     of ArratX, PatX:
       semTypedAt c, dest, it
     of UnpackX:
-      takeToken dest, it.n
-      takeParRi dest, it.n
+      takeInto dest, it.n:
+        discard
     of FieldsX, FieldpairsX, InternalFieldPairsX:
       takeTree dest, it.n
     of OchoiceX, CchoiceX:
-      if ResemChoiceFeature in c.features:
-        semSymChoice c, dest, it
-      else:
-        takeTree dest, it.n
+      # An `ochoice` is an *open* symbol: a name that a template or generic body
+      # left unresolved on purpose, so it must be resolved again here, against
+      # the scope we are expanding into. Only re-adding the def-site candidates
+      # (what skipping this did) makes the choice closed, and then a template
+      # like system's `in` — `contains(y, x)` — can never see a `contains` the
+      # *caller* imported: `sub in str` failed while `contains(str, sub)` on the
+      # same line resolved. `cchoice` stays closed; that is what `bind` is for.
+      semSymChoice c, dest, it
     of HaddrX, HderefX:
-      takeToken dest, it.n
-      # this is exactly what we need here as these operators have the same
-      # type as the operand:
-      semExpr c, dest, it
-      takeParRi dest, it.n
+      takeInto dest, it.n:
+        # this is exactly what we need here as these operators have the same
+        # type as the operand:
+        semExpr c, dest, it
     of CastX:
       semCast c, dest, it
     of NilX:
@@ -5332,6 +6205,10 @@ proc semExpr*(c: var SemContext; dest: var TokenBuf; it: var Item; flags: set[Se
       semAddr c, dest, it
     of SizeofX:
       semSizeof c, dest, it
+    of CanFormCyclesX:
+      semCanFormCycles c, dest, it
+    of SupportsCopyMemX:
+      semSupportsCopyMem c, dest, it
     of TypeofX:
       semTypeof c, dest, it
     of DestroyX, CopyX, WasmovedX, SinkhX, TraceX:
@@ -5357,32 +6234,35 @@ proc semExpr*(c: var SemContext; dest: var TokenBuf; it: var Item; flags: set[Se
         semDo c, dest, it, whichPass(c)
     of CompilesX:
       semCompiles c, dest, it
+    of StaticX:
+      semStaticExpr c, dest, it
     of CurlyatX:
       semCurlyat c, dest, it
     of AlignofX, OffsetofX:
       # XXX To implement
       buildErr c, dest, it.n.info, "to implement: " & $exprKind(it.n)
-      takeToken dest, it.n
-      takeParRi dest, it.n
+      takeInto dest, it.n:
+        discard
     of EnvpX:
       bug "frontend should not encounter `envp`"
     of KvX:
-      takeToken dest, it.n
-      var keyIt = Item(n: it.n, typ: c.types.autoType)
-      semExpr c, dest, keyIt
-      it.n = keyIt.n
-      var valIt = Item(n: it.n, typ: c.types.autoType)
-      semExpr c, dest, valIt
-      it.n = valIt.n
-      if it.n.hasMore:
-        takeTree dest, it.n
-      takeParRi dest, it.n
-      it.typ = valIt.typ
+      takeInto dest, it.n:
+        var keyIt = Item(n: it.n, typ: c.types.autoType)
+        semExpr c, dest, keyIt
+        it.n = keyIt.n
+        var valIt = Item(n: it.n, typ: c.types.autoType)
+        semExpr c, dest, valIt
+        it.n = valIt.n
+        if it.n.hasMore:
+          takeTree dest, it.n
+        it.typ = valIt.typ
     of ToClosureX:
-      bug "frontend should not encounter `toClosure`"
+      semToClosure c, dest, it
 
-  of ParRi, EofToken, SymbolDef, UnknownToken, DotToken:
+  else:
+    # ParRi / EofToken / SymbolDef / UnknownToken / DotToken and anything else
+    # that is not a valid expression head.
     buildErr c, dest, it.n.info, "expression expected"
-    if it.n.kind in {DotToken, UnknownToken}:
+    if it.n.isDotToken or it.n.isUnknownToken:
       inc it.n
 

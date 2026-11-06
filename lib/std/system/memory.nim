@@ -1,12 +1,13 @@
-## Low-level memory primitives and the default allocator for Nimony.
+## Low-level memory primitives and the allocators for Nimony.
 ##
-## The default allocator is the mimalloc shim (`include mimalloc`). A native
-## allocator — a literal port of Nim 2's `lib/system/{alloc,osalloc}.nim`
-## (page-chunk TLSF: segregated small cells, coalescing big chunks, huge mmap;
-## owner-stamped lock-free deferred free for cross-thread deallocations) — is
-## available behind `-d:nimNativeAlloc`. It is not yet the default: it still
-## regresses a couple of arc tests (see project notes), so mimalloc stays the
-## default until those are root-caused.
+## The default allocator is the native one — a literal port of Nim 2's
+## `lib/system/{alloc,osalloc}.nim` (page-chunk TLSF: segregated small cells,
+## coalescing big chunks, huge mmap; owner-stamped lock-free deferred free for
+## cross-thread deallocations). The driver defines `nimNativeAlloc` for every
+## backend, because the libc-free stdlib is the default (`nimony.nim`); the
+## mimalloc shim is the opt-OUT, reached with `-d:useMimalloc` (allocator only)
+## or `-d:useLibc` (allocator and IO together), and the native backend is always
+## libc-free regardless.
 ##
 ## The user-facing `alloc`/`dealloc`/`realloc`/`allocatedSize` wrappers are
 ## `func` (noSideEffect) so they remain usable inside the `func`s of pure data
@@ -14,7 +15,8 @@
 ## is an implementation detail invisible to callers, so each wrapper launders
 ## the side-effecting MemRegion proc through `{.cast(noSideEffect).}`.
 ##
-## Compile with `-d:nimNativeAlloc` to use the native ported allocator.
+## `-d:nimMaxHeap=N` caps the heap at N megabytes and `-d:nimHardenOutOfMem`
+## makes that cap recoverable; both live in the ported allocator, see below.
 
 # --- C memory intrinsics (needed by the allocator, hence defined first) ----
 func c_memcpy(dest, src: pointer; size: csize_t) {.importc: "memcpy", header: "<string.h>".}
@@ -74,7 +76,24 @@ func zeroMem*(dest: pointer; size: int) {.inline.} =
   ## Sets `size` bytes at `dest` to zero.
   c_memset(dest, 0, csize_t size)
 
+# The `-d:nimMaxHeap=N` heap cap and its recoverable companion
+# `-d:nimHardenOutOfMem` live in the ported allocator (`system/alloc.nim`), where
+# the occupancy they check is already tracked. Keeping the accounting there
+# rather than in the wrappers below is what keeps it free -- no second layer of
+# bookkeeping on every allocation -- and it covers the default configuration,
+# since `nimNativeAlloc` is the default. A `-d:useMimalloc` build ignores both.
+
 when not defined(nimNativeAlloc):
+  # NOTE: `-d:valgrind` does nothing here. It instruments the NATIVE allocator
+  # (`system/valgrind.nim`), and this build uses mimalloc, whose heap valgrind
+  # already understands through mimalloc's own `-DMI_TRACK_VALGRIND=1`.
+  #
+  # This ought to be a `{.error.}` — a flag that silently produces a build which
+  # looks instrumented and tracks nothing is the worst of both. Nimony rejects a
+  # standalone `{.error.}` pragma inside the `system` include chain
+  # ("unsupported pragma"), so the check cannot live here yet. `hastur
+  # nativevalgrind`, which is how the flag is meant to be reached, always
+  # compiles through `nimony n` and so cannot land in this branch.
   include mimalloc
 else:
   # ----------------------------------------------------------------------
@@ -85,7 +104,8 @@ else:
     PageShift = 12
     PageSize = 1 shl PageShift
     PageMask = PageSize - 1
-    MemAlign = 16
+    MemAlignShift = 4
+    MemAlign = 1 shl MemAlignShift # 16
     BitsPerPage = PageSize div MemAlign
     UnitsPerPage = BitsPerPage div (sizeof(int) * 8)
     TrunkShift = 9
@@ -107,11 +127,17 @@ else:
     reallyOsDealloc = false    # keep pages mapped (matches Nim's macosx/arm default)
     UseDestructors = true      # Nimony is always destructor-based; selects the
                                # gcDestructors code paths in the ported alloc.nim
+    usesRegionHandles = hasThreadSupport and UseDestructors
+      # Chunks are owned by a permanent `RegionHandle`, not by the thread's
+      # `MemRegion` (a threadvar that dies with its thread); see alloc.nim.
 
   template sysAssert(cond, msg: untyped) = discard
 
-  proc raiseOutOfMem() {.noinline.} =
+  proc raiseOutOfMem() {.noinline, noreturn.} =
     # Reached only when the OS itself refuses to map pages; nothing to recover.
+    # `noreturn` because `cAbort` is, and saying so is what lets a caller whose
+    # only other arm assigns `result` be proved to initialise it — which is how
+    # the bare-metal `osAllocPages` typechecks at all.
     cAbort()
 
   template `+!`(p: pointer; x: int): pointer = cast[pointer](cast[int](p) + x)
@@ -138,7 +164,7 @@ else:
   # alloc.nim's dirty templates and intrusive generics carry per-routine
   # `{.untyped.}` so their bodies are checked at instantiation. We deliberately
   # do NOT enable the `untyped` feature module-wide here — it would leak into
-  # seqimpl/stringimpl/arcops and miscompile their `{.cast(noSideEffect).}`.
+  # seqimpl/stringimpl and the mm strategy and miscompile their `{.cast(noSideEffect).}`.
 
   # --- the ported allocator (alloc.nim itself `include`s osalloc) ----------
   include "alloc"
@@ -146,19 +172,36 @@ else:
   # --- user-facing API: `func` over a per-thread global MemRegion ----------
   var allocator {.threadvar.}: MemRegion
 
+  when usesRegionHandles:
+    proc nimAllocThreadInit*() =
+      ## A thread starts (`std/rawthreads`): check a region out of the pool,
+      ## or a fresh handle. Must precede the thread's first allocation, since
+      ## chunks are stamped with the region's handle.
+      acquireMemRegion(allocator)
+
+    proc nimAllocThreadTeardown*() =
+      ## A thread ends: its region returns to the pool, with the handle that
+      ## still owns every chunk it allocated and receives their foreign frees.
+      releaseMemRegion(allocator)
+
+    nimAllocThreadInit() # the main thread
+
   func alloc*(size: int): pointer =
     ## Allocates `size` bytes of uninitialized memory.
     {.cast(noSideEffect).}:
+      {.assume: size >= 0.}
       result = alloc(allocator, size)
 
   func alloc0*(size: int): pointer =
     ## Allocates `size` bytes of zero-initialized memory.
     {.cast(noSideEffect).}:
+      {.assume: size >= 0.}
       result = alloc0(allocator, size)
 
   func realloc*(p: pointer; size: int): pointer =
     ## Grows or shrinks the allocation `p` to `size` bytes, preserving contents.
     {.cast(noSideEffect).}:
+      {.assume: size >= 0.}
       result = realloc(allocator, p, size)
 
   func dealloc*(p: pointer) =
@@ -195,8 +238,7 @@ func deallocFixed*(p: pointer) =
   dealloc(p)
 
 # --- out-of-memory handling ------------------------------------------------
-var
-  missingBytes {.threadvar.}: int
+var missingBytes {.threadvar.}: int
 
 proc continueAfterOutOfMem*(size: int) {.nimcall.} =
   ## Default out-of-memory handler: accumulates missing bytes so runtime code can react gracefully.

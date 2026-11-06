@@ -30,13 +30,35 @@ proc nimFlushStdStreams*() {.exportc: "nimFlushStdStreams".} =
   ## (system is always imported) and a no-op unless `syncio` installed a flush.
   gExitFlush()
 
-when defined(nimNativeIo):
+when defined(embedded):
+  # Bare metal: there is no process to end and no parent to hand a status to, so
+  # both primitives go through the debug agent — the only thing attached that can
+  # receive one. See `system/semihosting`, included just above this.
+  proc cExit*(code: int) {.noreturn.} =
+    ## Normal termination: flush the standard streams, then tell the agent.
+    gExitFlush()
+    semihostExit(code)
+
+  proc cAbort*() {.noreturn.} =
+    ## Abnormal termination. There is no `SIGABRT` to raise and no core to dump —
+    ## the debugger IS the thing that would have caught the signal, and it is
+    ## already watching. So this is `cExit` with the status libc's `abort` leaves
+    ## behind, and the difference between the two is the number, which is all a
+    ## status can carry here.
+    gExitFlush()
+    semihostExit(127)
+
+elif defined(nimNativeIo):
   when defined(windows):
     # Freestanding Windows: terminate through kernel32 `ExitProcess` — no libc
-    # and no POSIX signals. `<windows.h>`/kernel32 is the OS API, not the C
-    # runtime, so this stays the direct counterpart of the Linux syscall path.
+    # and no POSIX signals, the direct counterpart of the Linux syscall path.
+    # No `header: "<windows.h>"`, keeping the whole `system` translation unit
+    # free of the Windows header (see `panics`). `dynlib` names the import
+    # library, and means a STATIC import on every backend: the native image
+    # bakes it into its import table, the C backend emits a prototype that
+    # kernel32.lib resolves at link time.
     proc cExitProcess(uExitCode: uint32) {.stdcall, importc: "ExitProcess",
-                                           header: "<windows.h>", noreturn.}
+                                           dynlib: "kernel32", noreturn.}
 
     proc cExit*(code: int) {.noreturn.} =
       ## Normal process termination: flush the standard streams, then exit.

@@ -4,28 +4,15 @@
 # See the file "license.txt", included in this
 # distribution, for details about the copyright.
 
-import ".." / lib / [bitabs, lineinfos, nifcursors, nifstreams, filelinecache, symparser]
-import ".." / njvl / njvl_model
+import ".." / lib / [bitabs, nifpools, filelinecache, symparser]
+import ".." / finalir / finalir_model
 
-import nimony_model, decls
+import nimony_model, decls, programs
 
 
 import std/[strutils, assertions, formatfloat]
 
 ## Rendering of Nim code from a cursor.
-
-proc skipParRi(n: var Cursor) =
-  # A RENDERER MUST NOT ASSERT. This is reached from `asNimCode`, i.e. while
-  # BUILDING A DIAGNOSTIC for something the compiler could not resolve -- so the
-  # tree is unusual by definition, which is exactly when this runs. Raising here
-  # replaces the message the user needed with a traceback, and the compiler then
-  # prints `Errors: 0` and exits non-zero, because the count is emitted before
-  # the message. That makes the error count from such a run a lie.
-  #
-  # Skipping what we are not positioned on renders a slightly wrong message.
-  # That is strictly better than rendering none.
-  if n.hasMore: return
-  consumeParRi n
 
 type
   TokType* = enum
@@ -136,6 +123,30 @@ proc initSrcGen(renderFlags: RenderFlags): SrcGen =
                    flags: renderFlags, pendingNL: -1,
                    pendingWhitespace: -1, inside: {},
                    )
+
+proc isErrNode*(n: Cursor): bool =
+  n.isTagLit and (n.typeKind == ErrT or n.exprKind == ErrX)
+
+proc errPayload*(n: Cursor): Cursor =
+  ## First child of `(err …)`: the wrapped expression, or `.` if none was recorded.
+  assert isErrNode(n)
+  result = sub(n)
+
+proc errMsgFromCursor*(n: Cursor): string =
+  ## Extract the human-readable message from an `(err …)` node. Mirrors the
+  ## walk in `reportErrors` so diagnostics and the reporter stay in sync.
+  assert isErrNode(n)
+  var c = sub(n)
+  if c.isDotToken:
+    inc c
+  else:
+    skip c
+  while c.isDotToken:
+    inc c
+  assert c.isStringLit
+  result = pool.strings[c.strId]
+
+proc typeToString*(n: Cursor; renderFlags: RenderFlags = {}): string
 
 proc addTok(g: var SrcGen, kind: TokType, s: string; sym: SymId = SymId(0);
             isDef = false) =
@@ -322,66 +333,71 @@ proc gsub(g: var SrcGen, n: var Cursor, c: Context, fromStmtList = false, isTopL
 proc gtype(g: var SrcGen, n: var Cursor, c: Context)
 
 proc gstmts(g: var SrcGen, n: var Cursor, c: Context, doIndent=false) =
-  inc n
-  if doIndent: indentNL(g)
+  n.into:
+    if doIndent: indentNL(g)
 
-  while n.hasMore:
-    optNL(g)
+    while n.hasMore:
+      optNL(g)
+      gsub(g, n)
+
+    if doIndent: dedent(g)
+
+proc gstmtsOrExpr(g: var SrcGen, n: var Cursor, c: Context) =
+  ## Branch bodies are `(stmts …)` in statement context, but when the
+  ## surrounding `case`/`if`/`try`/`block` is used as an expression the body
+  ## is a bare expression (a symbol/literal or an `(expr …)` wrapper).
+  if n.stmtKind == StmtsS:
+    gstmts(g, n, c, doIndent = true)
+  else:
     gsub(g, n)
-
-  if doIndent: dedent(g)
-  skipParRi(n)
 
 proc gcomma(g: var SrcGen) =
   putWithSpace(g, tkComma, ",")
 
 proc mayAddExportMarker(g: var SrcGen, n: var Cursor) =
-  if n.kind == Ident and pool.strings[n.litId] == "x" and
+  if n.isIdent and pool.strings[n.strId] == "x" and
       renderNoPostfix notin g.flags:
     put(g, tkPostfixOpr, "*")
   skip n
 
 proc gpragmas(g: var SrcGen, n: var Cursor) =
-  inc n
-  put(g, tkSpaces, Space)
-  put(g, tkCurlyDotLe, "{.")
-  var afterFirst = false
+  n.into:
+    put(g, tkSpaces, Space)
+    put(g, tkCurlyDotLe, "{.")
+    var afterFirst = false
 
-  while n.hasMore:
-    if afterFirst:
-      gcomma(g)
-    else:
-      afterFirst = true
+    while n.hasMore:
+      if afterFirst:
+        gcomma(g)
+      else:
+        afterFirst = true
 
-    put(g, tkSymbol, pool.tags[n.tagId])
-    inc n
+      put(g, tkSymbol, globalTags.tags[n.cursorTagId])
+      n.into:
+        var firstArg = true
+        while n.hasMore:
+          if firstArg:
+            putWithSpace(g, tkColon, ":")
+            firstArg = false
+          else:
+            gcomma(g)
+          gsub(g, n)
 
-    if n.kind == ParRi:
-      skipParRi(n)
-    else:
-      putWithSpace(g, tkColon, ":")
-      gsub(g, n)
-      skipParRi(n)
-
-  put(g, tkCurlyDotRi, ".}")
-  skipParRi(n)
+    put(g, tkCurlyDotRi, ".}")
 
 proc gblock(g: var SrcGen, n: var Cursor) =
   var c: Context = initContext()
-  inc n
+  n.into:
+    if not n.isDotToken:
+      putWithSpace(g, tkBlock, "block")
+      gsub(g, n)
+    else:
+      put(g, tkBlock, "block")
+      inc n
 
-  if n.kind != DotToken:
-    putWithSpace(g, tkBlock, "block")
-    gsub(g, n)
-  else:
-    put(g, tkBlock, "block")
-    inc n
+    putWithSpace(g, tkColon, ":")
 
-  putWithSpace(g, tkColon, ":")
-
-  gstmts(g, n, c, doIndent = true)
-
-  skipParRi(n)
+    gstmtsOrExpr(g, n, c)
 
 proc gcond(g: var SrcGen, n: var Cursor) =
   # if n.kind == nkStmtListExpr:
@@ -391,36 +407,31 @@ proc gcond(g: var SrcGen, n: var Cursor) =
   #   put(g, tkParRi, ")")
 
 proc gif(g: var SrcGen, n: var Cursor) =
-
-  inc n
   var c: Context = initContext()
 
   var isFirst = true
 
-  while n.hasMore:
-    case n.substructureKind
-    of ElifU:
-      inc n
-      if isFirst:
-        isFirst = false
-      else:
+  n.into:
+    while n.hasMore:
+      case n.substructureKind
+      of ElifU:
+        n.into:
+          if isFirst:
+            isFirst = false
+          else:
+            optNL(g)
+            putWithSpace(g, tkElif, "elif")
+          gcond(g, n)
+          putWithSpace(g, tkColon, ":")
+          gstmtsOrExpr(g, n, c)
+      of ElseU:
         optNL(g)
-        putWithSpace(g, tkElif, "elif")
-      gcond(g, n)
-      putWithSpace(g, tkColon, ":")
-      gstmts(g, n, c, doIndent = true)
-      skipParRi(n)
-    of ElseU:
-      optNL(g)
-      put(g, tkElse, "else")
-      putWithSpace(g, tkColon, ":")
-      inc n
-      gstmts(g, n, c, doIndent = true)
-      skipParRi(n)
-    else:
-      raiseAssert "unreachable"
-
-  skipParRi(n)
+        put(g, tkElse, "else")
+        putWithSpace(g, tkColon, ":")
+        n.into:
+          gstmtsOrExpr(g, n, c)
+      else:
+        raiseAssert "unreachable"
 
 proc gcase(g: var SrcGen, n: var Cursor; isCaseObject = false)
 
@@ -443,87 +454,90 @@ proc takeObjectFields(g: var SrcGen, fields: var Cursor) =
     gcase(g, fields, isCaseObject = true)
   of FldU, GfldU:
     takeField(g, fields)
+  of NilU:
+    # A fieldless sum-type branch (`of None: discard` in `std/opt`) carries
+    # `(nil)` as its entire body. There is no field to render and `discard` is
+    # how the source spells it.
+    skip fields
+    put(g, tkDiscard, "discard")
+    optNL(g)
   else:
     raiseAssert "todo"
 
 proc takeCaseStmts(g: var SrcGen, n: var Cursor; c: var Context; isCaseObject = false) =
   if isCaseObject:
-    inc n
-    indentNL(g)
+    n.into:
+      indentNL(g)
 
-    while n.hasMore:
-      optNL(g)
-      takeObjectFields(g, n)
+      while n.hasMore:
+        optNL(g)
+        takeObjectFields(g, n)
 
-    dedent(g)
-    skipParRi(n)
+      dedent(g)
   else:
-    gstmts(g, n, c, doIndent = true)
+    gstmtsOrExpr(g, n, c)
 
 proc gcase(g: var SrcGen, n: var Cursor; isCaseObject = false) =
   var c: Context = initContext()
-  inc n
-  putWithSpace(g, tkCase, "case")
+  n.into:
+    putWithSpace(g, tkCase, "case")
 
-  if isCaseObject:
-    takeField(g, n)
-  else:
-    gsub(g, n)
-
-  optNL(g)
-
-  while n.hasMore:
-    case n.substructureKind
-    of OfU:
-      n.into:                                     # (of ...)
-        optNL(g)
-        putWithSpace(g, tkOf, "of")
-        assert n.substructureKind == RangesU
-        n.into:                                   # (ranges ...)
-          while n.hasMore:
-            gsub(g, n)
-
-        putWithSpace(g, tkColon, ":")
-        takeCaseStmts(g, n, c, isCaseObject = isCaseObject)
-    of ElseU:
-      n.into:                                     # (else ...)
-        optNL(g)
-        put(g, tkElse, "else")
-        putWithSpace(g, tkColon, ":")
-        takeCaseStmts(g, n, c, isCaseObject = isCaseObject)
+    if isCaseObject:
+      takeField(g, n)
     else:
-      raiseAssert "unreachable"
+      gsub(g, n)
 
-  skipParRi(n)
+    optNL(g)
+
+    while n.hasMore:
+      case n.substructureKind
+      of OfU:
+        n.into:                                   # (of ...)
+          optNL(g)
+          putWithSpace(g, tkOf, "of")
+          assert n.substructureKind == RangesU
+          n.into:                                 # (ranges ...)
+            while n.hasMore:
+              gsub(g, n)
+
+          putWithSpace(g, tkColon, ":")
+          takeCaseStmts(g, n, c, isCaseObject = isCaseObject)
+      of ElseU:
+        n.into:                                   # (else ...)
+          optNL(g)
+          put(g, tkElse, "else")
+          putWithSpace(g, tkColon, ":")
+          takeCaseStmts(g, n, c, isCaseObject = isCaseObject)
+      else:
+        raiseAssert "unreachable"
 
 proc takeTypeVars(g: var SrcGen, n: var Cursor) =
   if n.substructureKind == TypevarsU:
-    inc n
-    put(g, tkBracketLe, "[")
-    var afterFirst = false
+    n.into:
+      put(g, tkBracketLe, "[")
+      var afterFirst = false
 
-    while n.hasMore:
-      if afterFirst:
-        gcomma(g)
-      else:
-        afterFirst = true
-
-      let isStatic = n.symKind == StaticTypevarY
-      let typevar = takeLocal(n, SkipFinalParRi)
-      var name = typevar.name
-      gsub(g, name)
-      var typ = typevar.typ
-      if typ.kind != DotToken:
-        putWithSpace(g, tkColon, ":")
-        if isStatic:
-          put(g, tkSymbol, "static")
-          put(g, tkBracketLe, "[")
-          gtype(g, typ, emptyContext)
-          put(g, tkBracketRi, "]")
+      while n.hasMore:
+        if afterFirst:
+          gcomma(g)
         else:
-          gtype(g, typ, emptyContext)
+          afterFirst = true
 
-    skipParRi(n)
+        let isStatic = n.symKind == StaticTypevarY
+        let typevar = takeLocal(n, SkipFinalParRi)
+        var name = typevar.name
+        gsub(g, name)
+        var typ = typevar.typ
+        if not typ.isDotToken:
+          putWithSpace(g, tkColon, ":")
+          if isStatic:
+            put(g, tkSymbol, "static")
+            put(g, tkBracketLe, "[")
+            gtype(g, typ, emptyContext)
+            put(g, tkBracketRi, "]")
+          else:
+            gtype(g, typ, emptyContext)
+
     put(g, tkBracketRi, "]")
   else:
     skip n
@@ -545,29 +559,33 @@ proc gproc(g: var SrcGen, n: var Cursor) =
   put(g, tkParLe, "(")
 
   var params = decl.params
-  if params.kind != DotToken:
-    inc params
-    var afterFirst = false
-    while params.hasMore:
-      if afterFirst:
-        gcomma(g)
-      else:
-        afterFirst = true
-      let param = takeLocal(params, SkipFinalParRi)
-      var name = param.name
-      gsub(g, name)
-      putWithSpace(g, tkColon, ":")
+  if not params.isDotToken:
+    params.into:
+      var afterFirst = false
+      while params.hasMore:
+        if afterFirst:
+          gcomma(g)
+        else:
+          afterFirst = true
+        let param = takeLocal(params, SkipFinalParRi)
+        var name = param.name
+        gsub(g, name)
+        putWithSpace(g, tkColon, ":")
 
-      var typ = param.typ
-      gtype(g, typ, emptyContext)
-
-    skipParRi(params)
+        var typ = param.typ
+        if param.kind == StaticParamY:
+          put(g, tkSymbol, "static")
+          put(g, tkBracketLe, "[")
+          gtype(g, typ, emptyContext)
+          put(g, tkBracketRi, "]")
+        else:
+          gtype(g, typ, emptyContext)
 
   put(g, tkParRi, ")")
 
   if renderNoBody notin g.flags:
     var retType = decl.retType
-    if retType.kind != DotToken:
+    if not retType.isDotToken:
       putWithSpace(g, tkColon, ":")
       gtype(g, retType, c)
 
@@ -575,7 +593,7 @@ proc gproc(g: var SrcGen, n: var Cursor) =
     if renderNoPragmas notin g.flags:
       gsub(g, pragmas)
 
-    if decl.body.kind != DotToken:
+    if not decl.body.isDotToken:
       put(g, tkSpaces, Space)
       putWithSpace(g, tkEquals, "=")
 
@@ -589,12 +607,11 @@ proc gproc(g: var SrcGen, n: var Cursor) =
 proc bracketKind(g: SrcGen, n: Cursor): BracketKind =
   if renderIds notin g.flags:
     if n.exprKind in {OchoiceX, CchoiceX}:
-      var firstSon = n
-      inc firstSon
-      result = bracketKind(g, firstSon)
-    elif n.kind == Symbol:
-      var name = pool.syms[n.symId]
-      extractBasename(name)
+      var childCursor = n
+      inc childCursor
+      result = bracketKind(g, childCursor)
+    elif n.isSymbol:
+      var name = pool.symBasename(n.symId)
 
       case name
       of "[]": result = bkBracket
@@ -617,133 +634,121 @@ proc gcallComma(g: var SrcGen, n: var Cursor) =
       afterFirst = true
 
     if n.substructureKind == VvU:
-      inc n
-      gsub(g, n)
-      put(g, tkSpaces, Space)
-      put(g, tkEquals, "=")
-      put(g, tkSpaces, Space)
-      gsub(g, n)
+      n.into:
+        gsub(g, n)
+        put(g, tkSpaces, Space)
+        put(g, tkEquals, "=")
+        put(g, tkSpaces, Space)
+        gsub(g, n)
     else:
       gsub(g, n)
 
 proc gcall(g: var SrcGen, n: var Cursor) =
-  inc n
-  case bracketKind(g, n)
-  of bkBracket:
-    skip n
-    gsub(g, n)
-    put(g, tkBracketLe, "[")
-    gcallComma(g, n)
-    put(g, tkBracketRi, "]")
-    skipParRi(n)
-  of bkCurly:
-    skip n
-    gsub(g, n)
-    put(g, tkCurlyLe, "{")
-    gcallComma(g, n)
-    put(g, tkCurlyRi, "}")
-    skipParRi(n)
-  of bkNone, bkPar, bkBracketAsgn, bkCurlyAsgn:
-    # TODO:
-    gsub(g, n)
-    put(g, tkParLe, "(")
-    gcallComma(g, n)
-    put(g, tkParRi, ")")
-    skipParRi(n)
+  n.into:
+    case bracketKind(g, n)
+    of bkBracket:
+      skip n
+      gsub(g, n)
+      put(g, tkBracketLe, "[")
+      gcallComma(g, n)
+      put(g, tkBracketRi, "]")
+    of bkCurly:
+      skip n
+      gsub(g, n)
+      put(g, tkCurlyLe, "{")
+      gcallComma(g, n)
+      put(g, tkCurlyRi, "}")
+    of bkNone, bkPar, bkBracketAsgn, bkCurlyAsgn:
+      # TODO:
+      gsub(g, n)
+      put(g, tkParLe, "(")
+      gcallComma(g, n)
+      put(g, tkParRi, ")")
 
 proc gcallsystem(g: var SrcGen, n: var Cursor; name: string) =
-  inc n
-  put(g, tkSymbol, name)
-  put(g, tkParLe, "(")
+  n.into:
+    put(g, tkSymbol, name)
+    put(g, tkParLe, "(")
 
-  var afterFirst = false
+    var afterFirst = false
 
-  while n.hasMore:
-    if afterFirst:
-      gcomma(g)
-    else:
-      afterFirst = true
-    gsub(g, n)
+    while n.hasMore:
+      if afterFirst:
+        gcomma(g)
+      else:
+        afterFirst = true
+      gsub(g, n)
 
-  put(g, tkParRi, ")")
-  skipParRi(n)
+    put(g, tkParRi, ")")
 
 proc gcmd(g: var SrcGen, n: var Cursor) =
-  inc n
-  gsub(g, n)
-  put(g, tkSpaces, Space)
-
-  var afterFirst = false
-
-  while n.hasMore:
-    if afterFirst:
-      gcomma(g)
-    else:
-      afterFirst = true
+  n.into:
     gsub(g, n)
+    put(g, tkSpaces, Space)
 
-  skipParRi(n)
+    var afterFirst = false
+
+    while n.hasMore:
+      if afterFirst:
+        gcomma(g)
+      else:
+        afterFirst = true
+      gsub(g, n)
 
 proc ginfix(g: var SrcGen, n: var Cursor) =
-  inc n
-
-  var opr = n
-  skip n
-
-  var afterFirst = false
-
-  while n.hasMore:
-    if afterFirst:
-      gsub(g, n)
-    else:
-      gsub(g, n)
-      put(g, tkSpaces, Space)
-      gsub(g, opr)
-      put(g, tkSpaces, Space)
-      afterFirst = true
-
-  skipParRi(n)
-
-proc gsufx(g: var SrcGen, n: var Cursor) =
-  inc n
-  var value = n
-  skip n
-
-  case pool.strings[n.litId]
-  of "i": put(g, tkIntLit, $pool.integers[value.intId])
-  of "i8": put(g, tkIntLit, $pool.integers[value.intId] & "'i8")
-  of "i16": put(g, tkIntLit, $pool.integers[value.intId] & "'i16")
-  of "i32": put(g, tkIntLit, $pool.integers[value.intId] & "'i32")
-  of "i64": put(g, tkIntLit, $pool.integers[value.intId] & "'i64")
-  of "u": put(g, tkUIntLit, $pool.uintegers[value.uintId] & "'u")
-  of "u8": put(g, tkUIntLit, $pool.uintegers[value.uintId] & "'u8")
-  of "u16": put(g, tkUIntLit, $pool.uintegers[value.uintId] & "'u16")
-  of "u32": put(g, tkUIntLit, $pool.uintegers[value.uintId] & "'u32")
-  of "u64": put(g, tkUIntLit, $pool.uintegers[value.uintId] & "'u64")
-  of "f": put(g, tkFloatLit, $pool.floats[value.floatId])
-  of "f32": put(g, tkFloatLit, $pool.floats[value.floatId] & "f32")
-  of "f64": put(g, tkFloatLit, $pool.floats[value.floatId] & "f64")
-  of "R", "T": put(g, tkStrLit, toString(value, false))
-  of "C": put(g, tkStrLit, "cstring" & toString(value, false))
-  else: discard
-
-  skip n
-  skipParRi(n)
-
-proc takeNumberType(g: var SrcGen, n: var Cursor, typ: string) =
-  inc n
-  var name = typ
-  let size = pool.integers[n.intId]
-  if size != -1:
-    name.add $size
-
-  inc n
-
-  while n.hasMore:
-    # skips importc and headers etc.
+  n.into:
+    var opr = n
     skip n
 
-  skipParRi(n)
+    var afterFirst = false
+
+    while n.hasMore:
+      if afterFirst:
+        gsub(g, n)
+      else:
+        gsub(g, n)
+        put(g, tkSpaces, Space)
+        gsub(g, opr)
+        put(g, tkSpaces, Space)
+        afterFirst = true
+
+proc gsufx(g: var SrcGen, n: var Cursor) =
+  n.into:
+    var value = n
+    skip n
+
+    case pool.strings[n.strId]
+    of "i": put(g, tkIntLit, $value.intVal)
+    of "i8": put(g, tkIntLit, $value.intVal & "'i8")
+    of "i16": put(g, tkIntLit, $value.intVal & "'i16")
+    of "i32": put(g, tkIntLit, $value.intVal & "'i32")
+    of "i64": put(g, tkIntLit, $value.intVal & "'i64")
+    of "u": put(g, tkUIntLit, $value.uintVal & "'u")
+    of "u8": put(g, tkUIntLit, $value.uintVal & "'u8")
+    of "u16": put(g, tkUIntLit, $value.uintVal & "'u16")
+    of "u32": put(g, tkUIntLit, $value.uintVal & "'u32")
+    of "u64": put(g, tkUIntLit, $value.uintVal & "'u64")
+    of "f": put(g, tkFloatLit, $value.floatVal)
+    of "f32": put(g, tkFloatLit, $value.floatVal & "f32")
+    of "f64": put(g, tkFloatLit, $value.floatVal & "f64")
+    of "R", "T": put(g, tkStrLit, toString(value, false))
+    of "C": put(g, tkStrLit, "cstring" & toString(value, false))
+    else: discard
+
+    skip n
+
+proc takeNumberType(g: var SrcGen, n: var Cursor, typ: string) =
+  var name = typ
+  n.into:
+    let size = n.intVal
+    if size != -1:
+      name.add $size
+
+    inc n
+
+    while n.hasMore:
+      # skips importc and headers etc.
+      skip n
 
   put(g, tkSymbol, name)
 
@@ -758,7 +763,7 @@ proc gconceptParents(g: var SrcGen, n: var Cursor) =
           first = false
         gtype(g, n, initContext())
     skip n
-  elif n.kind == DotToken:
+  elif n.isDotToken:
     skip n
   else:
     gtype(g, n, initContext())
@@ -768,7 +773,7 @@ proc gconcept(g: var SrcGen, n: var Cursor, c: Context) =
   inc n
   skip n
   skip n
-  if n.kind != DotToken:
+  if not n.isDotToken:
     putWithSpace(g, tkOf, "of")
     gconceptParents(g, n)
   else:
@@ -783,8 +788,9 @@ proc gconcept(g: var SrcGen, n: var Cursor, c: Context) =
     skip n
 
 proc gtype(g: var SrcGen, n: var Cursor, c: Context) =
+  if not n.hasMore: return
   case n.kind
-  of ParLe:
+  of TagLit:
     case n.typeKind
     of IT:
       takeNumberType(g, n, "int")
@@ -817,162 +823,145 @@ proc gtype(g: var SrcGen, n: var Cursor, c: Context) =
           skip n # unchecked or other annotation
     of OrdinalT:
       put(g, tkSymbol, "Ordinal")
-      inc n
-      if n.hasMore:
-        put(g, tkBracketLe, "[")
-        gtype(g, n, c)
-        put(g, tkBracketRi, "]")
-      skipParRi(n)
+      n.into:
+        if n.hasMore:
+          put(g, tkBracketLe, "[")
+          gtype(g, n, c)
+          put(g, tkBracketRi, "]")
     of TypedescT:
       put(g, tkSymbol, "typedesc")
-      inc n
-      if n.hasMore:
-        put(g, tkBracketLe, "[")
-        gtype(g, n, c)
-        put(g, tkBracketRi, "]")
-      skipParRi(n)
+      n.into:
+        if n.hasMore:
+          put(g, tkBracketLe, "[")
+          gtype(g, n, c)
+          put(g, tkBracketRi, "]")
     of TypekindT:
-      inc n
-      gtype(g, n, c)
-      skipParRi(n)
+      n.into:
+        gtype(g, n, c)
     of PtrT:
       put(g, tkPtr, "ptr")
-      inc n
-      if n.hasMore and n.substructureKind notin {NotnilU, NilU, UncheckedU}:
-        put(g, tkSpaces, Space)
-        gtype(g, n, c)
-      if n.hasMore and n.substructureKind == NotnilU:
-        put(g, tkSpaces, Space)
-        put(g, tkSymbol, "not")
-        put(g, tkSpaces, Space)
-        put(g, tkNil, "nil")
-        skip n
-      elif n.hasMore:
-        skip n # nil, unchecked annotation
-      skipParRi(n)
+      n.into:
+        if n.hasMore and n.substructureKind notin {NotnilU, NilU, UncheckedU}:
+          put(g, tkSpaces, Space)
+          gtype(g, n, c)
+        if n.hasMore and n.substructureKind == NotnilU:
+          put(g, tkSpaces, Space)
+          put(g, tkSymbol, "not")
+          put(g, tkSpaces, Space)
+          put(g, tkNil, "nil")
+          skip n
+        elif n.hasMore:
+          skip n # nil, unchecked annotation
 
     of SetT:
       put(g, tkSymbol, "set")
-      inc n
-      if n.hasMore:
-        put(g, tkBracketLe, "[")
-        gtype(g, n, c)
-        put(g, tkBracketRi, "]")
-      skipParRi(n)
+      n.into:
+        if n.hasMore:
+          put(g, tkBracketLe, "[")
+          gtype(g, n, c)
+          put(g, tkBracketRi, "]")
 
     of VarargsT:
       put(g, tkSymbol, "varargs")
-      inc n
-      if n.kind != ParRi:
-        put(g, tkBracketLe, "[")
-        gtype(g, n, c)
-        if n.kind != ParRi and n.kind != StringLit:
-          # optional converter (the trailing StringLit, if any, is the
-          # openArray mangle hint planted by `semcompat` — skip silently)
-          put(g, tkComma, ",")
-          put(g, tkSpaces, Space)
-          gsub(g, n, c)
-        if n.kind == StringLit:
-          inc n
-        put(g, tkBracketRi, "]")
-      skipParRi(n)
+      n.into:
+        if n.hasMore:
+          put(g, tkBracketLe, "[")
+          gtype(g, n, c)
+          if n.hasMore and not n.isStringLit:
+            # optional converter (the trailing StringLit, if any, is the
+            # openArray mangle hint planted by `semcompat` — skip silently)
+            put(g, tkComma, ",")
+            put(g, tkSpaces, Space)
+            gsub(g, n, c)
+          if n.isStringLit:
+            inc n
+          put(g, tkBracketRi, "]")
 
     of RefT:
       put(g, tkRef, "ref")
-      inc n
-      if n.hasMore and n.substructureKind notin {NotnilU, NilU, UncheckedU}:
-        put(g, tkSpaces, Space)
-        gtype(g, n, c)
-      if n.hasMore and n.substructureKind == NotnilU:
-        put(g, tkSpaces, Space)
-        put(g, tkSymbol, "not")
-        put(g, tkSpaces, Space)
-        put(g, tkNil, "nil")
-        skip n
-      elif n.hasMore:
-        skip n # nil, unchecked annotation
-      skipParRi(n)
+      n.into:
+        if n.hasMore and n.substructureKind notin {NotnilU, NilU, UncheckedU}:
+          put(g, tkSpaces, Space)
+          gtype(g, n, c)
+        if n.hasMore and n.substructureKind == NotnilU:
+          put(g, tkSpaces, Space)
+          put(g, tkSymbol, "not")
+          put(g, tkSpaces, Space)
+          put(g, tkNil, "nil")
+          skip n
+        elif n.hasMore:
+          skip n # nil, unchecked annotation
     of MutT:
       putWithSpace(g, tkVar, "var")
-      inc n
-      gtype(g, n, c)
-      skipParRi(n)
+      n.into:
+        gtype(g, n, c)
     of OutT:
       putWithSpace(g, tkOut, "out")
-      inc n
-      gtype(g, n, c)
-      skipParRi(n)
-    of LentT, SinkT, DistinctT:
+      n.into:
+        gtype(g, n, c)
+    of LentT, SinkT, OwnedT, DistinctT:
       putWithSpace(g, tkSymbol, $n.typeKind)
-      inc n
-      gtype(g, n, c)
-      skipParRi(n)
+      n.into:
+        gtype(g, n, c)
 
     of OrT:
-      inc n
-      var afterFirst = false
-      while n.hasMore:
-        if afterFirst:
-          put(g, tkOpr, "|")
-        else:
-          afterFirst = true
-        gtype(g, n, c)
-
-      skipParRi(n)
+      n.into:
+        var afterFirst = false
+        while n.hasMore:
+          if afterFirst:
+            put(g, tkOpr, "|")
+          else:
+            afterFirst = true
+          gtype(g, n, c)
 
     of AtT:
-      inc n
-      var afterFirst = false
-      gtype(g, n, c)
-      put(g, tkBracketLe, "[")
-      while n.hasMore:
-        if afterFirst:
-          put(g, tkComma, ",")
-        else:
-          afterFirst = true
+      n.into:
+        var afterFirst = false
         gtype(g, n, c)
+        put(g, tkBracketLe, "[")
+        while n.hasMore:
+          if afterFirst:
+            put(g, tkComma, ",")
+          else:
+            afterFirst = true
+          gtype(g, n, c)
 
-      skipParRi(n)
       put(g, tkBracketRi, "]")
 
     of RangetypeT:
-      inc n
-      if n.hasMore:
-        skip n
-        gtype(g, n, c)
-        put(g, tkDotDot, "..")
-        gtype(g, n, c)
-      else:
-        put(g, tkSymbol, "range")
-      skipParRi(n)
+      n.into:
+        if n.hasMore:
+          skip n
+          gtype(g, n, c)
+          put(g, tkDotDot, "..")
+          gtype(g, n, c)
+        else:
+          put(g, tkSymbol, "range")
 
     of ArrayT:
-      inc n
+      n.into:
+        put(g, tkSymbol, "array")
+        put(g, tkBracketLe, "[")
 
-      put(g, tkSymbol, "array")
-      put(g, tkBracketLe, "[")
+        if n.hasMore:
+          var base = n
+          skip n
+          if n.hasMore:
+            gtype(g, n, c)
+            gcomma(g)
+          gtype(g, base, c)
+          while n.hasMore: skip n
 
-      var base = n
-      skip n
-      gtype(g, n, c)
-      gcomma(g)
-      gtype(g, base, c)
-
-      put(g, tkBracketRi, "]")
-
-      skipParRi(n)
+        put(g, tkBracketRi, "]")
 
     of UarrayT:
-      inc n
+      n.into:
+        put(g, tkSymbol, "UncheckedArray")
+        put(g, tkBracketLe, "[")
 
-      put(g, tkSymbol, "UncheckedArray")
-      put(g, tkBracketLe, "[")
+        gtype(g, n, c)
 
-      gtype(g, n, c)
-
-      put(g, tkBracketRi, "]")
-
-      skipParRi(n)
+        put(g, tkBracketRi, "]")
 
     of ObjectT:
       putWithSpace(g, tkObject, "object")
@@ -985,46 +974,37 @@ proc gtype(g: var SrcGen, n: var Cursor, c: Context) =
       fields.into:
         skip fields, AnyType  # parent type / inheritance slot
         while fields.hasMore:
-          case fields.substructureKind
-          of CaseU:
-            gcase(g, fields, isCaseObject = true)
-          of FldU, GfldU:
-            takeField(g, fields)
-          else:
-            raiseAssert "todo"
+          takeObjectFields(g, fields)
 
       dedent(g)
 
     of EnumT:
-      inc n
+      n.into:
+        if n.hasMore:
+          putWithSpace(g, tkEnum, "enum")
+          skip n
 
-      if n.hasMore:
-        putWithSpace(g, tkEnum, "enum")
-        skip n
+          indentNL(g)
 
-        indentNL(g)
+          while n.hasMore:
+            case n.substructureKind
+            of EfldU:
+              let local = takeLocal(n, SkipFinalParRi)
+              var name = local.name
+              var value = local.val
 
-        while n.hasMore:
-          case n.substructureKind
-          of EfldU:
-            let local = takeLocal(n, SkipFinalParRi)
-            var name = local.name
-            var value = local.val
+              gsub(g, name)
+              put(g, tkSpaces, Space)
+              put(g, tkEquals, "=")
+              put(g, tkSpaces, Space)
+              gsub(g, value)
+              optNL(g)
+            else:
+              raiseAssert "unreachable"
 
-            gsub(g, name)
-            put(g, tkSpaces, Space)
-            put(g, tkEquals, "=")
-            put(g, tkSpaces, Space)
-            gsub(g, value)
-            optNL(g)
-          else:
-            raiseAssert "unreachable"
-
-        dedent(g)
-      else:
-        put(g, tkSymbol, "OrdinalEnum")
-
-      skipParRi(n)
+          dedent(g)
+        else:
+          put(g, tkSymbol, "OrdinalEnum")
 
     of OnumT:
       put(g, tkSymbol, "HoleyEnum")
@@ -1037,35 +1017,34 @@ proc gtype(g: var SrcGen, n: var Cursor, c: Context) =
     of ConceptT:
       gconcept(g, n, c)
 
-    of TupleT:
-      inc n
+    of TupleT, ClosureTupleT:
+      # A `ClosureTupleT` only ever shows up in hexer-stage diagnostics; render
+      # it like the plain tuple it is laid out as.
+      n.into:
+        put(g, tkTuple, "tuple")
+        put(g, tkBracketLe, "[")
 
-      put(g, tkTuple, "tuple")
-      put(g, tkBracketLe, "[")
+        var afterFirst = false
 
-      var afterFirst = false
+        while n.hasMore:
+          if afterFirst:
+            gcomma(g)
+          else:
+            afterFirst = true
 
-      while n.hasMore:
-        if afterFirst:
-          gcomma(g)
-        else:
-          afterFirst = true
+          case n.substructureKind
+          of KvU:
+            n.into:
+              gsub(g, n)
+              putWithSpace(g, tkColon, ":")
+              gtype(g, n, c)
+          else:
+            gtype(g, n, c)
 
-        case n.substructureKind
-        of KvU:
-          inc n
-          gsub(g, n)
-          putWithSpace(g, tkColon, ":")
-          gtype(g, n, c)
-          skipParRi(n)
-        else:
-          gtype(g, n, c)
-
-      skipParRi(n)
       put(g, tkBracketRi, "]")
 
     of ErrT:
-      put(g, tkStrLit, toString(n, false))
+      put(g, tkStrLit, typeToString(n, g.flags))
       skip n
 
     of RoutineTypes:
@@ -1091,48 +1070,60 @@ proc gtype(g: var SrcGen, n: var Cursor, c: Context) =
       else:
         raiseAssert "cannot happen"
       let isProctype = n.typeKind in {ProctypeT, ItertypeT}
-      skipToParams n
-      if n.substructureKind == ParamsU:
-        put(g, tkParLe, "(")
-        inc n
-        while n.hasMore:
-          let decl = takeLocal(n, SkipFinalParRi)
-          var name = decl.name
-          var value = decl.val
-          var typ = decl.typ
-          gsub(g, name, c)
+      n.into:
+        # mirrors `skipToParams` inside the bounded scope:
+        if isProctype:
+          skip n # nilability tag
+        else:
+          skip n # name
+          skip n # export marker
+          skip n # pattern
+          skip n # generics
+        if n.substructureKind == ParamsU:
+          put(g, tkParLe, "(")
+          n.into:
+            while n.hasMore:
+              let decl = takeLocal(n, SkipFinalParRi)
+              var name = decl.name
+              var value = decl.val
+              var typ = decl.typ
+              gsub(g, name, c)
 
-          if typ.kind != DotToken:
-            putWithSpace(g, tkColon, ":")
-            gtype(g, typ, c)
+              if not typ.isDotToken:
+                putWithSpace(g, tkColon, ":")
+                if decl.kind == StaticParamY:
+                  put(g, tkSymbol, "static")
+                  put(g, tkBracketLe, "[")
+                  gtype(g, typ, c)
+                  put(g, tkBracketRi, "]")
+                else:
+                  gtype(g, typ, c)
 
-          if value.kind != DotToken:
-            put(g, tkSpaces, Space)
-            putWithSpace(g, tkEquals, "=")
-            gsub(g, value, c)
+              if not value.isDotToken:
+                put(g, tkSpaces, Space)
+                putWithSpace(g, tkEquals, "=")
+                gsub(g, value, c)
 
-          if n.hasMore:
-            putWithSpace(g, tkComma, ",")
-        inc n
-        put(g, tkParRi, ")")
-      else:
-        skip n
+              if n.hasMore:
+                putWithSpace(g, tkComma, ",")
+          put(g, tkParRi, ")")
+        else:
+          skip n
 
-      # return type
-      if n.kind != DotToken:
-        putWithSpace(g, tkColon, ":")
-        gtype(g, n, c)
-      else:
-        inc n
-      if n.kind != DotToken:
-        # pragmas
-        gsub(g, n, c)
-      else:
-        inc n
-      if not isProctype:
-        skip n, SkipEffects # effects
-        skip n, SkipBody # body
-      skipParRi(n)
+        # return type
+        if not n.isDotToken:
+          putWithSpace(g, tkColon, ":")
+          gtype(g, n, c)
+        else:
+          inc n
+        if not n.isDotToken:
+          # pragmas
+          gsub(g, n, c)
+        else:
+          inc n
+        if not isProctype:
+          skip n, SkipEffects # effects
+          skip n, SkipBody # body
     else:
       case n.exprKind
       of CchoiceX, OchoiceX:
@@ -1142,6 +1133,21 @@ proc gtype(g: var SrcGen, n: var Cursor, c: Context) =
   of DotToken:
     put(g, tkSymbol, "void")
     inc n
+  of Symbol:
+    # an instance of a generic type is spelled as its invocation, `seq[int]`,
+    # not by the base name it shares with every other instance
+    var inv = default(Cursor)
+    if pool.symIsInstantiation(n.symId):
+      let res = tryLoadSym(n.symId)
+      if res.status == LacksNothing and res.decl.symKind == TypeY:
+        let decl = asTypeDecl(res.decl)
+        if decl.typevars.typeKind == AtT:
+          inv = decl.typevars
+    if cursorIsNil(inv):
+      gsub(g, n, c)
+    else:
+      gtype(g, inv, c)
+      inc n
   else:
     gsub(g, n, c)
 
@@ -1152,13 +1158,11 @@ when false:
 proc gWhile(g: var SrcGen, n: var Cursor) =
   var c: Context = initContext()
   putWithSpace(g, tkWhile, "while")
-  inc n
-  gcond(g, n)
-  putWithSpace(g, tkColon, ":")
+  n.into:
+    gcond(g, n)
+    putWithSpace(g, tkColon, ":")
 
-  gstmts(g, n, c, doIndent = true)
-
-  skipParRi(n)
+    gstmts(g, n, c, doIndent = true)
 
 proc gfor(g: var SrcGen, n: var Cursor) =
   let forStmt = asForStmt(n)
@@ -1170,19 +1174,18 @@ proc gfor(g: var SrcGen, n: var Cursor) =
   #   incl(c.flags, rfLongMode)
   # gcomma(g, n, c, 0, - 3)
   var vars = forStmt.vars
-  inc vars
+  vars.into:
+    var afterFirst = false
+    while vars.hasMore:
+      let local = takeLocal(vars, SkipFinalParRi)
+      var name = local.name
 
-  var afterFirst = false
-  while vars.hasMore:
-    let local = takeLocal(vars, SkipFinalParRi)
-    var name = local.name
+      if afterFirst:
+        gcomma(g)
+      else:
+        afterFirst = true
 
-    if afterFirst:
-      gcomma(g)
-    else:
-      afterFirst = true
-
-    gsub(g, name, c)
+      gsub(g, name, c)
 
   put(g, tkSpaces, Space)
   putWithSpace(g, tkIn, "in")
@@ -1213,7 +1216,7 @@ proc gtypedef(g: var SrcGen, n: var Cursor, c: Context) =
   gsub(g, pragmas, c)
 
   var body = decl.body
-  if body.kind != DotToken:
+  if not body.isDotToken:
     put(g, tkSpaces, Space)
     putWithSpace(g, tkEquals, "=")
     gtype(g, body, c)
@@ -1222,62 +1225,55 @@ proc gtypedef(g: var SrcGen, n: var Cursor, c: Context) =
 
 proc gtry(g: var SrcGen, n: var Cursor) =
   var c: Context = initContext()
-  inc n
-  put(g, tkTry, "try")
-  putWithSpace(g, tkColon, ":")
-  # # if longMode(g, n) or (lsub(g, n[0]) + g.lineLen > MaxLineLen):
-  # #   incl(c.flags, rfLongMode)
-  gstmts(g, n, c, doIndent = true)
-  while n.substructureKind == ExceptU:
-    optNL(g)
-    inc n
-    if n.kind != DotToken:
-      putWithSpace(g, tkExcept, "except")
-      gsub(g, n, c)
-      raiseAssert "todo"
-    else:
-      put(g, tkExcept, "except")
-      inc n
+  n.into:
+    put(g, tkTry, "try")
     putWithSpace(g, tkColon, ":")
-    gstmts(g, n, c, doIndent = true)
-    skipParRi(n)
+    # # if longMode(g, n) or (lsub(g, n[0]) + g.lineLen > MaxLineLen):
+    # #   incl(c.flags, rfLongMode)
+    gstmtsOrExpr(g, n, c)
+    while n.substructureKind == ExceptU:
+      optNL(g)
+      n.into:
+        if not n.isDotToken:
+          putWithSpace(g, tkExcept, "except")
+          gsub(g, n, c)
+          raiseAssert "todo"
+        else:
+          put(g, tkExcept, "except")
+          inc n
+        putWithSpace(g, tkColon, ":")
+        gstmtsOrExpr(g, n, c)
 
-  if n.substructureKind == FinU:
-    optNL(g)
-    put(g, tkFinally, "finally")
-    inc n
-    putWithSpace(g, tkColon, ":")
-    gstmts(g, n, c, doIndent = true)
-    skipParRi(n)
-
-  skipParRi(n)
+    if n.substructureKind == FinU:
+      optNL(g)
+      put(g, tkFinally, "finally")
+      n.into:
+        putWithSpace(g, tkColon, ":")
+        gstmtsOrExpr(g, n, c)
 
 
 proc gconstr(g: var SrcGen, n: var Cursor, kind: BracketKind, isUntyped = false) =
-  inc n
+  n.into:
+    if not isUntyped:
+      skip n
 
-  if not isUntyped:
-    skip n
-
-  case kind
-  of bkBracket:
-    put(g, tkBracketLe, "[")
-  of bkCurly:
-    put(g, tkCurlyLe, "{")
-  of bkPar:
-    put(g, tkParLe, "(")
-  else:
-    raiseAssert "todo"
-
-  var afterFirst = false
-  while n.hasMore:
-    if afterFirst:
-      gcomma(g)
+    case kind
+    of bkBracket:
+      put(g, tkBracketLe, "[")
+    of bkCurly:
+      put(g, tkCurlyLe, "{")
+    of bkPar:
+      put(g, tkParLe, "(")
     else:
-      afterFirst = true
-    gsub(g, n)
+      raiseAssert "todo"
 
-  skipParRi(n)
+    var afterFirst = false
+    while n.hasMore:
+      if afterFirst:
+        gcomma(g)
+      else:
+        afterFirst = true
+      gsub(g, n)
 
   case kind
   of bkBracket:
@@ -1290,40 +1286,40 @@ proc gconstr(g: var SrcGen, n: var Cursor, kind: BracketKind, isUntyped = false)
     raiseAssert "todo"
 
 proc gpragmaBlock(g: var SrcGen, n: var Cursor) =
-  inc n
   var c: Context = initContext()
-  gsub(g, n)
-  putWithSpace(g, tkColon, ":")
-  # if longMode(g, n) or (lsub(g, n[1]) + g.lineLen > MaxLineLen):
-  #   incl(c.flags, rfLongMode)
-  # gcoms(g)                    # a good place for comments
-  gstmts(g, n, c, doIndent = true)
-  skipParRi(n)
+  n.into:
+    gsub(g, n)
+    putWithSpace(g, tkColon, ":")
+    # if longMode(g, n) or (lsub(g, n[1]) + g.lineLen > MaxLineLen):
+    #   incl(c.flags, rfLongMode)
+    # gcoms(g)                    # a good place for comments
+    gstmts(g, n, c, doIndent = true)
 
 proc isUseSpace(n: Cursor): bool =
   template isAlpha(s: Cursor): bool =
-    pool.strings[s.litId][0] in {'a'..'z', 'A'..'Z'}
+    pool.strings[s.strId][0] in {'a'..'z', 'A'..'Z'}
 
   result = true
   var n = n
 
   assert n.hasMore
-  let firstSon = n
+  let childCursor = n
   skip n
 
   if n.hasMore:
     let secondSon = n
     skip n
-    if n.kind == ParRi:
-      assert firstSon.kind == Ident and secondSon.kind == Ident
+    if not n.hasMore:
+      assert childCursor.isIdent and secondSon.isIdent
       # handle `=destroy`, `'big' and handle setters, e.g. `foo=`
-      if (pool.strings[firstSon.litId] in ["=", "'"] and isAlpha(secondSon)) or
-          (pool.strings[secondSon.litId] == "=" and isAlpha(firstSon)):
+      if (pool.strings[childCursor.strId] in ["=", "'"] and isAlpha(secondSon)) or
+          (pool.strings[secondSon.strId] == "=" and isAlpha(childCursor)):
         result = false
 
 proc gsub(g: var SrcGen, n: var Cursor, c: Context, fromStmtList = false, isTopLevel = false) =
+  if not n.hasMore: return
   case n.kind
-  of ParLe:
+  of TagLit:
     case n.exprKind
     of NoExpr:
       case n.stmtKind
@@ -1354,11 +1350,11 @@ proc gsub(g: var SrcGen, n: var Cursor, c: Context, fromStmtList = false, isTopL
         var exportMarker = decl.exported
         mayAddExportMarker(g, exportMarker)
 
-        if typ.kind != DotToken:
+        if not typ.isDotToken:
           putWithSpace(g, tkColon, ":")
           gtype(g, typ, c)
 
-        if value.kind != DotToken:
+        if not value.isDotToken:
           put(g, tkSpaces, Space)
           putWithSpace(g, tkEquals, "=")
           gsub(g, value, c)
@@ -1416,9 +1412,8 @@ proc gsub(g: var SrcGen, n: var Cursor, c: Context, fromStmtList = false, isTopL
 
       of DiscardS:
         putWithSpace(g, tkDiscard, "discard")
-        inc n
-        gsub(g, n)
-        skipParRi(n)
+        n.into:
+          gsub(g, n)
 
       of CallS:
         gcall(g, n)
@@ -1427,45 +1422,38 @@ proc gsub(g: var SrcGen, n: var Cursor, c: Context, fromStmtList = false, isTopL
         gcmd(g, n)
 
       of AsgnS:
-        inc n
-        gsub(g, n)
+        n.into:
+          gsub(g, n)
 
-        put(g, tkSpaces, Space)
-        putWithSpace(g, tkEquals, "=")
+          put(g, tkSpaces, Space)
+          putWithSpace(g, tkEquals, "=")
 
-        gsub(g, n)
-
-        skipParRi(n)
+          gsub(g, n)
 
       of RetS:
-        inc n
         putWithSpace(g, tkReturn, "return")
-        gsub(g, n)
-        skipParRi(n)
+        n.into:
+          gsub(g, n)
 
       of BreakS:
-        inc n
         putWithSpace(g, tkBreak, "break")
-        gsub(g, n)
-        skipParRi(n)
+        n.into:
+          gsub(g, n)
 
       of ContinueS:
-        inc n
         putWithSpace(g, tkContinue, "continue")
-        gsub(g, n)
-        skipParRi(n)
+        n.into:
+          gsub(g, n)
 
       of YldS:
-        inc n
         putWithSpace(g, tkYield, "yield")
-        gsub(g, n)
-        skipParRi(n)
+        n.into:
+          gsub(g, n)
 
       of RaiseS:
-        inc n
         putWithSpace(g, tkRaise, "raise")
-        gsub(g, n)
-        skipParRi(n)
+        n.into:
+          gsub(g, n)
 
       of TryS:
         gtry(g, n)
@@ -1478,19 +1466,17 @@ proc gsub(g: var SrcGen, n: var Cursor, c: Context, fromStmtList = false, isTopL
       of NoStmt:
         case n.substructureKind
         of RangeU:
-          inc n
-          gsub(g, n)
-          put(g, tkDotDot, "..")
-          gsub(g, n)
-          skipParRi(n)
+          n.into:
+            gsub(g, n)
+            put(g, tkDotDot, "..")
+            gsub(g, n)
         else:
           if n.typeKind != NoType:
             gtype(g, n, c)
-          elif n.njvlKind == VV:
-            inc n
-            gsub g, n, c, fromStmtList, isTopLevel
-            skip n # version
-            skipParRi n
+          elif n.finalIrKind == VV:
+            n.into:
+              gsub g, n, c, fromStmtList, isTopLevel
+              skip n # version
           else:
             skip n
         # raiseAssert "unreachable"
@@ -1504,7 +1490,7 @@ proc gsub(g: var SrcGen, n: var Cursor, c: Context, fromStmtList = false, isTopL
         skip n
 
       else:
-        # raiseAssert $pool.tags[n.tagId]
+        # raiseAssert $globalTags.tags[n.tagId]
         skip n
     of TrueX:
       put(g, tkSymbol, "true")
@@ -1517,46 +1503,40 @@ proc gsub(g: var SrcGen, n: var Cursor, c: Context, fromStmtList = false, isTopL
       skip n
 
     of KvX:
-      inc n
-      gsub(g, n)
-      putWithSpace(g, tkColon, ":")
-      gsub(g, n)
-      if n.hasMore:
-        skip n
-      skipParRi(n)
+      n.into:
+        gsub(g, n)
+        putWithSpace(g, tkColon, ":")
+        gsub(g, n)
+        if n.hasMore:
+          skip n
 
     of CastX:
-      inc n
-      put(g, tkCast, "cast")
-      put(g, tkBracketLe, "[")
-      gtype(g, n, c)
-      put(g, tkBracketRi, "]")
-      put(g, tkParLe, "(")
-      gsub(g, n)
-      put(g, tkParRi, ")")
-      skipParRi(n)
+      n.into:
+        put(g, tkCast, "cast")
+        put(g, tkBracketLe, "[")
+        gtype(g, n, c)
+        put(g, tkBracketRi, "]")
+        put(g, tkParLe, "(")
+        gsub(g, n)
+        put(g, tkParRi, ")")
 
     of AtX, PatX, TupatX, ArratX:
-      inc n
+      n.into:
+        gsub(g, n)
+        put(g, tkBracketLe, "[")
 
-      gsub(g, n)
-      put(g, tkBracketLe, "[")
+        gsub(g, n)
 
-      gsub(g, n)
+        put(g, tkBracketRi, "]")
 
-      put(g, tkBracketRi, "]")
-
-      while n.hasMore:
-        skip n
-
-      skipParRi(n)
+        while n.hasMore:
+          skip n
 
     of ParX:
-      inc n
-      put(g, tkParLe, "(")
-      gsub(g, n)
-      put(g, tkParRi, ")")
-      skipParRi(n)
+      n.into:
+        put(g, tkParLe, "(")
+        gsub(g, n)
+        put(g, tkParRi, ")")
 
     of SufX:
       gsufx(g, n)
@@ -1575,83 +1555,73 @@ proc gsub(g: var SrcGen, n: var Cursor, c: Context, fromStmtList = false, isTopL
       skip n
 
     of AddrX:
-      inc n
-      put(g, tkAddr, "addr")
-      gsub(g, n)
-
-      skipParRi(n)
+      n.into:
+        put(g, tkAddr, "addr")
+        gsub(g, n)
 
     of DelayX:
       # (delay fn args...) -> delay(fn(args...))
-      inc n  # skip (delay
-      put(g, tkSymbol, "delay")
-      put(g, tkParLe, "(")
-      gsub(g, n)  # fn
-      put(g, tkParLe, "(")
-      gcallComma(g, n)  # args
-      put(g, tkParRi, ")")
-      put(g, tkParRi, ")")
-      skipParRi(n)
+      n.into:
+        put(g, tkSymbol, "delay")
+        put(g, tkParLe, "(")
+        gsub(g, n)  # fn
+        put(g, tkParLe, "(")
+        gcallComma(g, n)  # args
+        put(g, tkParRi, ")")
+        put(g, tkParRi, ")")
 
     of Delay0X:
       # (delay0) -> delay()
-      inc n  # skip (delay0
-      put(g, tkSymbol, "delay")
-      put(g, tkParLe, "(")
-      put(g, tkParRi, ")")
-      skipParRi(n)
+      n.into:
+        put(g, tkSymbol, "delay")
+        put(g, tkParLe, "(")
+        put(g, tkParRi, ")")
 
     of SuspendX:
       # (suspend) -> suspend()
-      inc n  # skip (suspend
-      put(g, tkSymbol, "suspend")
-      put(g, tkParLe, "(")
-      put(g, tkParRi, ")")
-      skipParRi(n)
+      n.into:
+        put(g, tkSymbol, "suspend")
+        put(g, tkParLe, "(")
+        put(g, tkParRi, ")")
 
     of EmoveX:
-      inc n
-      put(g, tkSymbol, "ensureMove")
+      n.into:
+        put(g, tkSymbol, "ensureMove")
 
-      put(g, tkParLe, "(")
-      gsub(g, n)
-      put(g, tkParRi, ")")
+        put(g, tkParLe, "(")
+        gsub(g, n)
+        put(g, tkParRi, ")")
 
-      skipParRi(n)
-
-    of CallX, CallstrlitX:
+    of CallX, CallstrlitX, PluginCallX:
+      # a parked plugin call reads back exactly like the call it came from
       gcall(g, n)
 
     of HighX, LowX, TypeofX,
-       SizeofX, AlignofX, OffsetofX,
-       CardX, UnpackX, FieldsX, CompilesX,
+       SizeofX, AlignofX, OffsetofX, CanFormCyclesX, SupportsCopyMemX,
+       CardX, UnpackX, FieldsX, CompilesX, StaticX,
        DeclaredX, DefinedX, AstToStrX, BindSymX, BindSymNameX:
       gcallsystem(g, n, $n.exprKind)
 
     of ProccallX:
       # New flat format: (proccall fn args...) -> render as procCall(fn(args...))
-      inc n  # skip (proccall
-      put(g, tkSymbol, "procCall")
-      put(g, tkParLe, "(")
-      gsub(g, n)  # fn
-      put(g, tkParLe, "(")
-      gcallComma(g, n)  # args
-      put(g, tkParRi, ")")
-      put(g, tkParRi, ")")
-      skipParRi(n)
+      n.into:
+        put(g, tkSymbol, "procCall")
+        put(g, tkParLe, "(")
+        gsub(g, n)  # fn
+        put(g, tkParLe, "(")
+        gcallComma(g, n)  # args
+        put(g, tkParRi, ")")
+        put(g, tkParRi, ")")
 
     of NewrefX:
-      inc n
+      n.into:
+        put(g, tkSymbol, "newConstr")
 
-      put(g, tkSymbol, "newConstr")
+        skip n
 
-      skip n
-
-      put(g, tkParLe, "(")
-      gsub(g, n)
-      put(g, tkParRi, ")")
-
-      skipParRi(n)
+        put(g, tkParLe, "(")
+        gsub(g, n)
+        put(g, tkParRi, ")")
 
     of FieldpairsX:
       gcallsystem(g, n, "fieldPairs")
@@ -1677,24 +1647,37 @@ proc gsub(g: var SrcGen, n: var Cursor, c: Context, fromStmtList = false, isTopL
     of DefaultobjX, DefaulttupX, DefaultdistinctX:
       gcallsystem(g, n, "default")
 
+    of SuccX, PredX:
+      # `succ(x, y)`: the type operand is not written
+      let name = if n.exprKind == SuccX: "succ" else: "pred"
+      n.into:
+        put(g, tkSymbol, name)
+        put(g, tkParLe, "(")
+        skip n
+        var afterFirst = false
+        while n.hasMore:
+          if afterFirst: gcomma(g)
+          else: afterFirst = true
+          gsub(g, n)
+        put(g, tkParRi, ")")
+
     of InsetX:
-      inc n
-      put(g, tkSymbol, "contains")
-      put(g, tkParLe, "(")
+      n.into:
+        put(g, tkSymbol, "contains")
+        put(g, tkParLe, "(")
 
-      skip n
+        skip n
 
-      var afterFirst = false
+        var afterFirst = false
 
-      while n.hasMore:
-        if afterFirst:
-          gcomma(g)
-        else:
-          afterFirst = true
-        gsub(g, n)
+        while n.hasMore:
+          if afterFirst:
+            gcomma(g)
+          else:
+            afterFirst = true
+          gsub(g, n)
 
-      put(g, tkParRi, ")")
-      skipParRi(n)
+        put(g, tkParRi, ")")
 
     of PrefixX:
       # TODO:
@@ -1719,65 +1702,58 @@ proc gsub(g: var SrcGen, n: var Cursor, c: Context, fromStmtList = false, isTopL
       gconstr(g, n, bkCurly)
 
     of OconstrX:
-      inc n
-      gtype(g, n, c)
-      put(g, tkParLe, "(")
-      var afterFirst = false
-      while n.hasMore:
-        if afterFirst:
-          gcomma(g)
-        else:
-          afterFirst = true
-        assert n.substructureKind == KvU
-        inc n
-        gsub(g, n)
-        putWithSpace(g, tkColon, ":")
-        gsub(g, n)
+      n.into:
+        gtype(g, n, c)
+        put(g, tkParLe, "(")
+        var afterFirst = false
+        while n.hasMore:
+          if afterFirst:
+            gcomma(g)
+          else:
+            afterFirst = true
+          assert n.substructureKind == KvU
+          n.into:
+            gsub(g, n)
+            putWithSpace(g, tkColon, ":")
+            gsub(g, n)
 
-        if n.hasMore:
-          skip n
+            if n.hasMore:
+              skip n
 
-        skipParRi(n)
-
-      skipParRi(n)
       put(g, tkParRi, ")")
 
     of NewobjX:
-      inc n
-      # TODO: find the ref types
-      put(g, tkParLe, "(")
-      gtype(g, n, c)
-      put(g, tkParRi, ")")
+      n.into:
+        # TODO: find the ref types
+        put(g, tkParLe, "(")
+        gtype(g, n, c)
+        put(g, tkParRi, ")")
 
-      put(g, tkParLe, "(")
-      var afterFirst = false
-      while n.hasMore:
-        if afterFirst:
-          gcomma(g)
-        else:
-          afterFirst = true
-        assert n.substructureKind == KvU
-        inc n
-        gsub(g, n)
-        putWithSpace(g, tkColon, ":")
-        gsub(g, n)
-        if n.hasMore:
-          skip n
-        skipParRi(n)
+        put(g, tkParLe, "(")
+        var afterFirst = false
+        while n.hasMore:
+          if afterFirst:
+            gcomma(g)
+          else:
+            afterFirst = true
+          assert n.substructureKind == KvU
+          n.into:
+            gsub(g, n)
+            putWithSpace(g, tkColon, ":")
+            gsub(g, n)
+            if n.hasMore:
+              skip n
 
-      skipParRi(n)
       put(g, tkParRi, ")")
 
     of CmdX:
       gcmd(g, n)
 
     of EnumtostrX:
-      inc n
-      put(g, tkSymbol, "$")
+      n.into:
+        put(g, tkSymbol, "$")
 
-      gsub(g, n)
-
-      skipParRi(n)
+        gsub(g, n)
 
     of InfixX:
       ginfix(g, n)
@@ -1793,13 +1769,12 @@ proc gsub(g: var SrcGen, n: var Cursor, c: Context, fromStmtList = false, isTopL
         opr = "xor"
       else:
         raiseAssert "unreachable"
-      inc n
-      gsub(g, n)
-      put(g, tkSpaces, Space)
-      put(g, tkSymbol, opr)
-      put(g, tkSpaces, Space)
-      gsub(g, n)
-      skipParRi(n)
+      n.into:
+        gsub(g, n)
+        put(g, tkSpaces, Space)
+        put(g, tkSymbol, opr)
+        put(g, tkSpaces, Space)
+        gsub(g, n)
 
     of IsX, InstanceofX:
       let opr: string
@@ -1810,13 +1785,12 @@ proc gsub(g: var SrcGen, n: var Cursor, c: Context, fromStmtList = false, isTopL
         opr = "of"
       else:
         raiseAssert "unreachable"
-      inc n
-      gsub(g, n)
-      put(g, tkSpaces, Space)
-      put(g, tkSymbol, opr)
-      put(g, tkSpaces, Space)
-      gtype(g, n, c)
-      skipParRi(n)
+      n.into:
+        gsub(g, n)
+        put(g, tkSpaces, Space)
+        put(g, tkSymbol, opr)
+        put(g, tkSpaces, Space)
+        gtype(g, n, c)
 
     of EqX, NeqX, LeX, LtX, AddX,
         SubX, MulX, DivX,
@@ -1844,136 +1818,121 @@ proc gsub(g: var SrcGen, n: var Cursor, c: Context, fromStmtList = false, isTopL
         opr = "-+-"
       else:
         raiseAssert "unreachable"
-      inc n
-      skip n
-      gsub(g, n)
-      put(g, tkSpaces, Space)
-      put(g, tkSymbol, opr)
-      put(g, tkSpaces, Space)
-      gsub(g, n)
-      skipParRi(n)
+      n.into:
+        skip n
+        gsub(g, n)
+        put(g, tkSpaces, Space)
+        put(g, tkSymbol, opr)
+        put(g, tkSpaces, Space)
+        gsub(g, n)
 
     of ModX, ShrX, ShlX, BitandX, BitorX, BitxorX, BitnotX:
       let opr = $n.exprKind
-      inc n
-      skip n
-      gsub(g, n)
-      put(g, tkSpaces, Space)
-      put(g, tkSymbol, opr)
-      put(g, tkSpaces, Space)
-      gsub(g, n)
-      skipParRi(n)
+      n.into:
+        skip n
+        gsub(g, n)
+        put(g, tkSpaces, Space)
+        put(g, tkSymbol, opr)
+        put(g, tkSpaces, Space)
+        gsub(g, n)
 
     of AshrX:
-      inc n
-      skip n
-      put(g, tkSymbol, "ashr")
-      put(g, tkParLe, "(")
+      n.into:
+        skip n
+        put(g, tkSymbol, "ashr")
+        put(g, tkParLe, "(")
 
-      gsub(g, n)
-      gcomma(g)
-      gsub(g, n)
+        gsub(g, n)
+        gcomma(g)
+        gsub(g, n)
 
-      put(g, tkParRi, ")")
-      skipParRi(n)
+        put(g, tkParRi, ")")
 
     of NegX:
       putWithSpace(g, tkOpr, $n.exprKind)
-      inc n
-      skip n
-      gsub(g, n)
-      skipParRi(n)
+      n.into:
+        skip n
+        gsub(g, n)
 
     of NotX:
       putWithSpace(g, tkOpr, $n.exprKind)
-      inc n
-      gsub(g, n)
-      skipParRi(n)
-
-    of ExprX:
-      inc n
-      var isFirst = true
-
-      var ncopy = n
-
-      var hasChildren = false
-      if n.hasMore:
-        skip ncopy
-        hasChildren = ncopy.hasMore
-
-      if hasChildren:
-        put(g, tkParLe, "(")
-      while n.hasMore:
-        if isFirst:
-          isFirst = false
-        else:
-          putWithSpace(g, tkSemiColon, ";")
+      n.into:
         gsub(g, n)
 
-      if hasChildren:
-        put(g, tkParRi, ")")
+    of ExprX:
+      n.into:
+        var isFirst = true
 
-      skipParRi(n)
+        var ncopy = n
+
+        var hasChildren = false
+        if n.hasMore:
+          skip ncopy
+          hasChildren = ncopy.hasMore
+
+        if hasChildren:
+          put(g, tkParLe, "(")
+        while n.hasMore:
+          if isFirst:
+            isFirst = false
+          else:
+            putWithSpace(g, tkSemiColon, ";")
+          gsub(g, n)
+
+        if hasChildren:
+          put(g, tkParRi, ")")
 
     of HderefX, HaddrX:
-      inc n
-      gsub(g, n)
-      skipParRi(n)
+      n.into:
+        gsub(g, n)
 
     of DerefX:
-      inc n
-      gsub(g, n)
-      put(g, tkOpr, "[]")
-      skipParRi(n)
+      n.into:
+        gsub(g, n)
+        put(g, tkOpr, "[]")
 
     of BaseobjX:
-      inc n
-      put(g, tkParLe, "(")
-      gtype(g, n, c)
-      put(g, tkParRi, ")")
+      n.into:
+        put(g, tkParLe, "(")
+        gtype(g, n, c)
+        put(g, tkParRi, ")")
 
-      skip n # levels
+        skip n # levels
 
-      put(g, tkParLe, "(")
-      gsub(g, n)
-      put(g, tkParRi, ")")
-      skipParRi(n)
+        put(g, tkParLe, "(")
+        gsub(g, n)
+        put(g, tkParRi, ")")
 
     of ConvX:
-      inc n
-      gtype(g, n, c)
-      put(g, tkParLe, "(")
-      gsub(g, n)
-      put(g, tkParRi, ")")
-      skipParRi(n)
+      n.into:
+        gtype(g, n, c)
+        put(g, tkParLe, "(")
+        gsub(g, n)
+        put(g, tkParRi, ")")
 
     of CchoiceX, OchoiceX:
-      inc n
-      gsub(g, n)
-      while n.hasMore:
-        skip n
-
-      skipParRi(n)
+      n.into:
+        gsub(g, n)
+        while n.hasMore:
+          skip n
 
     of HconvX, DconvX, HcallX:
-      inc n
-      skip n
-      gsub(g, n)
-      skipParRi(n)
+      n.into:
+        skip n
+        gsub(g, n)
 
     of DotX, DdotX:
-      inc n
-      gsub(g, n)
-      put(g, tkDot, ".")
-      gsub(g, n)
+      n.into:
+        gsub(g, n)
+        put(g, tkDot, ".")
+        gsub(g, n)
 
-      if n.hasMore:
-        # inheritance depth
-        skip n
-      if n.hasMore:
-        # access-token string lit (only for private fields)
-        skip n
-      skipParRi(n)
+        if n.hasMore:
+          # inheritance depth
+          skip n
+        if n.hasMore:
+          # access-token string lit (only for private fields)
+          skip n
 
     of PragmaxX:
       gpragmaBlock(g, n)
@@ -1985,95 +1944,91 @@ proc gsub(g: var SrcGen, n: var Cursor, c: Context, fromStmtList = false, isTopL
       skip n
 
     of ErrX:
-      put(g, tkStrLit, toString(n, false))
+      if renderIr in g.flags:
+        put(g, tkStrLit, toString(n, false))
+      else:
+        put(g, tkStrLit, errMsgFromCursor(n))
       skip n
 
     of QuotedX:
-      inc n
+      n.into:
+        let useSpace = isUseSpace(n)
+        put(g, tkAccent, "`")
 
-      let useSpace = isUseSpace(n)
-      put(g, tkAccent, "`")
-
-      var afterFirst = false
-      while n.hasMore:
-        if afterFirst:
-          if useSpace:
-            put(g, tkSpaces, Space)
-        else:
-          afterFirst = true
-        gsub(g, n, c)
-
-      put(g, tkAccent, "`")
-      skipParRi(n)
-
-    of TabconstrX:
-      inc n
-      put(g, tkCurlyLe, "{")
-
-      if n.hasMore:
         var afterFirst = false
         while n.hasMore:
           if afterFirst:
-            gcomma(g)
+            if useSpace:
+              put(g, tkSpaces, Space)
           else:
             afterFirst = true
+          gsub(g, n, c)
 
-          if n.substructureKind == KvU:
-            inc n
-            gsub(g, n, c)
-            putWithSpace(g, tkColon, ":")
-            gsub(g, n, c)
-            skipParRi(n)
-          else:
-            gsub(g, n, c)
-      else:
-        put(g, tkColon, ":")
+        put(g, tkAccent, "`")
 
-      put(g, tkCurlyRi, "}")
-      skipParRi(n)
+    of TabconstrX:
+      n.into:
+        put(g, tkCurlyLe, "{")
+
+        if n.hasMore:
+          var afterFirst = false
+          while n.hasMore:
+            if afterFirst:
+              gcomma(g)
+            else:
+              afterFirst = true
+
+            if n.substructureKind == KvU:
+              n.into:
+                gsub(g, n, c)
+                putWithSpace(g, tkColon, ":")
+                gsub(g, n, c)
+            else:
+              gsub(g, n, c)
+        else:
+          put(g, tkColon, ":")
+
+        put(g, tkCurlyRi, "}")
 
     of EnvpX:
-      inc n
-      put(g, tkSymbol, "envp")
-      put(g, tkParLe, "(")
-      gsub(g, n)
-      put g, tkComma, ","
-      gsub(g, n)
-      put(g, tkParRi, ")")
-      skipParRi(n)
+      n.into:
+        put(g, tkSymbol, "envp")
+        put(g, tkParLe, "(")
+        gsub(g, n)
+        put g, tkComma, ","
+        gsub(g, n)
+        put(g, tkParRi, ")")
 
     of CurlyatX:
-      inc n
-      gsub(g, n)
-      put(g, tkCurlyLe, "{")
-      gsub(g, n)
-      put(g, tkCurlyRi, "}")
-      while n.hasMore:
-        skip n
-      skipParRi(n)
+      n.into:
+        gsub(g, n)
+        put(g, tkCurlyLe, "{")
+        gsub(g, n)
+        put(g, tkCurlyRi, "}")
+        while n.hasMore:
+          skip n
 
     of ToClosureX:
-      inc n
-      put(g, tkSymbol, "toClosure")
-      put(g, tkParLe, "(")
-      gsub(g, n)
-      put(g, tkParRi, ")")
-      skipParRi(n)
+      n.into:
+        put(g, tkSymbol, "toClosure")
+        put(g, tkParLe, "(")
+        gsub(g, n)
+        put(g, tkParRi, ")")
 
-    of IsmainmoduleX,
+    of IsmainmoduleX, InstantiationinfoX,
         DoX, InternalTypeNameX, InternalFieldPairsX, FailedX:
       raiseAssert "todo"
 
   of IntLit:
-    put(g, tkIntLit, $pool.integers[n.intId])
+    put(g, tkIntLit, $n.intVal)
     inc n
   of UIntLit:
-    put(g, tkUIntLit, $pool.uintegers[n.uintId])
+    put(g, tkUIntLit, $n.uintVal)
     inc n
   of FloatLit:
-    put(g, tkFloatLit, $pool.floats[n.floatId])
+    put(g, tkFloatLit, $n.floatVal)
     inc n
-  of StringLit:
+  of StrLit:
     put(g, tkStrLit, toString(n, false))
     inc n
   of CharLit:
@@ -2083,25 +2038,22 @@ proc gsub(g: var SrcGen, n: var Cursor, c: Context, fromStmtList = false, isTopL
     put(g, tkCharLit, lit)
     inc n
   of Symbol:
-    var name = pool.syms[n.symId]
-    extractBasename(name)
+    var name = pool.symBasename(n.symId)
     put(g, tkSymbol, name, n.symId)
     inc n
   of SymbolDef:
-    var name = pool.syms[n.symId]
-    extractBasename(name)
+    var name = pool.symBasename(n.symId)
     put(g, tkSymbol, name, n.symId, isDef = true)
     inc n
   of Ident:
-    put(g, tkSymbol, pool.strings[n.litId])
+    put(g, tkSymbol, pool.strings[n.strId])
     inc n
   of DotToken:
     inc n
-  of ParRi:
-    discard "for illformed tokens"
   else:
+    # a scope end / illformed token; the `if not n.hasMore: return` at the top
+    # already caught the (virtual or real) close in both builds.
     inc n
-    raiseAssert "unreachable"
 
 proc gsub(g: var SrcGen; n: var Cursor, fromStmtList = false, isTopLevel = false) =
   var c: Context = initContext()
@@ -2118,43 +2070,37 @@ proc renderTree(n: Cursor, renderFlags: RenderFlags = {}, renderType = false): s
     gsub(g, n, isTopLevel = true)
   result = g.buf
   if result.len == 0:
-    result = toString(orig, false)
+    result = if isErrNode(orig): typeToString(orig, g.flags)
+             else: toString(orig, false)
 
 proc asNimCode*(n: Cursor; renderFlags: RenderFlags = {}): string =
-  var m0: PackedLineInfo = NoLineInfo
-  var m1: PackedLineInfo = NoLineInfo
-  var nested = 0
+  var m0: NifLineInfo = NoLineInfo
+  var m1: NifLineInfo = NoLineInfo
   var n2 = n
   var file0 = FileId 0
 
-  while true:
+  var togo = subtreeWidth(n2)  # tokens incl. suffixes; consume `tokenWidth` per step
+  while togo > 0:
     if n2.info.isValid:
-      let currentFile = getFileId(pool.man, n2.info)
+      let currentFile = n2.info.file
       if not m0.isValid:
         m0 = n2.info
         file0 = currentFile
       elif not m1.isValid and currentFile == file0:
         m1 = n2.info
-    case n2.kind
-    of ParLe:
-      inc nested
-    of ParRi:
-      dec nested
-    else:
-      discard
-    if nested == 0: break
-    inc n2
+    dec togo, tokenWidth(n2)
+    if togo > 0: inc n2
 
   when false: #if m0.isValid:
     if file0.isValid:
-      let (_, line0, col0) = unpack(pool.man, m0)
+      let (line0, col0) = (m0.line, m0.col)
       if m1.isValid:
-        let (_, line1, col1) = unpack(pool.man, m1)
-        result = extract(pool.files[file0],
+        let (line1, col1) = (m1.line, m1.col)
+        result = extract(pool.filenames[file0],
                         FilePosition(line: line0, col: col0),
                         FilePosition(line: line1, col: col1))
       else:
-        result = extract(pool.files[file0], FilePosition(line: line0, col: col0))
+        result = extract(pool.filenames[file0], FilePosition(line: line0, col: col0))
     else:
       result = ""
     var visible = false
@@ -2167,8 +2113,29 @@ proc asNimCode*(n: Cursor; renderFlags: RenderFlags = {}): string =
   else:
     result = renderTree(n, renderFlags = renderFlags)
 
+proc asNimCode*(s: SymId): string =
+  ## `asNimCode` for the cases where only the `SymId` is at hand and no cursor
+  ## points at the symbol's token. Produces exactly what the `Symbol` case of
+  ## the renderer produces: the name as it was written in the Nim source,
+  ## without Nimony's disambiguating suffix.
+  result = pool.symBasename(s)
+
 proc typeToString*(n: Cursor; renderFlags: RenderFlags = {}): string =
-  result = renderTree(n, renderFlags = renderFlags, renderType = true)
+  var typ = n
+  if isErrNode(typ):
+    if renderIr in renderFlags:
+      return toString(typ, false)
+    let payload = errPayload(typ)
+    if payload.isDotToken:
+      return "<type error>"
+    if isErrNode(payload):
+      return typeToString(payload, renderFlags)
+    typ = payload
+  result = renderTree(typ, renderFlags = renderFlags, renderType = true)
+
+proc typeExprToString*(n: Cursor): string {.inline.} =
+  ## Like `typeToString`, but always unwraps `(err …)` to the wrapped type.
+  typeToString(n)
 
 proc typeToSrcGen*(n: Cursor; renderFlags: RenderFlags = {}): SrcGen =
   ## Render a type expression and return both rendered buffer and token stream.

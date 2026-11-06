@@ -28,7 +28,12 @@ const
 
 
 when defined(windows):
-  proc GetLastError(): int32 {.importc, header: "<windows.h>", nodecl.}
+  # Bare kernel32 import (no `header: "<windows.h>"`): nimony emits the
+  # prototype and the linker binds the symbol, keeping the `system` translation
+  # unit header-free for the all-native target (see `system/panics`). `nodecl`
+  # is dropped along with the header so a prototype is actually emitted.
+  proc GetLastError(): int32 {.importc: "GetLastError", stdcall,
+                               dynlib: "kernel32".}
   const ERROR_BAD_EXE_FORMAT = 193
 
 proc nimLoadLibraryError(path: string) =
@@ -86,20 +91,17 @@ when defined(posix):
   # =========================================================================
   #
 
-  # c stuff:
-  when defined(linux) or defined(macosx):
-    const RTLD_NOW = cint(2)
-  else:
-    var
-      RTLD_NOW {.importc: "RTLD_NOW", header: "<dlfcn.h>".}: cint
+  # c stuff (values transcribed per OS; RTLD_NOW is 2 on both Linux and
+  # Darwin, RTLD_GLOBAL differs — 0x100 vs 0x8):
+  const RTLD_NOW = cint(2)
+  when defined(globalSymbols):
+    const RTLD_GLOBAL = (when defined(osx): cint(0x8) else: cint(0x100))
 
-  proc dlclose(lib: LibHandle) {.importc, header: "<dlfcn.h>".}
-  proc dlopen(path: cstring, mode: cint): LibHandle {.
-      importc, header: "<dlfcn.h>".}
-  proc dlsym(lib: LibHandle, name: cstring): ProcAddr {.
-      importc, header: "<dlfcn.h>".}
+  proc dlclose(lib: LibHandle) {.importc: "dlclose".}
+  proc dlopen(path: cstring, mode: cint): LibHandle {.importc: "dlopen".}
+  proc dlsym(lib: LibHandle, name: cstring): ProcAddr {.importc: "dlsym".}
 
-  proc dlerror(): cstring {.importc, header: "<dlfcn.h>".}
+  proc dlerror(): cstring {.importc: "dlerror".}
 
   proc nimUnloadLibrary(lib: LibHandle) =
     dlclose(lib)
@@ -135,13 +137,17 @@ elif defined(windows) or defined(dos):
     # TODO: use `importc: "HINSTANCE"` when available
     type
       THINSTANCE = pointer
+  # kernel32 imports without `<windows.h>`, keeping the `system` unit
+  # header-free (see `panics`). `dynlib` = static import library on every
+  # backend — these are the runtime loader's own bootstrap, so a static
+  # import-table entry is exactly what they need.
   proc getProcAddress(lib: THINSTANCE, name: cstring): ProcAddr {.
-      importc: "GetProcAddress", header: "<windows.h>", stdcall.}
+      importc: "GetProcAddress", stdcall, dynlib: "kernel32".}
 
   proc freeLibrary(lib: THINSTANCE) {.
-      importc: "FreeLibrary", header: "<windows.h>", stdcall.}
+      importc: "FreeLibrary", stdcall, dynlib: "kernel32".}
   proc winLoadLibrary(path: cstring): THINSTANCE {.
-      importc: "LoadLibraryA", header: "<windows.h>", stdcall.}
+      importc: "LoadLibraryA", stdcall, dynlib: "kernel32".}
 
   proc nimUnloadLibrary(lib: LibHandle) =
     freeLibrary(cast[THINSTANCE](lib))
@@ -155,27 +161,29 @@ elif defined(windows) or defined(dos):
     const decoratedLength = 250
     var decorated: array[decoratedLength, char] = default(array[decoratedLength, char])
     decorated[0] = '_'
-    var m = 1
+    var m: range[1 .. decoratedLength - 5] = 1
     while m < (decoratedLength - 5):
       if name[m - 1] == '\x00': break
       decorated[m] = name[m - 1]
       inc(m)
     decorated[m] = '@'
+    let at = m
     for i in 0..50:
+      # `@` then the decimal digits of `i * 4` (at most three) and a NUL
       var k = i * 4
+      var last = at + 3
       if k div 100 == 0:
         if k div 10 == 0:
-          m = m + 1
+          last = at + 1
         else:
-          m = m + 2
-      else:
-        m = m + 3
-      decorated[m + 1] = '\x00'
+          last = at + 2
+      decorated[last + 1] = '\x00'
+      var d: range[2 .. decoratedLength - 2] = last
       while true:
-        decorated[m] = chr(ord('0') + (k mod 10))   # k is always >= 0 here
-        dec(m)
+        decorated[d] = chr(ord('0') + (k mod 10))   # k is always >= 0 here
         k = k div 10
-        if k == 0: break
+        if k == 0 or d <= at + 1: break
+        d = d - 1
       result = getProcAddress(cast[THINSTANCE](lib), cast[cstring](addr decorated))
       if result != nil: return
     procAddrError(name)
@@ -210,7 +218,19 @@ elif defined(nintendoswitch) or defined(freertos) or defined(zephyr) or defined(
     die(1)
 
 else:
-  die "no implementation for dyncalls"
+  # Freestanding targets without dynamic loading (standalone, wasm32, …):
+  # same loud-stub shape as the embedded arm above — the symbols exist so
+  # generic code links, and any actual use aborts with a message.
+  proc nimLoadLibrary(path: cstring): LibHandle {.exportc: "nimLoadLibrary".} =
+    writeErr("nimLoadLibrary not implemented")
+    writeErr("\n")
+    die(1)
+
+  proc nimGetProcAddr(lib: LibHandle, name: cstring): ProcAddr {.exportc: "nimGetProcAddr"} =
+    writeErr("nimGetProcAddr not implemented")
+    writeErr(name)
+    writeErr("\n")
+    die(1)
 
 proc nimDynlibLoadStep(prev: LibHandle; cand: cstring): LibHandle {.exportc: "nimDynlibLoadStep".} =
   ## One step of a compile-time-expanded dynlib name pattern: keep the first

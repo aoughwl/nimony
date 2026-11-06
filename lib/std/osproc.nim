@@ -11,8 +11,10 @@
 ## processes and process communication.
 ##
 ## This is the Nimony port. Compared to the upstream Nim module the POSIX
-## path uses `posix_spawn` exclusively (no useClone/useFork fallback) and the
-## timeout path of `waitForExit` uses a busy-wait with `nanosleep`.
+## path uses `posix_spawn` on illumos and `fork` + `execve` elsewhere.
+## On illumos, launch errors are reported synchronously as `OSError` rather
+## than as a child exiting with status 127. The timeout path of `waitForExit`
+## uses a busy-wait with `nanosleep`.
 ##
 ## **See also:**
 ## * `os module <os.html>`_
@@ -181,179 +183,208 @@ when not defined(windows):
     if a == nil: return
     while a[result] != nil: inc result
 
+  proc resolveExecPaths(command: string; usePath: bool): seq[string] =
+    ## Builds the candidate executable paths BEFORE forking. A forked child of
+    ## a multithreaded parent may only do async-signal-safe work (another
+    ## thread can hold the allocator lock at fork time), so all PATH searching
+    ## and string building happens here, in the parent; the child just walks
+    ## the prebuilt list calling bare `execve`.
+    result = @[]
+    var hasSlash = false
+    for ch in command.items:
+      if ch == '/':
+        hasSlash = true
+        break
+    if hasSlash or not usePath:
+      result.add command
+      return
+    var path = getEnv("PATH")
+    if path.len == 0:
+      path = "/bin:/usr/bin"
+    var start = 0
+    var i = 0
+    while i <= path.len:
+      if i == path.len or path[i] == ':':
+        let dir = if i > start: path.substr(start, i-1) else: "."
+        result.add dir & "/" & command
+        start = i + 1
+      inc i
+
+  type
+    LaunchState = object
+      pipes: array[3, array[2, cint]]
+      args, env, paths: cstringArray
+
+  proc cleanup(s: var LaunchState) =
+    for i in 0 ..< 3:
+      for j in 0 ..< 2:
+        if s.pipes[i][j] >= 0:
+          discard close(s.pipes[i][j])
+          s.pipes[i][j] = -1
+    deallocCStringArray(s.args, countCStringArray(s.args))
+    deallocCStringArray(s.env, countCStringArray(s.env))
+    deallocCStringArray(s.paths, countCStringArray(s.paths))
+
+  proc createPipes(s: var LaunchState) {.raises.} =
+    for i in 0 ..< 3:
+      when defined(illumos):
+        # Atomic CLOEXEC prevents another concurrent launch inheriting our
+        # parent ends and keeping a stream alive after its owner closes it.
+        let rc = pipe2(addr s.pipes[i][0], O_CLOEXEC)
+      else:
+        let rc = pipe(addr s.pipes[i][0])
+      if rc != 0:
+        raiseOSError(osLastError())
+      when defined(illumos):
+        # File actions must not overwrite a source or later close a dup2
+        # target when the caller started with a standard descriptor closed.
+        for j in 0 ..< 2:
+          if s.pipes[i][j] <= 2:
+            let fd = fcntl(s.pipes[i][j], F_DUPFD_CLOEXEC, 3'i32)
+            if fd < 0:
+              raiseOSError(osLastError())
+            discard close(s.pipes[i][j])
+            s.pipes[i][j] = fd
+
+  when defined(illumos):
+    proc checkSpawn(rc: cint) {.raises.} =
+      if rc != 0:
+        raiseOSError(OSErrorCode(rc))
+
+    proc spawnProcess(s: var LaunchState; workingDir: string;
+                      options: set[ProcessOption]): Pid {.raises.} =
+      result = Pid(-1)
+      var actions = SpawnFileActions()
+      var attr = SpawnAttr()
+      checkSpawn posix_spawn_file_actions_init(actions)
+      try:
+        checkSpawn posix_spawnattr_init(attr)
+        try:
+          if poParentStreams notin options:
+            checkSpawn posix_spawn_file_actions_adddup2(actions, s.pipes[0][readIdx], 0)
+            checkSpawn posix_spawn_file_actions_adddup2(actions, s.pipes[1][writeIdx], 1)
+            let errfd = if poStdErrToStdOut in options: s.pipes[1][writeIdx]
+                        else: s.pipes[2][writeIdx]
+            checkSpawn posix_spawn_file_actions_adddup2(actions, errfd, 2)
+            for i in 0 ..< 3:
+              for j in 0 ..< 2:
+                checkSpawn posix_spawn_file_actions_addclose(actions, s.pipes[i][j])
+          var wd = workingDir
+          if wd.len > 0:
+            checkSpawn posix_spawn_file_actions_addchdir(actions, wd.toCString)
+          if poDaemon in options:
+            checkSpawn posix_spawnattr_setpgroup(attr, Pid(0))
+            checkSpawn posix_spawnattr_setflags(attr, POSIX_SPAWN_SETPGROUP)
+          var rc = ENOENT
+          var denied = false
+          for i in 0 ..< countCStringArray(s.paths):
+            let candidate: cstring = s.paths[i]
+            if candidate != nil:
+              rc = posix_spawn(result, candidate, addr actions, addr attr,
+                               cast[CCharArray](s.args), cast[CCharArray](s.env))
+            if rc == 0:
+              return
+            # Only lookup failures justify trying the next PATH candidate.
+            # No shell fallback on ENOEXEC; use poEvalCommand explicitly.
+            if rc == EACCES:
+              denied = true
+            elif rc != ENOENT and rc != ENOTDIR:
+              checkSpawn(rc)
+          if denied: rc = EACCES
+          checkSpawn(rc)
+        finally:
+          discard posix_spawnattr_destroy(attr)
+      finally:
+        discard posix_spawn_file_actions_destroy(actions)
+  else:
+    proc forkProcess(s: var LaunchState; workingDir: string;
+                     options: set[ProcessOption]): Pid {.raises.} =
+      let argvC = cast[CCharArray](s.args)
+      let envpC = cast[CCharArray](s.env)
+      let nPaths = countCStringArray(s.paths)
+      var wd = workingDir
+      result = fork()
+      if result == Pid(0):
+        # Child: only async-signal-safe work from here to execve/_exit.
+        if poParentStreams notin options:
+          discard dup2(s.pipes[0][readIdx], 0'i32)
+          discard dup2(s.pipes[1][writeIdx], 1'i32)
+          if poStdErrToStdOut in options:
+            discard dup2(s.pipes[1][writeIdx], 2'i32)
+          else:
+            discard dup2(s.pipes[2][writeIdx], 2'i32)
+          for i in 0 ..< 3:
+            for j in 0 ..< 2:
+              discard close(s.pipes[i][j])
+        if poDaemon in options:
+          discard setpgid(Pid(0), Pid(0))
+        if wd.len > 0 and chdir(wd.toCString) != 0'i32:
+          exitnow(127'i32)
+        for k in 0 ..< nPaths:
+          let cand: cstring = s.paths[k]
+          if cand != nil:
+            discard execve(cand, argvC, envpC)
+        exitnow(127'i32)
+      if result.int < 0:
+        raiseOSError(osLastError())
+
   proc startProcess*(command: string; workingDir: string = "";
                      args: openArray[string] = [];
                      env: nil StringTableRef = nil;
                      options: set[ProcessOption] = {poStdErrToStdOut}):
       Process {.raises, tags: [ExecIOEffect, ReadEnvEffect, RootEffect].} =
-    var pStdin {.noinit.}: array[0..1, cint]
-    var pStdout {.noinit.}: array[0..1, cint]
-    var pStderr {.noinit.}: array[0..1, cint]
-
-    if poParentStreams notin options:
-      if pipe(addr pStdin[0]) != 0'i32 or pipe(addr pStdout[0]) != 0'i32 or
-         pipe(addr pStderr[0]) != 0'i32:
-        raiseOSError(osLastError())
-
-    # Build argv
-    var argsRaw: seq[string]
-    var syscmd: string
-    if poEvalCommand in options:
-      const useShPath = "/bin/sh"
-      syscmd = useShPath
-      argsRaw = @[useShPath, "-c", command]
-      assert args.len == 0,
-        "`args` has to be empty when using poEvalCommand."
-    else:
-      syscmd = command
-      argsRaw = @[command]
-      for a in args.items:
-        argsRaw.add a
-
-    let sysArgs = allocCStringArray(argsRaw)
-    let sysEnv =
-      if env == nil: envToCStringArray()
-      else: envToCStringArray(env)
-
-    var pid: Pid = Pid 0
-    when defined(nimNativeIo):
-      # Freestanding: no posix_spawn (libc-only). Use fork + exec (raw syscalls).
-      if poEchoCmd in options:
-        echo command, " ", joinArgs(args, " ")
-      let argvC = cast[CCharArray](sysArgs)
-      let envpC = cast[CCharArray](sysEnv)
-      var wd = workingDir
-      pid = fork()
-      if pid == Pid(0):
-        # --- child: wire up the pipe ends, optional chdir/pgroup, then exec ---
-        if poParentStreams notin options:
-          discard dup2(pStdin[readIdx], 0'i32)
-          discard dup2(pStdout[writeIdx], 1'i32)
-          if poStdErrToStdOut in options:
-            discard dup2(pStdout[writeIdx], 2'i32)
-          else:
-            discard dup2(pStderr[writeIdx], 2'i32)
-          discard close(pStdin[readIdx]); discard close(pStdin[writeIdx])
-          discard close(pStdout[readIdx]); discard close(pStdout[writeIdx])
-          discard close(pStderr[readIdx]); discard close(pStderr[writeIdx])
-        if poDaemon in options:
-          discard setpgid(Pid(0), Pid(0))
-        if wd.len > 0 and chdir(wd.toCString) != 0'i32:
-          exitnow(127'i32)
-        if poUsePath in options:
-          discard execvp(syscmd.toCString, argvC)
-        else:
-          discard execve(syscmd.toCString, argvC, envpC)
-        exitnow(127'i32)   # reached only if exec failed
-      # --- parent ---
-      deallocCStringArray(sysArgs, argsRaw.len)
-      deallocCStringArray(sysEnv, countCStringArray(sysEnv))
-      if pid.int < 0:
-        raiseOSError(osLastError())
-    else:
-      var fops: Tposix_spawn_file_actions = default(Tposix_spawn_file_actions)
-      var attr: Tposix_spawnattr = default(Tposix_spawnattr)
-
-      proc cleanup(sysArgs, sysEnv: cstringArray; argsLen: int;
-                   fops: var Tposix_spawn_file_actions;
-                   attr: var Tposix_spawnattr) =
-        discard posix_spawn_file_actions_destroy(fops)
-        discard posix_spawnattr_destroy(attr)
-        deallocCStringArray(sysArgs, argsLen)
-        deallocCStringArray(sysEnv, countCStringArray(sysEnv))
-
-      var chckErr = posix_spawn_file_actions_init(fops)
-      if chckErr != 0'i32:
-        cleanup(sysArgs, sysEnv, argsRaw.len, fops, attr)
-        raiseOSError(OSErrorCode(chckErr))
-      chckErr = posix_spawnattr_init(attr)
-      if chckErr != 0'i32:
-        cleanup(sysArgs, sysEnv, argsRaw.len, fops, attr)
-        raiseOSError(OSErrorCode(chckErr))
-
-      var mask: Sigset = default(Sigset)
-      discard sigemptyset(mask)
-      discard posix_spawnattr_setsigmask(attr, mask)
-
-      if poDaemon in options:
-        discard posix_spawnattr_setpgroup(attr, Pid 0)
-
-      var flags: cshort = cshort(0x08)    # POSIX_SPAWN_SETSIGMASK
-      if poDaemon in options:
-        flags = flags or cshort(0x02)     # POSIX_SPAWN_SETPGROUP
-      discard posix_spawnattr_setflags(attr, flags)
-
+    var s = LaunchState(pipes: [[-1'i32, -1'i32], [-1'i32, -1'i32],
+                                [-1'i32, -1'i32]],
+                        args: nil, env: nil, paths: nil)
+    try:
+      var argsRaw: seq[string]
+      var syscmd: string
+      if poEvalCommand in options:
+        syscmd = "/bin/sh"
+        argsRaw = @[syscmd, "-c", command]
+        assert args.len == 0,
+          "`args` has to be empty when using poEvalCommand."
+      else:
+        syscmd = command
+        argsRaw = @[command]
+        for a in args.items:
+          argsRaw.add a
+      s.args = allocCStringArray(argsRaw)
+      s.env = if env == nil: envToCStringArray() else: envToCStringArray(env)
+      # Both backends use the parent's PATH, even with a custom environment.
+      var execPaths = resolveExecPaths(syscmd,
+          poUsePath in options and poEvalCommand notin options)
+      when defined(android):
+        if poEvalCommand in options:
+          # Termux provides /bin/sh; plain Android app sandboxes only have
+          # /system/bin/sh, so let the child fall back to the system shell.
+          execPaths.add "/system/bin/sh"
+      s.paths = allocCStringArray(execPaths)
       if poParentStreams notin options:
-        discard posix_spawn_file_actions_addclose(fops, pStdin[writeIdx])
-        discard posix_spawn_file_actions_adddup2(fops, pStdin[readIdx],
-                                                 cint(readIdx))
-        discard posix_spawn_file_actions_addclose(fops, pStdout[readIdx])
-        discard posix_spawn_file_actions_adddup2(fops, pStdout[writeIdx],
-                                                 cint(writeIdx))
-        discard posix_spawn_file_actions_addclose(fops, pStderr[readIdx])
-        if poStdErrToStdOut in options:
-          discard posix_spawn_file_actions_adddup2(fops, pStdout[writeIdx],
-                                                   2'i32)
-        else:
-          discard posix_spawn_file_actions_adddup2(fops, pStderr[writeIdx],
-                                                   2'i32)
-
-      # posix_spawn inherits cwd: chdir manually around the spawn.
-      var savedCwd = ""
-      if workingDir.len > 0:
-        savedCwd = getCurrentDir()
-        var wd = workingDir
-        if chdir(wd.toCString) != 0'i32:
-          cleanup(sysArgs, sysEnv, argsRaw.len, fops, attr)
-          raiseOSError(osLastError())
-
+        createPipes(s)
       if poEchoCmd in options:
         echo command, " ", joinArgs(args, " ")
-
-      var res: cint = 0'i32
-      let argvC = cast[CCharArray](sysArgs)
-      let envpC = cast[CCharArray](sysEnv)
-      if poUsePath in options:
-        res = posix_spawnp(pid, syscmd.toCString, fops, attr, argvC, envpC)
+      when defined(illumos):
+        let pid = spawnProcess(s, workingDir, options)
       else:
-        res = posix_spawn(pid, syscmd.toCString, fops, attr, argvC, envpC)
+        let pid = forkProcess(s, workingDir, options)
 
-      discard posix_spawn_file_actions_destroy(fops)
-      discard posix_spawnattr_destroy(attr)
-
-      if savedCwd.len > 0:
-        var cwd = savedCwd
-        discard chdir(cwd.toCString)
-
-      deallocCStringArray(sysArgs, argsRaw.len)
-      deallocCStringArray(sysEnv, countCStringArray(sysEnv))
-
-      if res != 0'i32:
-        raiseOSError(OSErrorCode(res))
-
-    result = Process(options: options, exitFlag: false, id: pid,
-                     inHandle: 0'i32, outHandle: 0'i32, errHandle: 0'i32,
-                     inStream: nil, outStream: nil, errStream: nil,
-                     exitStatus: 0'i32)
-
-    if poParentStreams in options:
-      result.inHandle = 0'i32
-      result.outHandle = 1'i32
+      result = Process(options: options, exitFlag: false, id: pid,
+                       inHandle: 0'i32, outHandle: 1'i32, errHandle: 2'i32,
+                       inStream: nil, outStream: nil, errStream: nil,
+                       exitStatus: 0'i32)
+      if poParentStreams notin options:
+        result.inHandle = s.pipes[0][writeIdx]
+        result.outHandle = s.pipes[1][readIdx]
+        s.pipes[0][writeIdx] = -1
+        s.pipes[1][readIdx] = -1
+        if poStdErrToStdOut notin options:
+          result.errHandle = s.pipes[2][readIdx]
+          s.pipes[2][readIdx] = -1
       if poStdErrToStdOut in options:
         result.errHandle = result.outHandle
-      else:
-        result.errHandle = 2'i32
-    else:
-      result.inHandle = pStdin[writeIdx]
-      result.outHandle = pStdout[readIdx]
-      if poStdErrToStdOut in options:
-        result.errHandle = result.outHandle
-        discard close(pStderr[readIdx])
-      else:
-        result.errHandle = pStderr[readIdx]
-      discard close(pStderr[writeIdx])
-      discard close(pStdin[readIdx])
-      discard close(pStdout[writeIdx])
+    finally:
+      cleanup(s)
 
   proc close*(p: Process) {.raises, tags: [WriteIOEffect].} =
     if poParentStreams notin p.options:
@@ -475,9 +506,13 @@ when not defined(windows):
         of fmRead: cstring"rb"
         of fmWrite: cstring"wb"
         else: cstring"rb"
-      proc c_fdopen(fd: cint; mode: cstring): File {.
-        importc: "fdopen", header: "<stdio.h>".}
-      f = c_fdopen(handle, modeC)
+      # Declared to byte-match libc's `FILE *fdopen(int, const char *)`:
+      # under useLibc, syncio's `File` still carries <stdio.h>, so the real
+      # prototype is in scope in this TU and any deviation (even Nimony's
+      # unsigned-char `cstring`) is a conflicting redeclaration.
+      type ConstChar {.importc: "const char", nodecl.} = int8
+      proc c_fdopen(fd: cint; mode: nil ptr ConstChar): File {.importc: "fdopen".}
+      f = c_fdopen(handle, cast[ptr ConstChar](modeC))
       if f == nil:
         raiseOSError(osLastError())
     result = newFileStream(f)
@@ -500,24 +535,16 @@ when not defined(windows):
       p.errStream = createStream(p.errHandle, fmRead)
     result = p.errStream
 
-  when not defined(nimNativeIo):
-    proc csystem(cmd: cstring): cint {.nodecl, importc: "system",
-                                       header: "<stdlib.h>".}
-
   proc execCmd*(command: string): int {.raises,
       tags: [ExecIOEffect, ReadIOEffect, RootEffect].} =
     ## Executes `command` and returns its error code.
-    when defined(nimNativeIo):
-      # Freestanding: no libc `system()`. Run via /bin/sh -c with inherited
-      # standard streams (matching `system()` semantics) and wait.
-      var p = startProcess(command,
-        options = {poEvalCommand, poParentStreams, poUsePath})
-      result = waitForExit(p)
-      close(p)
-    else:
-      var cmd = command
-      let tmp = csystem(cmd.toCString)
-      result = if tmp == -1: tmp else: exitStatusLikeShell(tmp)
+    # Run via the platform shell's `-c` with inherited standard streams and
+    # wait — the semantics of libc `system()`, over the same launch backend as
+    # startProcess (no libc `system` binding needed).
+    var p = startProcess(command,
+      options = {poEvalCommand, poParentStreams, poUsePath})
+    result = waitForExit(p)
+    close(p)
 
 # ---------------------------------------------------------------------------
 # Windows backend

@@ -17,7 +17,7 @@
 ## Note: NIF `#comment#` decorations are not carried into the token buffer —
 ## the codegen path has no use for them.
 
-import std / assertions
+import std / [assertions, math]
 import nifcore
 import nifreader as rd
 import nifbuilder
@@ -25,6 +25,11 @@ import stringviews
 import lineinfos  # for `==`(FileId) used by NifLineInfo's structural `==`
 
 export nifcore
+import comesfrom
+# Travels with the reader for the same reason it travels with the pool API:
+# any consumer of a line-info filename may need `realFile` to strip the
+# template-expansion provenance the front end forged into it.
+export comesfrom
 
 type
   Parent = tuple[file: FileId; line, col: int32]
@@ -49,6 +54,103 @@ proc resolveInfo(b: var TokenBuf; tok: rd.ExpandedToken;
                          col:  p.col + tok.pos.col,
                          comment: comment)
 
+proc peekRootInfo*(r: var rd.Reader; pool: Pool): NifLineInfo =
+  ## Absolute line info of the next token — typically a module's toplevel
+  ## `(stmts)` head, which carries the file explicitly — without consuming it.
+  ## Index-jumped decl reads pass this as `parse`'s `parentSeed` so their
+  ## file-less child position deltas resolve against the module root (a decl's
+  ## parent in the original tree IS the toplevel `(stmts)` node).
+  let start = rd.offset(r)
+  var tok = default(rd.ExpandedToken)
+  rd.next(r, tok)
+  if tok.filename.len != 0:
+    result = NifLineInfo(file: pool.filenames.getOrIncl(rd.decodeFilename(tok)),
+                         line: tok.pos.line, col: tok.pos.col)
+  else:
+    result = NoNifLineInfo
+  rd.jumpTo(r, start)
+
+proc internPart(b: var TokenBuf; r: rd.Reader; t: rd.ExpandedToken): StrId =
+  ## One component of a split symbol, interned. When the bytes ARE the value --
+  ## no escape, no module suffix to append, which is the overwhelming case --
+  ## they go into the string pool straight from the reader's mapped file.
+  if rd.needsDecoding(t):
+    b.pool.strings.getOrIncl(rd.decodeStr(r, t))
+  else:
+    b.pool.strings.getOrInclFromView(t.data)
+
+proc addSplitSymbol(b: var TokenBuf; r: var rd.Reader;
+                    head: rd.ExpandedToken; isDef: bool) =
+  ## Emit the symbol whose `<name>` is `head` and whose remaining components
+  ## follow it as `ExtendedSuffix` tokens (see `nifreader.splitSymbols`). The
+  ## pool stores exactly those components, so the common shape is interned
+  ## straight from the reader's bytes: the spelling is never assembled and
+  ## never parsed back apart.
+  ##
+  ## Three shapes fall back to handing `symId` a spelling, because only it can
+  ## decide where the name ends: a disambiguator that is not a number, a name
+  ## carrying two keys (`foo.0.Ia.Ib.mod`), and one short enough to live inside
+  ## the token, which the pool must not gain an entry for.
+  var disambTok = default(rd.ExpandedToken)
+  var dedupTok = default(rd.ExpandedToken)
+  var moduleTok = default(rd.ExpandedToken)
+  var dedupStr = ""
+  var dedups = 0
+  var hasDisamb = false
+  var rawLen = head.data.len
+  for _ in 1 .. int(head.suffixes):
+    var t = default(rd.ExpandedToken)
+    rd.next(r, t)
+    rawLen += 1 + t.data.len
+    case t.part
+    of rd.SymDisamb:
+      disambTok = t
+      hasDisamb = true
+    of rd.SymDedup:
+      inc dedups
+      if dedups == 1:
+        dedupTok = t
+      else:
+        if dedups == 2: dedupStr = rd.decodeStr(r, dedupTok)
+        dedupStr.add '.'
+        dedupStr.add rd.decodeStr(r, t)
+    of rd.SymModule:
+      moduleTok = t
+
+  var disamb = -1
+  var disambText = ""
+  if hasDisamb:
+    disambText = rd.decodeStr(r, disambTok)  # 1-3 bytes, and the value is needed
+    disamb = parseDisamb(disambText, 0, disambText.len)
+
+  # `rawLen` is an upper bound on the spelling (an escape shrinks, and a module
+  # suffix to expand only ever grows it past this test anyway), so it is a sound
+  # way to ask "could this fit inside the token?".
+  if (hasDisamb and disamb < 0) or dedups > 1 or rawLen <= StrInlineMaxLen:
+    var spelling = rd.decodeStr(r, head)
+    if hasDisamb:
+      spelling.add '.'
+      spelling.add disambText
+    if dedups == 1:
+      spelling.add '.'
+      spelling.add rd.decodeStr(r, dedupTok)
+    elif dedups > 1:
+      spelling.add '.'
+      spelling.add dedupStr
+    if moduleTok.tk == ExtendedSuffix:
+      spelling.add '.'
+      spelling.add rd.decodeStr(r, moduleTok)
+    if isDef: b.addSymDef spelling else: b.addSymUse spelling
+    return
+
+  var s = NifSymbol(name: internPart(b, r, head), disamb: int32(disamb),
+                    dedup: StrId(0), module: StrId(0))
+  if not hasDisamb: s.disamb = NoDisamb
+  if dedups == 1: s.dedup = internPart(b, r, dedupTok)
+  if moduleTok.tk == ExtendedSuffix: s.module = internPart(b, r, moduleTok)
+  let id = symId(b.pool, s)
+  if isDef: b.addSymDef id else: b.addSymUse id
+
 proc parse*(r: var rd.Reader; b: var TokenBuf;
             parentSeed: NifLineInfo = NoNifLineInfo;
             denseLineInfo = false) =
@@ -58,6 +160,10 @@ proc parse*(r: var rd.Reader; b: var TokenBuf;
   ## compound's parent info; whole-file reads pass `NoNifLineInfo`).
   ## With `denseLineInfo`, every positioned value receives its effective
   ## location instead of only changes in the location stream.
+  # Symbols arrive taken apart, so their components go into the pool directly
+  # (see `readSymbol`). Idempotent, and `jumpTo` drops any components a caller
+  # skipped over.
+  rd.splitSymbols(r)
   var parents = @[(file: parentSeed.file, line: parentSeed.line,
                    col: parentSeed.col)]
   var last = NoNifLineInfo
@@ -70,10 +176,16 @@ proc parse*(r: var rd.Reader; b: var TokenBuf;
   while true:
     rd.next(r, tok)
     case tok.tk
-    of rd.EofToken, rd.UnknownToken:
+    of rd.EofToken, rd.UnknownToken, TagLit, ExtendedSuffix, LineInfoLit:
+      # `TagLit`/`LineInfoLit` are binary-only kinds the textual reader never
+      # yields. An `ExtendedSuffix` never reaches HERE either: `readSymbol`
+      # consumes a split symbol's components as part of the symbol.
       break
     of rd.ParLe:
       let info = resolveInfo(b, tok, parents)
+      # No escape handling here: `openTag` folds an id that does not fit the
+      # 9-bit tag field into the adapter's escape tag by itself, and the
+      # line-info suffix lands on the head either way.
       b.openTag b.tags.tags.getOrInclFromView(tok.data)
       emit info
       parents.add (info.file, info.line, info.col)
@@ -90,10 +202,14 @@ proc parse*(r: var rd.Reader; b: var TokenBuf;
       b.addIdent rd.decodeStr(r, tok); emit info
     of rd.Symbol:
       let info = resolveInfo(b, tok, parents)
-      b.addSymUse rd.decodeStr(r, tok); emit info
+      if tok.suffixes > 0'u8: addSplitSymbol(b, r, tok, isDef = false)
+      else: b.addSymUse rd.decodeStr(r, tok)
+      emit info
     of rd.SymbolDef:
       let info = resolveInfo(b, tok, parents)
-      b.addSymDef rd.decodeStr(r, tok); emit info
+      if tok.suffixes > 0'u8: addSplitSymbol(b, r, tok, isDef = true)
+      else: b.addSymDef rd.decodeStr(r, tok)
+      emit info
     of rd.StringLit:
       let info = resolveInfo(b, tok, parents)
       b.addStrLit rd.decodeStr(r, tok); emit info
@@ -136,6 +252,7 @@ proc parseFromFile*(filename: string; sizeHint = 100;
   discard rd.processDirectives(r)
   result = createTokenBuf(sizeHint, sharedPool, sharedTags)
   parse(r, result, denseLineInfo = denseLineInfo)
+  rd.close(r)   # the reader mmaps the file; a leak keeps it locked on Windows
 
 proc parseFromFile*(filename: string; unusedName: var string;
                     sizeHint = 100; sharedPool: Pool = nil;
@@ -147,6 +264,7 @@ proc parseFromFile*(filename: string; unusedName: var string;
   unusedName = r.firstUnusedName
   result = createTokenBuf(sizeHint, sharedPool, sharedTags)
   parse(r, result, denseLineInfo = denseLineInfo)
+  rd.close(r)
 
 # ── toString ─────────────────────────────────────────────────────────────
 
@@ -172,6 +290,23 @@ proc emitRelLineInfo(bld: var Builder; abs, parent: NifLineInfo; pool: Pool;
   if emitComment and uint32(abs.comment) != 0'u32:
     bld.attachComment(pool.strings[abs.comment])
 
+proc emitFloatLit(bld: var Builder; v: float64; abs, parent: NifLineInfo;
+                  pool: Pool) =
+  ## `nifbuilder` spells a non-finite float as a compound -- `(inf)`, `(nan)`,
+  ## `(neginf)` -- and a line-info suffix may only follow an atom or a tag
+  ## *name*. Attached after the closing `)` it is not NIF: the reader stops
+  ## there and the rest of the module is lost. So the compound is written
+  ## here, with the suffix on its tag.
+  let fc = classify(v)
+  case fc
+  of fcInf, fcNan, fcNegInf:
+    bld.addTree(if fc == fcInf: "inf" elif fc == fcNan: "nan" else: "neginf")
+    emitRelLineInfo(bld, abs, parent, pool)
+    bld.endTree()
+  else:
+    bld.addFloatLit(v)
+    emitRelLineInfo(bld, abs, parent, pool)
+
 proc emitValueWithLineInfo(bld: var Builder; c: var Cursor;
                            cur: var NifLineInfo;
                            parents: var seq[NifLineInfo];
@@ -186,10 +321,12 @@ proc emitValueWithLineInfo(bld: var Builder; c: var Cursor;
     cur.comment = StrId(0)   # a comment is a one-shot decoration, never inherited
   case c.kind
   of TagLit:
-    bld.addTree(tags.tags[c.cursorTagId])
+    let escaped = isEscapedTag(c)
+    bld.addTree(tags.tags[resolvedTagId(c)])
     emitRelLineInfo(bld, abs, parents[^1], pool)
     parents.add abs
     c.into:
+      if escaped: c.inc               # the escaped id IS the tag name above
       while c.hasMore:
         emitValueWithLineInfo(bld, c, cur, parents, tags, pool)
     discard parents.pop()
@@ -225,10 +362,9 @@ proc emitValueWithLineInfo(bld: var Builder; c: var Cursor;
     emitRelLineInfo(bld, abs, parents[^1], pool)
     c.inc
   of FloatLit:
-    bld.addFloatLit(floatVal(c))
-    emitRelLineInfo(bld, abs, parents[^1], pool)
+    emitFloatLit(bld, floatVal(c), abs, parents[^1], pool)
     c.inc
-  of ExtendedSuffix, LineInfoLit:
+  of ExtendedSuffix, LineInfoLit, UnknownToken, EofToken, ParLe, ParRi:
     assert false, "suffix token is not a value head"
 
 proc emitValueWithoutLineInfo(bld: var Builder; c: var Cursor;
@@ -236,8 +372,10 @@ proc emitValueWithoutLineInfo(bld: var Builder; c: var Cursor;
   ## Fast diagnostic serializer: no location decoding or parent stack.
   case c.kind
   of TagLit:
-    bld.addTree(tags.tags[c.cursorTagId])
+    let escaped = isEscapedTag(c)
+    bld.addTree(tags.tags[resolvedTagId(c)])
     c.into:
+      if escaped: c.inc
       while c.hasMore:
         emitValueWithoutLineInfo(bld, c, tags, pool)
     bld.endTree()
@@ -259,7 +397,7 @@ proc emitValueWithoutLineInfo(bld: var Builder; c: var Cursor;
     bld.addUIntLit(uintVal(c)); c.inc
   of FloatLit:
     bld.addFloatLit(floatVal(c)); c.inc
-  of ExtendedSuffix, LineInfoLit:
+  of ExtendedSuffix, LineInfoLit, UnknownToken, EofToken, ParLe, ParRi:
     assert false, "suffix token is not a value head"
 
 proc appendTo*(b: var TokenBuf; dest: var Builder;
@@ -319,10 +457,12 @@ proc emitValueIndexed(bld: var Builder; c: var Cursor; cur: var NifLineInfo;
   case c.kind
   of TagLit:
     mostRecentOffset = bld.offset            # offset of this `(`
-    bld.addTree(tags.tags[c.cursorTagId])
+    let escaped = isEscapedTag(c)
+    bld.addTree(tags.tags[resolvedTagId(c)])
     emitRelLineInfo(bld, abs, parents[^1], pool)
     parents.add abs
     c.into:
+      if escaped: c.inc
       while c.hasMore:
         emitValueIndexed(bld, c, cur, parents, tags, pool, index, dottedSuffix,
                          mostRecentOffset, previousOffset, rootInfo)
@@ -362,23 +502,30 @@ proc emitValueIndexed(bld: var Builder; c: var Cursor; cur: var NifLineInfo;
   of UIntLit:
     bld.addUIntLit(uintVal(c)); emitRelLineInfo(bld, abs, parents[^1], pool); c.inc
   of FloatLit:
-    bld.addFloatLit(floatVal(c)); emitRelLineInfo(bld, abs, parents[^1], pool); c.inc
-  of ExtendedSuffix, LineInfoLit:
+    emitFloatLit(bld, floatVal(c), abs, parents[^1], pool); c.inc
+  of ExtendedSuffix, LineInfoLit, UnknownToken, EofToken, ParLe, ParRi:
     assert false, "suffix token is not a value head"
 
-proc toModuleString*(b: var TokenBuf; dottedSuffix = ""; sizeHint = 0): string =
+proc toModuleString*(b: var TokenBuf; dottedSuffix = ""; sizeHint = 0;
+                     compact = false): string =
   ## Like `toString` but emits a full module file: the `(.nif27)` header with a
   ## patched `.indexat`, the body, and a trailing `(.index …)` mapping each global
   ## SymbolDef to its declaration's byte offset. `dottedSuffix` (e.g. `.mymod`)
   ## compresses self-module symbol suffixes to a trailing dot (the reader re-
   ## expands via its `thisModule`). Mirrors `nifstreams.toModuleString` so the
   ## output is byte-compatible with the canonical tooling (`reindex`).
-  var bld = nifbuilder.open(if sizeHint > 0: sizeHint else: b.len * 20)
+  ##
+  ## `compact` drops the layout whitespace (`nifbuilder`'s compact mode). The
+  ## result parses identically — indentation is decoration — and is what a text
+  ## NIF costs when it is treated as a cache rather than as something to read.
+  # A module file takes 8-10 bytes per token, its index included (the index is
+  # appended to the same string, so this reservation holds both).
+  var bld = nifbuilder.open(if sizeHint > 0: sizeHint else: b.len * 10, compact)
   let patchPos = bld.addHeader27()
   var c = b.beginRead()
   var cur = NoNifLineInfo
   var parents = @[NoNifLineInfo]
-  var index = nifbuilder.open(b.len * 2)
+  var index = nifbuilder.open(b.len div 2)
   index.addTree ".index"
   let rootInfo = rawLineInfo(c)
   if rootInfo.isValid:
@@ -394,7 +541,7 @@ proc toModuleString*(b: var TokenBuf; dottedSuffix = ""; sizeHint = 0): string =
   result.add index.extract()
 
 when isMainModule:
-  import std / syncio
+  import std / [syncio, strutils]
   proc sameTokens(a, b: var TokenBuf): bool =
     if a.len != b.len: return false
     for i in 0 ..< a.len:
@@ -436,5 +583,45 @@ when isMainModule:
     b1.addStrLit "z";        b1.appendLineInfo f, 40000'i32, 9'i32  # wide layout
     b1.closeTag()
     doAssert roundTrips(b1)
+
+  block escape_space:
+    # An adapter whose vocabulary outgrew the 9-bit tag field. `registerTag`
+    # just keeps counting; the ids past `TagMask` cost a second token and
+    # nothing else. The escape must be invisible in BOTH directions — the text
+    # never says `other`, and parsing that text back yields the same tokens.
+    proc escTags(): TagPool =
+      result = newTagPool()
+      result.escapeTag = result.registerTag("other")
+      discard result.registerTag("stmts")
+      discard result.registerTag("mov")
+      # Pad the pool out to the edge of the tag field, so the next two
+      # spellings genuinely do not fit and take the escape.
+      while uint32(result.tags.len) < TagMask: discard result.registerTag("pad" & $result.tags.len)
+      doAssert uint32(result.registerTag("movzx")) == FirstEscapeId
+      doAssert uint32(result.registerTag("syscall")) == FirstEscapeId + 1'u32
+
+    let src = "(stmts (mov (rax) +1) (movzx (rax) (rbx) +8) (syscall))"
+    var b1 = parseFromBuffer(src, "t", sharedTags = escTags())
+    # In the BUFFER the two overflowing tags are escape headers carrying their
+    # id inline; `mov` is untouched, so a tag that fits still costs one token.
+    var c = b1.beginRead()
+    var seen = 0
+    c.into:
+      while c.hasMore:
+        if isEscapedTag(c):
+          doAssert uint32(resolvedTagId(c)) >= FirstEscapeId
+          inc seen
+        else:
+          doAssert uint32(resolvedTagId(c)) == uint32(c.cursorTagId)
+        skip c
+    doAssert seen == 2, "expected two escaped nodes, got " & $seen
+    let txt = toString(b1)
+    doAssert txt.find("other") < 0, txt
+    doAssert txt.find("movzx") >= 0 and txt.find("syscall") >= 0, txt
+    var b2 = parseFromBuffer(txt, "t", sharedTags = escTags())
+    doAssert sameTokens(b1, b2), txt
+    # The escape survives the indexed (full-module) serializer too.
+    var b3 = parseFromBuffer(toModuleString(b1), "t", sharedTags = escTags())
+    doAssert sameTokens(b1, b3)
 
   echo "nifcoreparse self-tests passed"

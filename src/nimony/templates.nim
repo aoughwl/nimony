@@ -29,111 +29,409 @@ type
     inferred: ptr Table[SymId, Cursor]
 
 proc expandTemplateImpl(c: var SemContext; dest: var TokenBuf;
-                        e: var ExpansionContext; body: Cursor) =
-  var nested = 0
+                        e: var ExpansionContext; body: Cursor;
+                        atToplevel: bool) =
+  ## Expands a single tree/token of the template body into `dest`.
+  ##
+  ## `atToplevel` says that what lands here lands at MODULE scope: the call site
+  ## is toplevel and nothing between the body root and this node opened a scope.
+  ## It decides the layout of a name the body declares. A template's own body is
+  ## semchecked in the template's scope, so everything it declares that is not
+  ## routine-like got a LOCAL name there (`identToSym`), and `newSymId` keeps
+  ## whatever layout it copies — so `template t() = (let x = 1)` expanded at
+  ## module scope produced `x.1`, a local-layout name on a module-level `gvar`.
+  ## Such a decl is not indexed (`nifcoreparse.toModuleString` indexes by the
+  ## name's shape), so the module compiles and cannot be IMPORTED: nifasm reads
+  ## a foreign module's decls through that index and fails with "Unknown symbol"
+  ## on the module init that reads it.
   var body = body
-  let isAtom = body.kind != ParLe
-  while true:
-    case body.kind
-    of UnknownToken, EofToken, DotToken, Ident:
-      dest.add body
-    of Symbol:
-      let s = body.symId
-      let arg = e.formalParams.getOrDefault(s)
-      if arg != default(Cursor):
-        dest.addSubtree arg
+  case body.kind
+  of UnknownToken, EofToken, ParLe, ParRi, ExtendedSuffix, LineInfoLit, DotToken, Ident:
+    dest.addSubtree body
+  of Symbol:
+    let s = body.symId
+    let arg = e.formalParams.getOrDefault(s)
+    if arg != default(Cursor):
+      dest.addSubtree arg
+    else:
+      let nv = e.newVars.getOrDefault(s)
+      if nv != SymId(0):
+        dest.addSymUse(nv, body.info)
       else:
-        let nv = e.newVars.getOrDefault(s)
-        if nv != SymId(0):
-          dest.add symToken(nv, body.info)
+        let tv = e.inferred[].getOrDefault(s)
+        if tv != default(Cursor):
+          dest.addSubtree tv
         else:
-          let tv = e.inferred[].getOrDefault(s)
-          if tv != default(Cursor):
-            dest.addSubtree tv
-          else:
-            dest.add body # keep Symbol as it was
-    of SymbolDef:
-      let s = body.symId
-      let newDef = newSymId(c, s)
+          dest.addSubtree body # keep Symbol as it was
+  of SymbolDef:
+    let s = body.symId
+    # One fresh symbol per template symbol and expansion. The same one can be
+    # declared more than once: in the branches of a `when` (see
+    # `semuntyped.WhenFrame`), of which only one survives.
+    var newDef = e.newVars.getOrDefault(s)
+    if newDef == SymId(0):
+      newDef = newSymId(c, s, forceGlobal = atToplevel)
       e.newVars[s] = newDef
-      dest.add symdefToken(newDef, body.info)
-    of StringLit, CharLit, IntLit, UIntLit, FloatLit:
-      dest.add body
-    of ParLe:
-      let forStmt = asForStmt(body)
-      if forStmt.kind == ForS and forStmt.iter.exprKind == UnpackX:
-        assert forStmt.vars.substructureKind == UnpackflatU
-        var arg = e.firstVarargMatch
-        var fv = forStmt.vars
-        inc fv
-        inc fv
-        let vid = fv.symId
-        if arg.kind notin {DotToken, ParRi}:
-          while arg.hasMore:
-            e.formalParams[vid] = arg
-            expandTemplateImpl c, dest, e, forStmt.body
-            skip arg
-
-        skip body
-        unsafeDec body
-      elif body.exprKind == UnpackX:
-        inc body
-        var arg = e.firstVarargMatch
-        if body.kind == ParRi:
-          # `unpack()` variant:
-          while arg.hasMore:
-            dest.takeTree arg
-        else:
-          # `unpack(fn)` variant:
-          while arg.hasMore:
-            dest.addParLe CallX, arg.info
-            dest.copyTree body # fn
-            dest.takeTree arg
-            dest.addParRi()
-          skip body
-          unsafeDec body
+    dest.addSymDef(newDef, body.info)
+  of StrLit, CharLit, IntLit, UIntLit, FloatLit:
+    dest.addSubtree body
+  of TagLit:
+    let forStmt = asForStmt(body)
+    if forStmt.kind == ForS and forStmt.iter.exprKind == UnpackX:
+      # the loop body is expanded once per matched vararg; the `(for …)`
+      # tree itself produces no output
+      assert forStmt.vars.substructureKind == UnpackflatU
+      var arg = e.firstVarargMatch
+      var fv = forStmt.vars
+      inc fv
+      inc fv
+      let vid = fv.symId
+      if arg.hasMore and not arg.isDotToken:
+        # every copy of the body declares its locals afresh
+        let outerVars = e.newVars
+        while arg.hasMore:
+          e.newVars = outerVars
+          e.formalParams[vid] = arg
+          expandTemplateImpl c, dest, e, forStmt.body, atToplevel
+          skip arg
+    elif body.exprKind == UnpackX:
+      var un = body
+      un = sub(un) # bounded: `kind` is ParRi for a bare `unpack()`
+      var arg = e.firstVarargMatch
+      if not un.hasMore:
+        # `unpack()` variant:
+        while arg.hasMore:
+          dest.takeTree arg
       else:
-        dest.add body
-        inc nested
-    of ParRi:
-      dest.add body
-      dec nested
-      if nested == 0: break
-    if isAtom: break
-    inc body
+        # `unpack(fn)` variant:
+        while arg.hasMore:
+          dest.addParLe CallX, arg.info
+          dest.copyTree un # fn
+          dest.takeTree arg
+          dest.addParRi()
+    else:
+      dest.addParLe(body.cursorTagId, body.info)
+      # Module scope survives exactly two steps: a `(stmts …)` list, and the NAME
+      # of a declaration sitting in one. Everything else — a routine body, a
+      # `block`, the branches of an `if` — is a scope of its own in `identToSym`'s
+      # eyes, so a name declared under it keeps the local layout it already has.
+      let listy = body.stmtKind == StmtsS
+      # A local declared in the body may have been typed `untyped` when the
+      # template's own body was checked — `let n = call` can be nothing else
+      # there. That type must not travel into the expansion: here the
+      # initializer IS typed, and a local claiming `untyped` over a real value
+      # makes the next thing to read it (`return n`, an assignment, a call that
+      # has to pick an overload) report a mismatch nobody can act on. Blanking
+      # the slot is what the source said, and the expansion is semchecked
+      # again, so the type is inferred from the value where it can be known.
+      #
+      # In the body's own tree it has to stay: that check needs *a* type for
+      # `n` or every use of it fails. Only what is emitted here is real code.
+      let localy = body.stmtKind in LocalDecls
+      var child = 0
+      var first = true
+      body.into:
+        while body.hasMore:
+          if localy and child == LocalTypePos and body.typeKind == UntypedT:
+            dest.addDotToken(body.info)
+          else:
+            expandTemplateImpl c, dest, e, body,
+                               atToplevel and (listy or (first and body.kind == SymbolDef))
+          inc child
+          first = false
+          skip body
+        dest.addParRi(body.endInfo)
+  else:
+    discard "ParRi/close (classic) or stray suffix (nifcore)"
 
-proc expandPlugin(c: var SemContext; dest: var TokenBuf; temp: Routine, args: Cursor): bool =
+proc forgeExpansionInfo*(c: var SemContext; dest: var TokenBuf; start: int;
+                         origin: SymId; declInfo: NifLineInfo;
+                         callInfo: NifLineInfo) =
+  ## Mark what `dest` gained from `start` onward as the result of expanding
+  ## `origin` (#1987), by forging the line-info filename of the *first expanded
+  ## node's head token* - and only that one. An expansion is a single value (a
+  ## `(stmts …)` for a statement template, one expression otherwise), so that
+  ## head covers the whole body. A head whose file is `foo.nim` becomes
+  ## `__crucial\0<origin>\1<declfile>\1<declline>\0foo.nim`; the debug backend
+  ## pushes the origin onto a stack when its tree walk enters such a head and
+  ## pops it when the walk leaves, so every instruction inside gets the DWARF
+  ## inlined frame while the tokens themselves keep their real positions.
+  ## Every other consumer sees `realFile()` and is unaffected.
+  ##
+  ## Nesting composes through the walk: an inner template's expansion sits
+  ## inside the outer one's subtree and carries its own forged head. Only when
+  ## the two heads are the *same token* - a body that is nothing but a call to
+  ## another template - does a chain form, by prepending onto the head's
+  ## existing entries. Outermost first, which is what nesting `inlinedAt`
+  ## needs.
+  ##
+  ## When that head sits at exactly the call's position it is substituted
+  ## *argument* code, written by the caller and belonging to the caller's
+  ## frame, so it keeps its info and nothing is marked. That is why `callInfo`
+  ## is passed in rather than derived here. Comparing only the *file* would be
+  ## wrong for a template declared in the file it is called from - the common
+  ## case, and the one `tests/llvmdebug/ttemplate_locals.nim` covers.
+  # The declaration site travels in the entry because it cannot be recovered
+  # downstream: a template decl does not survive into Leng, and the expanded
+  # code's own info points at whatever file the body came from.
+  ## Off unless `--inlineframes:on`: every template expansion would otherwise
+  ## pay for it, and only a debug build reads the result.
+  if not c.g.config.inlineFrames: return
+  if start >= dest.len: return
+  let originSym = pool.symString(origin)
+  let originDeclFile =
+    if declInfo.file.isValid: realFile(pool.filenames[declInfo.file]) else: ""
+
+  # Info rides as a trailing `LineInfoLit` whose width can change with the
+  # `FileId`, so the head cannot be patched in place - the range is re-emitted.
+  var src = createTokenBuf(dest.len - start)
+  for i in start ..< dest.len: src.add dest[i]
+  shrink dest, start
+
+  var n = beginRead(src)
+  let li = n.info
+  var forge = li.isValid and li.file.isValid
+  if forge and li.file == callInfo.file and li.line == callInfo.line and
+     li.col == callInfo.col:
+    forge = false
+  if forge and n.kind == TagLit and cursorTagId(n) == nifpools.ErrT:
+    # An `(err <orig> <instantiation-dots> <msg>)` is already-reported
+    # diagnostic state, not code: its dots are the error contexts
+    # `reporters` prints as `Trace: instantiation from here`. Marking it
+    # duplicates the trace for a template that errors inside another
+    # expansion (`tests/nimony/templates/tinvalidrecursion.nim`).
+    forge = false
+  if forge:
+    # Prepend, not append: this head's existing chain (if any) is the inner
+    # levels, expanded before us. Outermost first is what the debug backend
+    # needs to nest `inlinedAt` correctly.
+    var forged = CrucialPrefix
+    forged.addCrucialInfo(originSym, originDeclFile, declInfo.line)
+    forged.add crucialTail(pool.filenames[li.file])
+    let info = NifLineInfo(file: pool.filenames.getOrIncl(forged),
+                           line: li.line, col: li.col, comment: li.comment)
+    case n.kind
+    of TagLit:
+      dest.addParLe(cursorTagId(n), info)
+      n.into:
+        while n.hasMore:
+          dest.addSubtree n
+          skip n
+      dest.addParRi()
+    of IntLit:    dest.addIntLit(intVal(n), info); inc n
+    of UIntLit:   dest.addUIntLit(uintVal(n), info); inc n
+    of FloatLit:  dest.addFloatLit(floatVal(n), info); inc n
+    of CharLit:   dest.addCharLit(charLit(n), info); inc n
+    of StrLit:    dest.addStrLit(strVal(n), info); inc n
+    of Symbol:    dest.addSymUse(n.symId, info); inc n
+    of SymbolDef: dest.addSymDef(n.symId, info); inc n
+    of DotToken:  dest.addDotToken(info); inc n
+    else:
+      # An Ident carries no rewritable info; nothing to mark.
+      dest.addSubtree n
+      skip n
+  # Whatever was not re-emitted above (an unforgeable head, or a second value
+  # if one ever appears) is copied through unchanged.
+  while n.hasMore:
+    dest.addSubtree n
+    skip n
+
+type
+  PluginOutcome* = enum
+    NoPluginRan       ## the template carries no `.plugin` pragma
+    PluginExpanded    ## the plugin produced a replacement tree
+    PluginDeferred    ## the plugin answered `(deferexpansion)`: it cannot decide
+                      ## while the arguments still contain type variables
+    PluginFailed      ## the exchange broke down; `errMsg` says how. Reported by
+                      ## the caller against the call site — an `(err …)` written
+                      ## into the plugin's own output buffer is re-checked as an
+                      ## expression and its message lost
+
+const MaxPluginRounds = 32
+  ## Backstop only: `(needtypes …)` already has to name a symbol it was not given,
+  ## so a well-formed exchange terminates after at most one round per level of
+  ## type nesting. This catches a plugin that finds new symbols to ask about
+  ## forever (a cyclic decl walked without a `seen` set, say).
+
+proc appendDecl(s: SymId; dest: var TokenBuf): bool =
+  ## Appends `s`'s declaration — a type *or* a type variable — and says whether
+  ## there was one. Type variables are shipped too, so that a plugin can tell
+  ## "this is a `T` still to be substituted" from "this is a type" positively,
+  ## rather than guessing from what is absent.
   result = false
+  let res = tryLoadSym(s)
+  if res.status != LacksNothing: return
+  if res.decl.symKind notin {TypeY, TypevarY, StaticTypevarY}: return
+  dest.addSubtree res.decl
+  result = true
+
+proc buildTypeDefsInput(decls: var TokenBuf; info: NifLineInfo): TokenBuf =
+  ## Wrap the declarations gathered so far as `(stmts <decl>*)`. A template
+  ## plugin always gets this second input, empty on the first round, so
+  ## `loadTypeDefinitions()` is safe to call unconditionally.
+  result = createTokenBuf(decls.len + 4)
+  result.addParLe StmtsS, info
+  if decls.len > 0:
+    var d = beginRead(decls)
+    while d.hasMore:
+      result.addSubtree d
+      skip d
+    endRead d
+  result.addParRi()
+
+proc readRequestedSyms(dest: var TokenBuf; outputStart: int; syms: var seq[SymId]) =
+  ## Reads the symbols out of a `(needtypes …)` output.
+  var o = readonlyCursorAt(dest, outputStart)
+  o.into:
+    while o.hasMore:
+      if o.isSymbol: syms.add o.symId
+      skip o
+  endRead o
+
+proc expandPlugin(c: var SemContext; dest: var TokenBuf; temp: Routine, args: Cursor;
+                  errMsg: var string): PluginOutcome =
+  result = NoPluginRan
   var p = temp.pragmas
-  if p.kind != ParLe:
+  if not p.isTagLit:
     return
+  var path = StrId(0)
+  var pathInfo = p.endInfo # a degenerate/empty pragma list still needs an info
   p.into:  # (pragmas …)
     while p.hasMore:
       if p.pragmaKind == PluginP:
         p.into PluginP:
           # `.plugin: "path"` — single-string form only.
-          var path = StrId(0)
-          var pathInfo = p.info
-          if p.kind == StringLit:
-            path = p.litId
+          if p.isStringLit:
+            path = p.strId
             pathInfo = p.info
-          if path != StrId(0):
-            var b = createTokenBuf(30)
-            b.addParLe StmtsS, args.info
-            # Pass the invoked template's name as the first child of the input
-            # so a single shared plugin can dispatch on which template was
-            # called. The plugin reads it with `pluginName` and skips to
-            # the real call-site arguments with `callArgs`.
-            b.add identToken(symToIdent(temp.name.symId), args.info)
-            var a = args
-            while a.hasMore:
-              b.takeTree a
-            b.addParRi()
-            runPlugin(c, dest, pathInfo, pool.strings[path], b.toString)
-            result = true
           while p.hasMore: skip p
-        if result: return
       else:
+        skip p
+  if path == StrId(0):
+    return
+
+  # Declarations the plugin has asked for so far. Nothing is shipped up front:
+  # a plugin that does not inspect types never pays for the lookup, and one that
+  # does gets exactly the symbols it names rather than a transitive closure.
+  var decls = createTokenBuf(0)
+  var provided = initHashSet[SymId]()
+  var rounds = 0
+
+  while true:
+    inc rounds
+    var b = createTokenBuf(30)
+    b.addParLe StmtsS, args.endInfo # zero-arg calls: args sits at a scope's end
+    # Pass the invoked template's name as the first child of the input
+    # so a single shared plugin can dispatch on which template was
+    # called. The plugin reads it with `pluginName` and skips to
+    # the real call-site arguments with `callArgs`.
+    b.addIdent(symToIdent(temp.name.symId), args.endInfo)
+    var a = args
+    while a.hasMore:
+      b.takeTree a
+    b.addParRi()
+
+    var types = buildTypeDefsInput(decls, args.endInfo)
+    let outputStart = dest.len
+    runPlugin(c, dest, pathInfo, pool.strings[path], b, types)
+
+    var marker = NoSub
+    if dest.len > outputStart:
+      var o = readonlyCursorAt(dest, outputStart)
+      marker = o.substructureKind
+      endRead o
+
+    case marker
+    of DeferexpansionU:
+      # The marker is a signal, not a tree: drop it and let the caller keep the
+      # call itself, to be re-driven once instantiation has substituted.
+      dest.shrink outputStart
+      return PluginDeferred
+    of NeedtypesU:
+      var wanted: seq[SymId] = @[]
+      readRequestedSyms(dest, outputStart, wanted)
+      dest.shrink outputStart
+      var progress = false
+      for s in wanted:
+        if not provided.containsOrIncl(s):
+          progress = true
+          discard appendDecl(s, decls)
+      if not progress:
+        errMsg = "plugin '" & pool.strings[path] &
+          "' asked again for declarations it was already given"
+        return PluginFailed
+      if rounds >= MaxPluginRounds:
+        errMsg = "plugin '" & pool.strings[path] &
+          "' kept asking for declarations (" & $rounds & " rounds)"
+        return PluginFailed
+    else:
+      return PluginExpanded
+
+proc isRoutineSym*(fnId: SymId): bool =
+  ## True when `fnId` denotes a routine rather than a type. Used by `semInvoke`
+  ## to tell a deferred plugin call, parked as `(at <template> <args>…)`, apart
+  ## from a real generic type instantiation.
+  let res = tryLoadSym(fnId)
+  result = res.status == LacksNothing and res.decl.symKind in RoutineKinds
+
+proc pluginCallToCall*(n: var Cursor; info: NifLineInfo): TokenBuf =
+  ## Turn a parked `(pluginCall <template> <args>…)` back into a `(call …)` so
+  ## the ordinary call path drives the plugin again -- including a second
+  ## deferral, which parks it here once more. `n` is left after the node.
+  let start = n
+  n = sub(n)
+  result = createTokenBuf(16)
+  result.addParLe(CallX, info)
+  while n.hasMore:
+    result.addSubtree n
+    skip n
+  result.addParRi()
+  n = start; skip n
+
+proc pluginReturnsType*(fnId: SymId): bool =
+  ## True when the routine `fnId` declares a `typedesc` result. A plugin
+  ## template that stands for a TYPE has to say so -- `std/typetraits` spells
+  ## `distinctBase` as `[T](t: typedesc[T]): typedesc`. Anything else, `untyped`
+  ## included, stands for a VALUE: `untyped` is the result category a template
+  ## body would have resolved on expansion, and a plugin may not quietly widen
+  ## it to "maybe a typedesc".
+  let res = tryLoadSym(fnId)
+  result = false
+  if res.status == LacksNothing and res.decl.symKind in RoutineKinds:
+    var rt = asRoutine(res.decl).retType
+    # a bare `typedesc` result is sem-checked into the type class
+    # `(typekind (typedesc))` by `tryTypeClass`; `typedesc[T]` stays `(typedesc T)`
+    if rt.typeKind == TypekindT: rt = rt.childCursor
+    result = rt.typeKind == TypedescT
+
+proc addTemplFormalsToScope(c: var SemContext; buf: TokenBuf; at: int) =
+  ## Put a promoted template's OWN typevars and params on the parameter scope.
+  ##
+  ## `semTemplBody` resolves a body `Ident` through `getIdentReplaceParams`,
+  ## which asks `buildSymChoice` (`InnerMost`) for a symbol and substitutes it
+  ## only when that SymId is a formal of THIS template (`isTemplParam`, i.e.
+  ## `ctx.params`). Lazy promotion runs inside the CALLER's live scope, so
+  ## without this the innermost `T` is the caller's homonymous typevar — not one
+  ## of our formals, so the ident stays an `Ident`, is re-sem'd at the expansion
+  ## site against yet another `T`, and yields the bogus `got: T but wanted: T`
+  ## (issue #2181). Registering our formals in the inner parameter scope makes
+  ## `InnerMost` pick ours and the substitution happen.
+  ##
+  ## Phase 3 gets all this for free: `semGenericParams` / `semParams` `addSym`
+  ## every formal as they check it. Promotion starts from an already-sem'd
+  ## published decl and skips both, so it has to re-attach them here.
+  var p = readonlyCursorAt(buf, at)
+  if p.substructureKind in {ParamsU, TypevarsU}:
+    p.into:
+      while p.hasMore:
+        let param = asLocal(p)
+        if param.name.isSymbolDef:
+          var nameStr = pool.symBasename(param.name.symId)
+          if nameStr.len > 0:
+            # `param.kind` is the decl's own `ParamY` / `TypevarY`, so the two
+            # call sites cannot disagree with the structure they pass.
+            addOverloadable(c.currentScope, pool.strings.getOrIncl(nameStr),
+                            Sym(kind: param.kind, name: param.name.symId, pos: 0))
         skip p
 
 proc tryPromoteTemplateBody*(c: var SemContext; sym: SymId): bool =
@@ -171,62 +469,49 @@ proc tryPromoteTemplateBody*(c: var SemContext; sym: SymId): bool =
   if oldHead.symKind != TemplateY: return false
 
   var newBuf = createTokenBuf(prog.mem[sym].buffer.len + 16)
-  newBuf.takeToken oldHead    # `(template`
-  newBuf.takeTree oldHead     # name (SymbolDef)
-  newBuf.takeTree oldHead     # exported marker
-  newBuf.takeTree oldHead     # pattern
-  let typevarsAt = newBuf.len
-  newBuf.takeTree oldHead     # typevars
-  let paramsAt = newBuf.len
-  newBuf.takeTree oldHead     # params
-  newBuf.takeTree oldHead     # return type
-  newBuf.takeTree oldHead     # pragmas
-  newBuf.takeTree oldHead     # effects
-  # oldHead is now positioned at the body.
+  newBuf.addParLe(oldHead.cursorTagId, oldHead.info)          # `(template`
+  oldHead.into:
+    newBuf.takeTree oldHead     # name (SymbolDef)
+    newBuf.takeTree oldHead     # exported marker
+    newBuf.takeTree oldHead     # pattern
+    let typevarsAt = newBuf.len
+    newBuf.takeTree oldHead     # typevars
+    let paramsAt = newBuf.len
+    newBuf.takeTree oldHead     # params
+    newBuf.takeTree oldHead     # return type
+    newBuf.takeTree oldHead     # pragmas
+    newBuf.takeTree oldHead     # effects
+    # oldHead is now positioned at the body.
 
-  let oldRoutine = c.routine
-  c.routine = createSemRoutine(TemplateY, c.routine)
-  # Mirror `semProcImpl`'s template setup so the lazy body sem matches
-  # what phase 3 would do.
-  inc c.routine.inLoop
-  inc c.routine.inGeneric
-  c.openScope()  # parameter scope
-  c.openScope()  # body scope
+    let oldRoutine = c.routine
+    c.routine = createSemRoutine(TemplateY, c.routine)
+    # Mirror `semProcImpl`'s template setup so the lazy body sem matches
+    # what phase 3 would do.
+    inc c.routine.inLoop
+    inc c.routine.inGeneric
+    inc c.inGenericDefinition
+    c.openScope()  # parameter scope
+    c.openScope()  # body scope
 
-  var ctx = createUntypedContext(addr c, UntypedTemplate, dirty = false)
-  addParams(ctx, newBuf, typevarsAt)
-  addParams(ctx, newBuf, paramsAt)
+    var ctx = createUntypedContext(addr c, UntypedTemplate, dirty = false)
+    addParams(ctx, newBuf, typevarsAt)
+    addParams(ctx, newBuf, paramsAt)
 
-  # `addParams` populates `ctx.params` (used by `getIdentReplaceParams`'s
-  # `isTemplParam` check) — but `getIdentReplaceParams` first calls
-  # `buildSymChoice`, which scans the actual SemContext scope. The
-  # original phase-3 path got params into scope via `semParams`, which
-  # ran `addSym` for each param. Lazily promoting from the published
-  # decl skips that, so re-attach the params to the scope here.
-  block addParamsToScope:
-    var p = readonlyCursorAt(newBuf, paramsAt)
-    if p.substructureKind == ParamsU:
-      p.into ParamsU:
-        while p.hasMore:
-          let param = asLocal(p)
-          if param.name.kind == SymbolDef:
-            var nameStr = pool.syms[param.name.symId]
-            extractBasename(nameStr)
-            if nameStr.len > 0:
-              let s = Sym(kind: ParamY, name: param.name.symId, pos: 0)
-              addOverloadable(c.currentScope,
-                              pool.strings.getOrIncl(nameStr), s)
-          skip p
+    # `addParams` populates `ctx.params`, but that is only half of it — see
+    # `addTemplFormalsToScope`.
+    addTemplFormalsToScope(c, newBuf, typevarsAt)
+    addTemplFormalsToScope(c, newBuf, paramsAt)
 
-  semTemplBody ctx, newBuf, oldHead
-  # `oldHead` is now past the body, sitting on the closing `)`.
+    semTemplBody ctx, newBuf, oldHead
+    # `oldHead` is now past the body, at the template's (possibly elided) close.
 
-  c.closeScope()  # body scope
-  c.closeScope()  # parameter scope
-  c.routine = oldRoutine
+    c.closeScope()  # body scope
+    c.closeScope()  # parameter scope
+    dec c.inGenericDefinition
+    c.routine = oldRoutine
 
-  # Closing `)` for the template
-  newBuf.takeToken oldHead
+    # Closing `)` for the template
+    newBuf.addParRi(oldHead.endInfo)
 
   prog.mem[sym].buffer = newBuf
   prog.mem[sym].phase = SemcheckBodies
@@ -248,10 +533,11 @@ proc loadSymWithPhase*(c: var SemContext; symId: SymId; targetPhase: SemPhase): 
 proc expandTemplate*(c: var SemContext; dest: var TokenBuf;
                      templateDecl, args, firstVarargMatch: Cursor;
                      inferred: ptr Table[SymId, Cursor];
-                     info: PackedLineInfo) =
+                     info: NifLineInfo; errMsg: var string): PluginOutcome =
   var templ = asRoutine(templateDecl, SkipInclBody)
 
-  if expandPlugin(c, dest, templ, args):
+  result = expandPlugin(c, dest, templ, args, errMsg)
+  if result != NoPluginRan:
     return
 
   var e = ExpansionContext(
@@ -262,22 +548,23 @@ proc expandTemplate*(c: var SemContext; dest: var TokenBuf;
 
   var a = args
   var f = templ.params
-  if f.kind != DotToken:
+  if not f.isDotToken:
     assert f.isParamsTag
     f.into ParamsU:
       while f.hasMore and a.hasMore:
         var param = f
         inc param
-        assert param.kind == SymbolDef
+        assert param.isSymbolDef
         e.formalParams[param.symId] = a
         skip a
         skip f
       while f.hasMore: skip f  # mop-up if a ran out first
 
-  if templ.body.kind == DotToken:
+  if templ.body.isDotToken:
     c.buildErr dest, info, "cannot expand template from prototype; possibly a recursive template call"
   else:
-    expandTemplateImpl c, dest, e, templ.body
+    expandTemplateImpl c, dest, e, templ.body,
+                       atToplevel = c.currentScope.kind == ToplevelScope
 
   for _, newVar in e.newVars:
     c.freshSyms.incl newVar

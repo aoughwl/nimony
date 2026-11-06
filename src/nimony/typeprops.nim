@@ -1,21 +1,16 @@
 import std/[assertions, sets]
 from std/strutils import startsWith
 include ".." / lib / nifprelude
-import nimony_model, decls, xints, semdata, programs, nifconfig
+import nimony_model, decls, xints, semdata, programs, nifconfig, builtintypes
 import ".." / models / tags
 
 const
   DefaultSetElements* = createXint(1'u64 shl 8)
   MaxSetElements* = createXint(1'u64 shl 16)
 
-proc typebits*(config: NifConfig; n: PackedToken): int =
-  if n.kind == IntLit:
-    result = int pool.integers[n.intId]
-  elif n.kind == InlineInt:
-    result = n.soperand
-  else:
-    result = 0
-
+proc typebits*(config: NifConfig; n: NifToken): int =
+  if n.isIntLit: result = n.soperand.int  # nifcore stores small ints inline
+  else: result = 0
 proc isOrdinalTypeKind*(kind: TypeKind): bool {.inline.} =
   result = kind in {EnumT, IntT, UIntT, CharT, BoolT, RangetypeT}
 
@@ -40,7 +35,7 @@ proc isOrdinalType*(typ: TypeCursor; allowEnumWithHoles: bool = false): bool =
       result = isOrdinalType(baseType, allowEnumWithHoles)
     else:
       result = isOrdinalType(decl.body, allowEnumWithHoles)
-  of ParLe:
+  of TagLit:
     case typ.typeKind
     of IntT, UIntT, CharT, BoolT, RangetypeT:
       result = true
@@ -77,9 +72,9 @@ proc firstOrd*(c: var SemContext; typ: TypeCursor): xint =
       inc firstVal # skip tuple tag
       case firstVal.kind
       of IntLit:
-        result = createXint pool.integers[firstVal.intId]
+        result = createXint firstVal.intVal
       of UIntLit:
-        result = createXint pool.uintegers[firstVal.uintId]
+        result = createXint firstVal.uintVal
       else:
         # enum field with non int/uint value?
         result = createNaN()
@@ -90,7 +85,7 @@ proc firstOrd*(c: var SemContext; typ: TypeCursor): xint =
       result = firstOrd(c, baseType)
     else:
       result = firstOrd(c, decl.body)
-  of ParLe:
+  of TagLit:
     case typ.typeKind
     of IntT:
       var bits = typ
@@ -109,9 +104,9 @@ proc firstOrd*(c: var SemContext; typ: TypeCursor): xint =
       skip first # base type
       case first.kind
       of IntLit:
-        result = createXint pool.integers[first.intId]
+        result = createXint first.intVal
       of UIntLit:
-        result = createXint pool.uintegers[first.uintId]
+        result = createXint first.uintVal
       else:
         result = createNaN()
     of InvokeT:
@@ -153,9 +148,9 @@ proc lastOrd*(c: var SemContext; typ: TypeCursor): xint =
       inc lastVal # skip tuple tag
       case lastVal.kind
       of IntLit:
-        result = createXint pool.integers[lastVal.intId]
+        result = createXint lastVal.intVal
       of UIntLit:
-        result = createXint pool.uintegers[lastVal.uintId]
+        result = createXint lastVal.uintVal
       else:
         # enum field with non int/uint value?
         result = createNaN()
@@ -166,7 +161,7 @@ proc lastOrd*(c: var SemContext; typ: TypeCursor): xint =
       result = lastOrd(c, baseType)
     else:
       result = lastOrd(c, decl.body)
-  of ParLe:
+  of TagLit:
     case typ.typeKind
     of IntT:
       var bits = typ
@@ -193,9 +188,9 @@ proc lastOrd*(c: var SemContext; typ: TypeCursor): xint =
       skip last # first
       case last.kind
       of IntLit:
-        result = createXint pool.integers[last.intId]
+        result = createXint last.intVal
       of UIntLit:
-        result = createXint pool.uintegers[last.uintId]
+        result = createXint last.uintVal
       else:
         result = createNaN()
     of BoolT:
@@ -227,15 +222,46 @@ proc containsGenericParamsAux(n: var TypeCursor): bool =
     if res.status == LacksNothing and res.decl.tagEnum in {TypevarTagId, StaticTypevarTagId}:
       return true
     inc n
-  of ParLe:
+  of TagLit:
     n.loopInto:
       if containsGenericParamsAux(n): return true
   else:
     inc n
   return false
 
+proc typeValueExpr*(n: Cursor): Cursor =
+  ## In a static type slot, a template expansion is emitted as `(expr … value)`.
+  ## Peel to `value` when present; otherwise return `n` unchanged.
+  result = n
+  if n.exprKind != ExprX: return
+  var e = n
+  inc e
+  while e.hasMore and not isLastSon(e):
+    skip e
+  if e.hasMore:
+    result = e
+
+proc isPureTypeValueExpr*(n: Cursor): bool =
+  ## True when `n` is an `(expr …)` whose prefix statements are only empty
+  ## `(stmts)` nodes — the shape produced by expanding a single-expression
+  ## template in a type context.
+  if n.exprKind != ExprX: return true
+  var e = n
+  inc e
+  while e.hasMore and not isLastSon(e):
+    if e.stmtKind == StmtsS:
+      var probe = e
+      probe.peekInto:
+        if probe.hasMore: return false
+    else:
+      return false
+    skip e
+  result = e.hasMore
+
 proc containsGenericParams*(n: TypeCursor): bool =
   var n = n
+  if n.exprKind == ExprX and isPureTypeValueExpr(n):
+    n = typeValueExpr(n)
   result = containsGenericParamsAux(n)
 
 proc nominalRoot*(t: TypeCursor; allowTypevar = false; skipPtrs = false): SymId =
@@ -252,7 +278,7 @@ proc nominalRoot*(t: TypeCursor; allowTypevar = false; skipPtrs = false): SymId 
         if decl.typevars.typeKind == InvokeT:
           var root = decl.typevars
           inc root
-          assert root.kind == Symbol
+          assert root.isSymbol
           return root.symId
         else:
           return t.symId
@@ -260,7 +286,7 @@ proc nominalRoot*(t: TypeCursor; allowTypevar = false; skipPtrs = false): SymId 
         return t.symId
       else:
         break
-    of ParLe:
+    of TagLit:
       case t.typeKind
       of MutT, OutT, LentT, SinkT, StaticT, TypedescT:
         inc t
@@ -293,7 +319,7 @@ proc getClass*(t: TypeCursor): SymId =
       else:
         # ignore typevar case
         break
-    of ParLe:
+    of TagLit:
       case t.typeKind
       of MutT, OutT, LentT, SinkT, StaticT, TypedescT:
         inc t
@@ -328,7 +354,7 @@ proc skipTypeInstSym*(s: SymId): SymId =
 proc typeHasPragma*(n: Cursor; pragma: NimonyPragma; bodyKindRestriction = NoType): bool =
   var counter = 20
   var n = n
-  while counter > 0 and n.kind == Symbol:
+  while counter > 0 and n.isSymbol:
     dec counter
     let res = tryLoadSym(n.symId)
     assert res.status == LacksNothing
@@ -339,7 +365,7 @@ proc typeHasPragma*(n: Cursor; pragma: NimonyPragma; bodyKindRestriction = NoTyp
       if hasPragma(impl.pragmas, pragma):
         return true
       # Might be an alias, so traverse this one here:
-      if impl.body.kind == Symbol:
+      if impl.body.isSymbol:
         n = impl.body
       else:
         break
@@ -348,15 +374,42 @@ proc typeHasPragma*(n: Cursor; pragma: NimonyPragma; bodyKindRestriction = NoTyp
 proc isViewType*(n: Cursor): bool =
   typeHasPragma(n, ViewP)
 
+proc firstParamPassedByRef*(params: Cursor): bool =
+  ## A routine whose result is a view (`openArray`, a `.view` object) borrows
+  ## from its first parameter. When that parameter is passed by value the view
+  ## would point into the callee's copy — a short `string` keeps its characters
+  ## inline — and dangle once the callee returns (#2837). So such a parameter is
+  ## passed by reference, exactly as if it were `{.byref.}` (which
+  ## `system.toOpenArray` spells out by hand). `lent T` needs no such
+  ## rule: sem already refuses to borrow a `lent` from a by-value parameter's
+  ## own storage.
+  ## `params` is the `(params …)` of a routine or proc type; its return type
+  ## follows it. Every pass that decides how a parameter is passed has to ask
+  ## this, or the callee and its callers disagree on the calling convention.
+  var ret = params
+  skip ret
+  var p = params
+  p = sub(p)
+  if isViewType(ret) and p.hasMore:
+    let t = takeLocal(p, SkipFinalParRi).typ
+    # Nothing to fix for a parameter that already is an address (`var`,
+    # `lent`, `ptr`, `ref`, a view), that the callee owns (`sink`), or that
+    # has no runtime existence.
+    result = t.typeKind notin {SinkT, MutT, OutT, LentT, PtrT, RefT, VarargsT,
+                               TypekindT, UntypedT, TypedT, TypedescT, StaticT} and
+             not isViewType(t)
+  else:
+    result = false
+
 proc isVoidType*(t: Cursor): bool {.inline.} =
-  t.kind == DotToken or t.typeKind == VoidT
+  t.isDotToken or t.typeKind == VoidT
 
 proc typeImpl*(s: SymId): Cursor =
   let res = tryLoadSym(s)
   assert res.status == LacksNothing
   result = res.decl
   assert result.stmtKind == TypeS
-  inc result # skip ParLe
+  inc result # skip TagLit
   for i in 1..4:
     skip(result) # name, export marker, pragmas, generic parameter
 
@@ -376,7 +429,7 @@ iterator inheritanceChain*(s: SymId): SymId {.sideEffect.} =
         inc parent
       if parent.typeKind == InvokeT:
         inc parent
-      if parent.kind == Symbol:
+      if parent.isSymbol:
         let ps = parent.symId
         yield ps
         objbody = objtypeImpl(ps)
@@ -390,12 +443,45 @@ proc isInheritable*(n: Cursor; skipPtrs = false): bool =
   if skipPtrs and n.typeKind in {RefT, PtrT}:
     inc n
   if typeHasPragma(n, FinalP, ObjectT): return false
-  if n.kind == Symbol:
+  if n.isSymbol:
     if typeHasPragma(n, InheritableP, ObjectT): return true
     for parent in inheritanceChain(n.symId):
       # well it has a parent and is not final so it is inheritable:
       return true
   return false
+
+type
+  RaisesFamily* = enum
+    NotRaisable   ## neither `ErrorCode` nor a `ref` object type
+    CodeRaises    ## `ErrorCode`: the code travels in the result's error slot
+    RefRaises     ## a `ref` object: the slot says `Failure`, `exc` holds it
+    UnknownRaises ## a type variable or an unresolvable symbol: judged later
+
+proc raisesFamily*(t: Cursor): RaisesFamily =
+  ## What `.raises: T` and `except T` may name. Nothing translates one kind
+  ## into the other, so the family is also what a raise and the handler or
+  ## routine it reaches have to agree on.
+  var t = t
+  var refSeen = false
+  for _ in 0 ..< 20:
+    if t.isSymbol:
+      if not refSeen and t.symId == pool.symId(ErrorCodeName): return CodeRaises
+      let res = tryLoadSym(t.symId)
+      if res.status != LacksNothing or res.decl.stmtKind != TypeS:
+        return UnknownRaises
+      t = asTypeDecl(res.decl).body
+    elif t.typeKind == InvokeT:
+      inc t # the generic type it instantiates
+    elif t.typeKind == RefT and not refSeen:
+      refSeen = true
+      inc t
+    elif t.typeKind == ObjectT and refSeen:
+      return RefRaises
+    elif t.typeKind == AutoT:
+      return UnknownRaises
+    else:
+      return NotRaisable
+  result = UnknownRaises
 
 proc isPure*(n: Cursor): bool =
   typeHasPragma(n, PureP)
@@ -406,7 +492,7 @@ proc isFinal*(n: Cursor): bool =
   result = typeHasPragma(n, FinalP, ObjectT)
 
 proc hasRtti*(s: SymId): bool =
-  if pool.syms[s].startsWith("`t.0.IAref"):
+  if pool.symString(s).startsWith("`t.0.IAref"):
     # This `startsWith` is a minor hack but we know that types of this
     # internal name only have a refcount and a payload, hence no RTTI
     return false
@@ -418,7 +504,7 @@ proc hasRtti*(s: SymId): bool =
   assert res.status == LacksNothing
   var n = res.decl
   assert n.stmtKind == TypeS
-  inc n # skip ParLe
+  inc n # skip TagLit
   skip n, SkipName # name
   skip n, SkipExport # export marker
   skip n, SkipGenParams # type vars
@@ -429,7 +515,7 @@ proc hasRtti*(pragmas: Cursor): bool =
 
 proc getTypeSection*(s: SymId): TypeDecl =
   let res = tryLoadSym(s)
-  assert res.status == LacksNothing
+  assert res.status == LacksNothing, "could not load type declaration: " & pool.symString(s)
   result = asTypeDecl(res.decl)
 
 proc skipDistinct*(n: TypeCursor; isDistinct: var bool): TypeCursor =
@@ -438,7 +524,7 @@ proc skipDistinct*(n: TypeCursor; isDistinct: var bool): TypeCursor =
   var i = 0
   while i < 10:
     n = skipModifier(n)
-    if n.kind == Symbol:
+    if n.isSymbol:
       let section = getTypeSection(n.symId)
       if section.kind == TypeY:
         let s = n
@@ -464,17 +550,9 @@ proc isMinterm(n: TypeCursor): bool =
   if n.typeKind == AndT:
     result = true
     var n = n
-    inc n
-    var nested = 1
-    while nested != 0:
-      if n.typeKind == AndT:
-        inc n
-        inc nested
-      elif n.kind == ParRi:
-        inc n
-        dec nested
-      else:
-        result = isAtomTypeclass(n)
+    n.peekInto:
+      while n.hasMore:
+        result = isMinterm(n)
         if not result: break
         skip n
   else:
@@ -484,17 +562,9 @@ proc isSumOfProducts*(n: TypeCursor): bool =
   if n.typeKind == OrT:
     result = true
     var n = n
-    inc n
-    var nested = 1
-    while nested != 0:
-      if n.typeKind == OrT:
-        inc n
-        inc nested
-      elif n.kind == ParRi:
-        inc n
-        dec nested
-      else:
-        result = isMinterm(n)
+    n.peekInto:
+      while n.hasMore:
+        result = isSumOfProducts(n)
         if not result: break
         skip n
   else:
@@ -503,7 +573,7 @@ proc isSumOfProducts*(n: TypeCursor): bool =
 proc multiplyMinterms(buf: var TokenBuf; a, b: var TypeCursor) =
   if a.typeKind == AndT:
     # flatten:
-    buf.add a
+    buf.addParLe(a.cursorTagId, a.info)
     a.into:
       while a.hasMore:
         takeTree buf, a
@@ -516,7 +586,7 @@ proc multiplyMinterms(buf: var TokenBuf; a, b: var TypeCursor) =
     buf.addParRi()
   else:
     if b.typeKind == AndT:
-      buf.add b
+      buf.addParLe(b.cursorTagId, b.info)
       b.into:
         takeTree buf, a
         while b.hasMore:
@@ -531,30 +601,25 @@ proc multiplyMinterms(buf: var TokenBuf; a, b: var TypeCursor) =
 proc multiplySums(buf: var TokenBuf; a, b: var TypeCursor) =
   # apply distributive property
   if a.typeKind == OrT:
-    buf.add a
-    inc a
-    let bOrig = b
-    while a.hasMore:
-      b = bOrig
-      if b.typeKind == OrT:
-        inc b
+    copyInto buf, a:
+      let bOrig = b
+      while a.hasMore:
+        b = bOrig
+        if b.typeKind == OrT:
+          let aOrig = a
+          b.into:
+            while b.hasMore:
+              a = aOrig
+              multiplyMinterms(buf, a, b)
+        else:
+          multiplyMinterms(buf, a, b)
+  else:
+    if b.typeKind == OrT:
+      copyInto buf, b:
         let aOrig = a
         while b.hasMore:
           a = aOrig
           multiplyMinterms(buf, a, b)
-        skipParRi b
-      else:
-        multiplyMinterms(buf, a, b)
-    takeParRi buf, a
-  else:
-    if b.typeKind == OrT:
-      buf.add b
-      inc b
-      let aOrig = a
-      while b.hasMore:
-        a = aOrig
-        multiplyMinterms(buf, a, b)
-      takeParRi buf, b
     else:
       multiplyMinterms(buf, a, b)
 
@@ -583,34 +648,31 @@ proc reorderSumOfProducts*(buf: var TokenBuf; n: var TypeCursor; negative = fals
       reorderSumOfProducts(buf, n, not negative)
   of AndT:
     var buf2 = createTokenBuf(32)
-    inc n
     let sumStart = buf.len
-    reorderSumOfProducts(buf, n, negative)
-    while n.hasMore:
-      # move both operands to `buf2` then fold into `buf`:
-      for tok in sumStart ..< buf.len: buf2.add buf[tok]
-      buf.shrink sumStart
-      let bStart = buf2.len
-      reorderSumOfProducts(buf2, n, negative)
-      var a = beginRead(buf2)
-      var b = cursorAt(buf2, bStart)
-      if countProducts(a) * countProducts(b) >= 256:
-        # bail out
-        buf.addParLe(AndT, a.info)
-        buf.add buf2
-        while n.hasMore:
-          if negative:
-            buf.addParLe(NotT, n.info)
-          takeTree buf, n
-          if negative:
-            buf.addParRi()
-        break
-      else:
-        multiplySums(buf, a, b)
-      endRead(buf2)
-      endRead(buf2)
-      buf2.shrink 0
-    skipParRi n
+    n.into:
+      reorderSumOfProducts(buf, n, negative)
+      while n.hasMore:
+        # move both operands to `buf2` then fold into `buf`:
+        for tok in sumStart ..< buf.len: buf2.add buf[tok]
+        buf.shrink sumStart
+        let bStart = buf2.len
+        reorderSumOfProducts(buf2, n, negative)
+        var a = beginRead(buf2)
+        var b = cursorAt(buf2, bStart)
+        if countProducts(a) * countProducts(b) >= 256:
+          # bail out
+          buf.addParLe(AndT, a.info)
+          buf.add buf2
+          while n.hasMore:
+            if negative:
+              buf.addParLe(NotT, n.info)
+            takeTree buf, n
+            if negative:
+              buf.addParRi()
+          break
+        else:
+          multiplySums(buf, a, b)
+        buf2.shrink 0
   of OrT:
     # flatten:
     buf.addParLe(OrT, n.info)
@@ -625,7 +687,6 @@ proc reorderSumOfProducts*(buf: var TokenBuf; n: var TypeCursor; negative = fals
               takeTree buf, n2
         else:
           buf.addSubtree n2
-        endRead(buf2)
         buf2.shrink 0
     buf.addParRi()
   else:
@@ -638,7 +699,7 @@ proc reorderSumOfProducts*(buf: var TokenBuf; n: var TypeCursor; negative = fals
 proc toTypeImpl*(n: Cursor): Cursor =
   result = n
   var counter = 20
-  while counter > 0 and result.kind == Symbol:
+  while counter > 0 and result.isSymbol:
     dec counter
     let sym = tryLoadSym(result.symId)
     if sym.status == LacksNothing:
@@ -646,7 +707,7 @@ proc toTypeImpl*(n: Cursor): Cursor =
       if local.kind == TypeY:
         result = local.body
     else:
-      bug "could not load: " & pool.syms[result.symId]
+      bug "could not load: " & pool.symString(result.symId)
 
 proc isConceptSym*(s: SymId): bool =
   let section = getTypeSection(s)
@@ -660,23 +721,50 @@ proc conceptParentsSlot*(body: Cursor): Cursor =
   skip result
   skip result
 
+proc isConceptParentInst(p: Cursor): bool {.inline.} =
+  p.typeKind == AtT or p.exprKind == AtX
+
+proc conceptParentHeadSym*(p: Cursor): SymId =
+  ## Concept symbol named by a parent slot: bare sym or `(at Concept ...)`.
+  if p.isSymbol:
+    p.symId
+  elif isConceptParentInst(p):
+    var pt = p
+    inc pt
+    if pt.isSymbol:
+      pt.symId
+    else:
+      SymId(0)
+  else:
+    SymId(0)
+
+proc conceptParentsWellFormed*(parents: Cursor): bool =
+  ## False when parent sem produced an `(err ...)` node or other garbage.
+  parents.kind == DotToken or parents.kind == Symbol or
+    parents.typeKind == AndT or isConceptParentInst(parents) or parents.exprKind == ParX
+
 proc conceptHasParents*(parents: Cursor): bool =
-  parents.kind != DotToken
+  conceptParentsWellFormed(parents) and not parents.isDotToken
 
 iterator conceptParentSyms*(parents: Cursor): SymId {.sideEffect.} =
   var p = parents
-  if p.kind == DotToken:
+  if not conceptParentsWellFormed(p):
+    bug "illformed concept parents: ", p
+  if p.isDotToken:
     discard
-  elif p.kind == Symbol:
+  elif p.isSymbol:
     yield p.symId
+  elif isConceptParentInst(p):
+    let h = conceptParentHeadSym(p)
+    if h != SymId(0):
+      yield h
   elif p.typeKind == AndT or p.exprKind == ParX:
     p.into:
       while p.hasMore:
-        if p.kind == Symbol:
-          yield p.symId
+        let h = conceptParentHeadSym(p)
+        if h != SymId(0):
+          yield h
         skip p
-  else:
-    bug "illformed concept parents: ", p
 
 proc conceptSelfSlot*(body: Cursor): Cursor =
   result = conceptParentsSlot(body)
@@ -699,30 +787,38 @@ proc conceptExtends*(sub, sup: SymId): bool {.sideEffect.} =
       return true
   false
 
-proc collectConceptHierarchyBodiesImpl(body: Cursor; result: var seq[Cursor];
+proc collectConceptHierarchyBodiesImpl(owner: SymId; body: Cursor; result: var seq[(SymId, Cursor)];
                                       visited: var HashSet[SymId]) {.sideEffect.} =
-  result.add body
+  result.add (owner, body)
   for p in conceptParentSyms(conceptParentsSlot(body)):
     if p notin visited:
       visited.incl p
-      collectConceptHierarchyBodiesImpl(getTypeSection(p).body, result, visited)
+      collectConceptHierarchyBodiesImpl(p, getTypeSection(p).body, result, visited)
 
-iterator conceptHierarchyBodies*(body: Cursor): Cursor {.sideEffect.} =
-  var bodies: seq[Cursor] = @[]
+iterator conceptHierarchyBodies*(conceptSym: SymId; body: Cursor): (SymId, Cursor) {.sideEffect.} =
+  ## Yields `(declaringConcept, conceptBody)` for `body` and every concept it
+  ## inherits from. `declaringConcept` is `conceptSym` for `body` itself, which
+  ## may be `SymId(0)` when the caller only has the body at hand.
+  var bodies: seq[(SymId, Cursor)] = @[]
   var visited = initHashSet[SymId]()
-  collectConceptHierarchyBodiesImpl(body, bodies, visited)
+  if conceptSym != SymId(0):
+    visited.incl conceptSym
+  collectConceptHierarchyBodiesImpl(conceptSym, body, bodies, visited)
   for b in bodies:
     yield b
 
-iterator conceptHierarchyRoutines*(body: Cursor): (Cursor, Cursor) {.sideEffect.} =
-  ## Yields `(conceptBody, requirementRoutine)` from the hierarchy (deduplicated).
-  for cbody in conceptHierarchyBodies(body):
+iterator conceptHierarchyRoutines*(conceptSym: SymId; body: Cursor): (SymId, Cursor, Cursor) {.sideEffect.} =
+  ## Yields `(declaringConcept, conceptBody, requirementRoutine)` from the
+  ## hierarchy (deduplicated). A requirement inherited via `concept of` carries
+  ## the parent that declares it, not `conceptSym`: it is resolved against the
+  ## parent's module, which is where a call would find its implementations.
+  for (owner, cbody) in conceptHierarchyBodies(conceptSym, body):
     var ops = conceptStmtsSlot(cbody)
     if ops.stmtKind == StmtsS:
       ops.into StmtsS:
         while ops.hasMore:
           if ops.symKind in RoutineKinds:
-            yield (cbody, ops)
+            yield (owner, cbody, ops)
           skip ops
 
 when isMainModule:

@@ -1,3 +1,5 @@
+{.feature: "staticContracts".}
+
 when defined(nodejs):
   proc getEnv*(key: string, default = ""): string {.tags: [ReadEnvEffect].} =
     var ret = default.cstring
@@ -51,29 +53,22 @@ else:
       x[j] = move x[j+1]
     shrink(x, xl-1)
 
-  when defined(windows) and not defined(nimscript):
+  const useWinEnv = defined(windows) and not defined(nimscript)
+    ## Read and write the environment through kernel32 alone. No libc is
+    ## involved on that path, so it works unchanged on the freestanding
+    ## (`-d:nimNativeIo`) target, whose process has no C runtime at all.
+
+  when useWinEnv:
     import widestrs
+    import windows/winlean
 
-
-    type
-      WINBOOL = int32
-      ## `WINBOOL` uses opposite convention as posix, !=0 meaning success.
-      # xxx this should be distinct int32, distinct would make code less error prone
-    proc getEnvironmentStringsW(): WideCString {.
-      importc: "GetEnvironmentStringsW", header: "<windows.h>".}
-    proc freeEnvironmentStringsW(env: WideCString): WINBOOL {.
-      importc: "FreeEnvironmentStringsW", header: "<windows.h>".}
-    proc setEnvironmentVariableW(name, value: WideCString): WINBOOL {.
-      importc: "SetEnvironmentVariableW", header: "<windows.h>".}
-
-  proc c_getenv(env: cstring): cstring {.
-    importc: "getenv", header: "<stdlib.h>".}
-  when defined(vcc):
-    proc c_putenv_s(envname: cstring, envval: cstring): cint {.importc: "_putenv_s", header: "<stdlib.h>".}
-  else:
-    proc c_setenv(envname: cstring, envval: cstring, overwrite: cint): cint {.importc: "setenv", header: "<stdlib.h>".}
-  proc c_unsetenv(env: cstring): cint {.
-    importc: "unsetenv", header: "<stdlib.h>".}
+  when not useWinEnv:
+    # Real libc exports; bare importc, no <stdlib.h>. On the truly
+    # freestanding (arkham) target these have no implementation, but that
+    # target never mutates the process environment either.
+    proc c_getenv(env: cstring): cstring {.importc: "getenv".}
+    proc c_setenv(envname: cstring, envval: cstring, overwrite: cint): cint {.importc: "setenv".}
+    proc c_unsetenv(env: cstring): cint {.importc: "unsetenv".}
 
   # Environment handling cannot be put into RTL, because the `envPairs`
   # iterator depends on `environment`.
@@ -87,15 +82,16 @@ else:
       result = environment.len
       if result > 0: inc result
 
-  when defined(windows) and not defined(nimscript):
-    # because we support Windows GUI applications, things get really
-    # messy here...
-    when defined(cpp):
-      proc strEnd(cstr: WideCString, c = 0'i32): WideCString {.
-        importcpp: "(NI16*)wcschr((const wchar_t *)#, #)", header: "<string.h>".}
-    else:
-      proc strEnd(cstr: WideCString, c = 0'i32): WideCString {.
-        importc: "wcschr", header: "<string.h>".}
+  when useWinEnv:
+    # Windows hands a process entry point no `envp` — GUI entry points never
+    # did, and a PE entry point never does — so the block is fetched from the
+    # OS instead. It arrives as UTF-16 `KEY=VALUE\0KEY=VALUE\0…\0\0`.
+    func strEnd(cstr: WideCString): WideCString =
+      ## The address of `cstr`'s NUL terminator — `wcschr(cstr, 0)`, spelled out
+      ## rather than imported so the walk needs no libc `<string.h>`.
+      var i = 0
+      while int16(cstr[i]) != 0'i16: inc i
+      result = cast[WideCString](cast[uint](cstr) + uint(i * 2))
 
     proc getEnvVarsC() =
       if not envComputed:
@@ -108,41 +104,23 @@ else:
           var eend = strEnd(e)
           add(environment, $e)
           e = cast[WideCString](cast[uint](eend)+2)
-          if eend[1].int == 0: break
+          if int16(eend[1]) == 0'i16: break
         discard freeEnvironmentStringsW(env)
 
         envComputed = true
 
   else:
-    const
-      useNSGetEnviron = (defined(macosx) and not defined(ios) and not defined(emscripten)) or defined(nimscript)
-
-    when useNSGetEnviron:
-      # From the manual:
-      # Shared libraries and bundles don't have direct access to environ,
-      # which is only available to the loader ld(1) when a complete program
-      # is being linked.
-      # The environment routines can still be used, but if direct access to
-      # environ is needed, the _NSGetEnviron() routine, defined in
-      # <crt_externs.h>, can be used to retrieve the address of environ
-      # at runtime.
-      proc NSGetEnviron(): pointer {.
-        importc: "_NSGetEnviron", header: "<crt_externs.h>".}
-    elif defined(haiku):
-      var gEnv {.importc: "environ", header: "<stdlib.h>".}: cstringArray
-    elif defined(nimNativeIo):
-      # Libc-free backend: no `environ`. The generated `main` captures the
-      # kernel-provided env block into `nimEnviron` (hexer genMainProc).
-      var gEnv {.importc: "nimEnviron".}: cstringArray
-    else:
-      var gEnv {.importc: "environ".}: cstringArray
+    # The generated `main` captures the env block it receives (`char** envp`)
+    # into the `nimEnviron` global (hexer genMainProc), so neither libc's
+    # `environ` nor Darwin's `_NSGetEnviron` is needed. Windows never comes
+    # here: its entry point receives no `envp` at all, so the block is read
+    # from `GetEnvironmentStringsW` above instead.
+    let gEnv {.importc: "nimEnviron".}: cstringArray
 
     proc getEnvVarsC() =
       # retrieves the variables of char** env of C's main proc
       if not envComputed:
         environment = @[]
-        when useNSGetEnviron:
-          var gEnv = cast[ptr cstringArray](NSGetEnviron())[]
         var i = 0
         while gEnv[i] != nil:
           add environment, $gEnv[i]
@@ -152,7 +130,7 @@ else:
   proc findEnvVar(key: string): int =
     getEnvVarsC()
     var temp = key & "="
-    for i in 0..high(environment):
+    for i in 0 ..< environment.len:
       when defined(windows):
         if skipIgnoreCase(environment[i], temp) == len(temp): return i
       else:
@@ -177,12 +155,14 @@ else:
 
 
     var i = findEnvVar(key)
-    if i >= 0:
+    if i >= 0 and i < environment.len:
       result = substr(environment[i], find(environment[i], '=')+1)
     else:
-      when defined(nimNativeIo):
-        # Libc-free: no `getenv`. The `environment` scan above (built from
-        # `nimEnviron`) is the complete view, so a miss means "not set".
+      when useWinEnv or defined(nimNativeIo):
+        # No libc `getenv`: on Windows because the environment is kernel32's
+        # alone, on the freestanding target because there is no libc at all.
+        # The `environment` scan above is the complete view either way, so a
+        # miss means "not set".
         result = default
       else:
         var key = key
@@ -206,14 +186,20 @@ else:
     runnableExamples:
       assert not existsEnv("unknownEnv")
 
-    var key = key
-    let kc = key.toCString()
-    if kc.isNil:
-      result = false
-    elif c_getenv(kc) != nil:
-      result = true
-    else:
+    when useWinEnv or defined(nimNativeIo):
+      # No libc `getenv` here (see `getEnv`) — and this has to be an `else`, not
+      # an early return, or the reference below still reaches the linker. The
+      # `environment` scan is the complete view, so it answers alone.
       result = findEnvVar(key) >= 0
+    else:
+      var key = key
+      let kc = key.toCString()
+      if kc.isNil:
+        result = false
+      elif c_getenv(kc) != nil:
+        result = true
+      else:
+        result = findEnvVar(key) >= 0
 
   proc putEnv*(key, val: string) {.tags: [WriteEnvEffect], raises.} =
     ## Sets the value of the `environment variable`:idx: named `key` to `val`.
@@ -231,7 +217,7 @@ else:
     # the process itself may access its modified environment variables!
 
     var indx = findEnvVar(key)
-    if indx >= 0:
+    if indx >= 0 and indx < environment.len:
       environment[indx] = key & '=' & val
     else:
       add environment, (key & '=' & val)
@@ -239,15 +225,12 @@ else:
 
     var key = key
     var val = val
-    when defined(windows) and not defined(nimscript):
+    when useWinEnv:
       var k = newWideCString(key)
       var v = newWideCString(val)
-      if setEnvironmentVariableW(k.toWideCString(), v.toWideCString()) == 0'i32:
+      if isFail setEnvironmentVariableW(k.toWideCString(), v.toWideCString()):
         raiseOSError(osLastError())
 
-    elif defined(vcc):
-      if c_putenv_s(key, val) != 0'i32:
-        raiseOSError(osLastError())
     else:
       let kc = key.toCString()
       let vc = val.toCString()
@@ -269,10 +252,10 @@ else:
     ## * `envPairs iterator <#envPairs.i>`_
     var indx = findEnvVar(key)
     if indx >= 0:
-      when defined(windows) and not defined(nimscript):
+      when useWinEnv:
         var key = key
         var k = newWideCString(key)
-        if setEnvironmentVariableW(k.toWideCString(), nil) == 0'i32:
+        if isFail setEnvironmentVariableW(k.toWideCString(), nil):
           raiseOSError(osLastError())
       else:
         var key = key
@@ -297,7 +280,7 @@ else:
     ## * `putEnv proc <#putEnv,string,string>`_
     ## * `delEnv proc <#delEnv,string>`_
     getEnvVarsC()
-    for i in 0..high(environment):
+    for i in 0 ..< environment.len:
       var p = find(environment[i], '=')
       yield (substr(environment[i], 0, p-1),
              substr(environment[i], p+1))

@@ -1,4 +1,4 @@
-#       Nimony
+﻿#       Nimony
 # (c) Copyright 2024 Andreas Rumpf
 #
 # See the file "license.txt", included in this
@@ -6,10 +6,15 @@
 
 ## Types required by semantic checking.
 
+when defined(nimony):
+  # `SemRoutine.parent` and the other back-links here are nilable chains: the
+  # outermost routine has no parent.
+  {.feature: "lenientnils".}
+
 import std / [tables, sets, hashes, os, syncio, formatfloat, assertions]
 include ".." / lib / nifprelude
 include ".." / lib / compat2
-import ".." / lib / [symparser, nifindexes]
+import ".." / lib / [symparser, nifindexes, intrinsics]
 import nimony_model, symtabs, builtintypes, decls, programs, magics, reporters, nifconfig, xints,
   langmodes, features
 
@@ -19,12 +24,20 @@ type
   TypeCursor* = Cursor
   SemRoutine* {.acyclic.} = ref object
     kind*: SymKind
+    sym*: SymId
     hasDefer*: bool
     inGeneric*, inLoop*, inBlock*, inInst*, inExcept*: int
+    breakTargets*: seq[SymId]
+      ## What an unlabeled `break` can leave, innermost last: `SymId(0)` for a
+      ## loop, the label for a `block` (only under `anonBlockBreaks`).
     returnType*: TypeCursor
     pragmas*: set[PragmaKind]
     raisesType*: TypeCursor  # Type from .raises pragma (e.g., ErrorCode, MyError)
     resId*: SymId
+    conceptBounds*: seq[TypeCursor]
+      ## `(at Concept ...)` invocations constraining the signature's typevars,
+      ## as in `C: Findable[T]`: their requirements are available on the
+      ## typevars passed to them.
     parent*: SemRoutine
 
 proc createSemRoutine*(kind: SymKind; parent: SemRoutine): SemRoutine =
@@ -32,6 +45,11 @@ proc createSemRoutine*(kind: SymKind; parent: SemRoutine): SemRoutine =
 
 const
   MaxNestedTemplates* = 100
+
+  AlreadyChecked* = "*"
+    ## Access-token value meaning "validated, but the originating module is no
+    ## longer comparable here". Not a legal module suffix, so it cannot collide
+    ## with one. Used by `exprexec`, whose sub-compile is a synthesized module.
 
 type
   Item* = object
@@ -44,7 +62,13 @@ type
   SemFlag* = enum
     KeepMagics
     AllowOverloads
+    KeepChoices  ## the consumer resolves a symbol choice itself (overload
+                 ## resolution against the formal parameter types), so lookup
+                 ## must not collapse it by scope distance nor call it
+                 ## ambiguous: context has not spoken yet
     PreferIterators
+    PreferTypes  ## a name in a type position: a symbol choice with exactly one
+                 ## type candidate means that type (see `semIdentImpl`)
     AllowUndeclared
     AllowModuleSym
     AllowEmpty
@@ -68,10 +92,17 @@ type
     magic*, externName*: string
     bits*: int
     size*: int  ## value of `{.size: X.}` pragma in bytes; 0 if not set
-    hasVarargs*: PackedLineInfo
+    hasVarargs*: NifLineInfo
+    intrinsic*: IntrinsicOp  ## the `{.instruction: "X".}` / `{.intrinsic: "X".}` row,
+                             ## or `NoIntrinsicOp`. Its signature is checked
+                             ## against the row in `semProcImpl`, where the
+                             ## params and the return type are already known.
     flags*: set[PragmaKind]
     raisesType*: TypeCursor  # Type from .raises pragma
-    headerFileTok*: PackedToken
+    headerFileTok*: NifToken
+    defineKey*: string  ## `{.intdefine: "custom.key".}`: the command-line key to
+                        ## read the constant's value from. Empty means the
+                        ## constant's own name, which is the common case.
 
   ImportedModule* = object
     path*: string
@@ -85,7 +116,7 @@ type
     #targetType*: TypeCursor
     #typeParams*: seq[TypeCursor]
     inferred*: Table[SymId, Cursor]
-    requestFrom*: seq[PackedLineInfo]
+    requestFrom*: seq[NifLineInfo]
 
   ProcInstance* = object
     targetSym*: SymId
@@ -104,6 +135,16 @@ type
     guarded*: bool # true for gfld fields (cannot be accessed via dot)
     rootOwner*: SymId # generic root of owner type
 
+  VisOwner* = object
+    ## One frame of `SemContext.visOwner`: an expansion whose body belongs to
+    ## `module`, written in `file`. Tokens from other files inside the same
+    ## tree are call-site arguments and do not belong to `module`.
+    ##
+    ## `file` is the raw `FileId` value: the name is ambiguous here (two
+    ## imported modules define it) and only equality is ever needed.
+    module*: string
+    file*: uint32
+
   # SemPhase and ToplevelEntry are now in programs.nim
 
   MetaInfo* = object
@@ -112,9 +153,9 @@ type
 
   PluginObj* = object
     path*: StrId
-    info*: PackedLineInfo
+    info*: NifLineInfo
 
-  SemExpressionExecutor* = proc (c: var SemContext; expr: Cursor; expectedType: TypeCursor; result: var TokenBuf; info: PackedLineInfo): string {.nimcall.}
+  SemExpressionExecutor* = proc (c: var SemContext; expr: Cursor; expectedType: TypeCursor; result: var TokenBuf; info: NifLineInfo): string {.nimcall.}
   SemStmtCallback* = proc (c: var SemContext; dest: var TokenBuf; n: Cursor) {.nimcall.}
   SemGetSize* = proc(c: var SemContext; n: Cursor; strict=false): xint {.nimcall.}
   ForceInstantiate* = proc (c: var SemContext; dest: var TokenBuf) {.nimcall.}
@@ -126,7 +167,7 @@ type
   CommonTypeCallbackT* = proc (c: var SemContext; dest: var TokenBuf; it: var Item; argBegin: int; expected: TypeCursor) {.nimcall.}
   SemLocalTypeImplCallbackT* = proc (c: var SemContext; dest: var TokenBuf; n: var Cursor; context: TypeDeclContext; exported: bool; ownerSym: SymId) {.nimcall.}
   # Additional core entry points needed by the pragma module (sempragmas).
-  DeclareResultCallbackT* = proc (c: var SemContext; dest: var TokenBuf; info: PackedLineInfo): SymId {.nimcall.}
+  DeclareResultCallbackT* = proc (c: var SemContext; dest: var TokenBuf; info: NifLineInfo): SymId {.nimcall.}
   SemEmitCallbackT* = proc (c: var SemContext; dest: var TokenBuf; it: var Item) {.nimcall.}
 
   MethodIndexEntry* = object
@@ -148,10 +189,19 @@ type
       ## syms of type instantiations to add their declarations to module
     pendingSumtypes*: TokenBuf
       ## synthesized oneof type declarations to emit at module end
+    refObjOwners*: Table[SymId, SymId]
+      ## `T.Obj` â†’ `T` for every `type T = ref|ptr object` split off by
+      ## `semTypeSection`. The split runs in `SemcheckTopLevelSyms`, but the
+      ## object body -- and with it a sum type's synthesized `anum` -- is
+      ## semchecked one phase later, by which time `T.Obj` is an ordinary
+      ## sibling declaration with nothing pointing back at `T`.
     includeStack*: seq[string]
+    templCallInfos*: seq[NifLineInfo]
+      ## call sites of the template expansions being semchecked, innermost
+      ## last; `instantiationInfo` reads the top
     importedModules*: OrderedTable[SymId, ImportedModule]
     selfModuleSym*: SymId
-    instantiatedFrom*: seq[PackedLineInfo]
+    instantiatedFrom*: seq[NifLineInfo]
     importTab*: OrderedTable[StrId, seq[SymId]] ## mapping of identifiers to modules containing the identifier
     globals*, locals*: Table[string, int]
     fieldCounts*: Table[string, int]
@@ -164,8 +214,33 @@ type
     types*: BuiltinTypes
     typeMem*: Table[string, TokenBuf]
     instantiatedTypes*: Table[string, SymId]
+    typesInProgress*: seq[SymId]
+      ## Type declarations and inlined aliases whose bodies are being semchecked;
+      ## reaching one of them again through aliases is an illegal recursion.
     instantiatedProcs*: Table[(SymId, string), SymId]
     thisModuleSuffix*: string
+    visOwner*: seq[VisOwner]
+      ## Stack of expansions currently being semchecked. Private field
+      ## visibility must be judged against the module the accessing code was
+      ## WRITTEN in, and an expansion mixes two provenances in one tree:
+      ## the body comes from the expanded routine's module, while the
+      ## arguments substituted into it come from the call site. `file`
+      ## discriminates the two â€” a token whose line info names the routine's
+      ## own file is body, anything else is a substituted argument and is
+      ## judged against the module being compiled.
+      ##
+      ## Pushed at `untyped` template expansion, macro plugin expansion and
+      ## generic instantiation: the three places where a body's field accesses
+      ## resolve for the FIRST time in a module other than their own. A typed
+      ## template body instead carries the `"x"` access token from its owner
+      ## module and takes the `bypassVis` path.
+      ##
+      ## `c.routine.inInst` cannot answer this: it conflates "this is an
+      ## expansion" with "this was already checked in its owner module", and
+      ## the latter is false for an `untyped` template argument (semchecked
+      ## here for the FIRST time, at a call site that may not see the field)
+      ## and for `{.untyped.}` generics (whose bodies are published unresolved
+      ## and only resolve at the instantiation site). See issue #1988.
     moduleFlags*: set[ModuleFlag]
     features*: set[Feature]
     processedModules*: Table[string, SymId] # suffix to sym
@@ -175,7 +250,7 @@ type
     checkedForWriteNifModule*: bool
     inWhen*: int
     inUncheckedAccess*: int
-    warnedSources*: HashSet[PackedLineInfo]
+    warnedSources*: HashSet[NifLineInfo]
       ## source positions already reported via `warn` (dedup so a construct that
       ## is semchecked more than once is only warned about once)
     inSpeculativeArg*: int
@@ -185,10 +260,17 @@ type
     templateInstCounter*: int
     commandLineArgs*: string # for IC we make nimony `exec` itself. Thus it is important
                              # to forward command line args properly.
+    hostCommandLineArgs*: string # the same minus the target triple, for the
+                                 # compile-time-eval processes we build and RUN
     #fieldsCache: Table[SymId, Table[StrId, ObjField]]
     meta*: MetaInfo
     #hookIndexLog*: array[AttachedOp, seq[HookIndexEntry]] # only a log, used for index generation, but is not read from.
-    typeHooks*: Table[SymId, HooksPerType] # hooks per type, for embedding in type declarations
+    typeHooks*: ref Table[SymId, HooksPerType]
+      ## Hooks per type, for embedding in type declarations. A `{.cyclic.}`
+      ## group's members share one table: none of them has written its
+      ## interface yet, so this is the only place a member's hooks can be
+      ## seen by its siblings, at sem time and when lifting.
+    errorHooks*: HashSet[SymId] # the `.error` hooks among `typeHooks`
     converters*: Table[SymId, seq[SymId]]
     converterIndexMap*: seq[(SymId, SymId)]
     classes*: Classes # class entries with methods for vtables
@@ -196,6 +278,7 @@ type
     freshSyms*: HashSet[SymId] ## symdefs that should count as new for semchecking
     toBuild*: TokenBuf
     toBundle*: TokenBuf ## `.bundle` custom-linker entries (link-step override)
+    toLink*: seq[string] ## absolute paths of the `.link`ed objects/libraries
     unoverloadableMagics*: HashSet[StrId]
     debugAllowErrors*: bool
     pending*: TokenBuf
@@ -203,13 +286,15 @@ type
     pendingModulePlugins*: seq[PluginObj]
     pluginBlacklist*: HashSet[StrId] # make 1984 fiction again
     cachedTypeboundOps*: Table[(SymId, StrId), seq[SymId]]
+    conceptCache*: RootRef
+      ## Opaque concept-match cache; implementation in conceptcache.nim.
     userPragmas*: Table[StrId, TokenBuf]
     customPragmaTemplates*: HashSet[StrId]
       ## Names of templates declared with `{.pragma.}`. Such templates can
       ## be used as custom pragmas that accept arguments, e.g.
       ## `template ensuresNif*(x: untyped) {.pragma.}` lets later code attach
       ## `{.ensuresNif: addedAny(dest).}`. The template body is not expanded
-      ## here — the annotation is simply accepted and dropped, matching
+      ## here â€” the annotation is simply accepted and dropped, matching
       ## Nim's treatment for tooling-only pragmas.
     usingStmtMap*: Table[StrId, TypeCursor] # mapping of identifiers to types declared in using statements
     pragmaStack*: seq[TokenBuf] # used to implement {.push.} and {.pop.}
@@ -226,6 +311,23 @@ type
     semEmitCB*: SemEmitCallbackT
     passL*: seq[string]
     passC*: seq[string]
+    pluginSources*: seq[string]
+      ## Sources of the plugins this module ran. Their imports join the program
+      ## (`semimport.importPluginImports`): a plugin's `bindSym` refers to them.
+    fileDeps*: seq[string]
+      ## Absolute paths of the files this module's semchecking READ outside
+      ## its own source: what a `.plugin` reported via `plugins.dependsOn` and
+      ## what `slurp`/`staticRead` folded. `semmain.writeNewDepsFile` writes
+      ## them as `(dependency â€¦)` into `.s.deps.nif`, and `deps.nim` turns them
+      ## into extra inputs of the *next* build's nimsem node â€” the depfile
+      ## pattern, so the first build runs regardless and every later one is
+      ## exact (nim-lang/nimony#1378). Filled through `recordFileDep`.
+    queriedIsMain*: bool
+      ## Whether semchecking this module consulted `isMainModule`. Its sem
+      ## output then depends on `--isMain`, which is not a file nifmake can
+      ## track, so `semmain.writeNewDepsFile` records the role and `deps.nim`
+      ## re-sems the module when the next build wants the other one
+      ## (nim-lang/nimony#2830).
     importSnippets*: TokenBuf ## NIF snippets for import statements (with absolute paths), for use by exprexec
     genericInnerProcs*: HashSet[SymId] # these are special in that they must be instantiated in specific places
     expanded*: TokenBuf
@@ -238,7 +340,22 @@ type
       ## module so they do not leak into the export index. See
       ## tests/nimony/lookups/tforward_decl_export.nim.
     deferredCyclicImports*: seq[(string, SymId)] # (module suffix, module sym) for cyclic imports to resolve after phase1
+    cycleGroup*: HashSet[string]
+      ## Module suffixes of this `{.cyclic.}` group, including this module.
+      ## Any import of a member is deferred like an explicit `{.cyclic.}`
+      ## edge: within a group no member's interface exists yet, so a plain
+      ## import of a sibling could not be loaded even though the build did
+      ## classify the edge as an ordinary one.
     inTypeInst*: int # > 0 means we're inside a generic type instantiation
+    inGenericDefinition*: int
+      ## > 0 while semchecking a generic (or template) definition that has not
+      ## been instantiated yet. Unlike `c.routine.inGeneric` this is a property
+      ## of the CONTEXT, not of one routine: a nested proc, lambda or do-block
+      ## closure inside a generic body gets a fresh `c.routine` whose
+      ## `inGeneric` is 0, so code keyed off that would eagerly instantiate and
+      ## eagerly report unresolved overloads inside a body whose typevars are
+      ## still abstract (issues #2143, #2175). Maintained by save/restore at
+      ## each routine/type definition, so it survives that nesting.
     deferredLocals*: Table[StrId, Cursor]
       ## Signature-phase on-demand resolution (nim-lang/nimony#1974): toplevel
       ## let/var are deferred to the body phase, but their decl cursor is
@@ -251,62 +368,62 @@ type
       ## phase 3 `handleSymDef` reuses this symbol for the same decl (treating
       ## it as OkExistingFresh) so the body phase does not redeclare it and the
       ## symbol keeps the same name as if it had never been resolved early.
-      ## Persists phase 2 → phase 3; cleared per module at phase-2 start.
+      ## Persists phase 2 â†’ phase 3; cleared per module at phase-2 start.
 
-proc typeToCanon*(buf: TokenBuf; start: int): string =
-  result = ""
-  for i in start..<buf.len:
-    case buf[i].kind
-    of ParLe:
-      result.add '('
-      result.addInt buf[i].tagId.int
-    of ParRi: result.add ')'
-    of Ident, StringLit:
+proc hooksOf*(c: SemContext; typ: SymId): HooksPerType =
+  ## The hooks of `typ` as sem knows them. The hooks of this module (and of
+  ## its `{.cyclic.}` siblings) are not embedded in type declarations until
+  ## `derefs` runs; any other module's are read from its type's pragmas.
+  let m = pool.symModule(typ)
+  if m == c.thisModuleSuffix or m in c.cycleGroup:
+    result = c.typeHooks[].getOrDefault(typ)
+  else:
+    result = tryLoadAllHooks(typ)
+
+proc recordFileDep*(c: var SemContext; path: string) =
+  ## `path` was read while semchecking this module; see `fileDeps`. Only a
+  ## file that exists can be watched, so nothing else is recorded.
+  if (fileExists(path) or dirExists(path)) and path notin c.fileDeps:
+    c.fileDeps.add path
+
+proc typeToCanonAux(result: var string; c: var Cursor) =
+  ## Cursor walk (ignores nifcore's sparse line-info suffixes, which must not
+  ## enter the type-identity key). Byte-format matches the classic raw walk.
+  if c.isTagLit:
+    result.add '('
+    result.addInt c.cursorTagId.int
+    c.into:
+      while c.hasMore: typeToCanonAux(result, c)
+    result.add ')'
+  else:
+    if c.isIdent or c.isStringLit:
       result.add ' '
-      result.addInt buf[i].litId.int
-    of UnknownToken: result.add " unknown"
-    of EofToken: result.add " eof"
-    of DotToken: result.add '.'
-    of SymbolDef:
-      # Param names inside proctypes get fresh symIds per declaration,
-      # but param names do not affect type identity. Use a fixed marker
-      # so that e.g. two `seq[proc(x: int)]` type trees produce the same
-      # canonical key regardless of the internal symId allocation for `x`.
+      result.addInt c.strId.int
+    elif c.isDotToken:
+      result.add '.'
+    elif c.isSymbolDef:
       result.add " !symdef"
-    of Symbol:
-      # An instantiated sym like `seq.0.Iabc.modA` has its module suffix
-      # appended at *creation* time, so the same logical instantiation
-      # `seq[Foo]` can appear as `seq.0.Iabc.modA` or `seq.0.Iabc.modB`
-      # depending on where in the program it was first instantiated.
-      # When such a sym appears as a *typeArg* to another generic
-      # instantiation, the two forms have different `symId`s but are
-      # semantically the same — DCE merges them at link time via
-      # `removeModule(name)` as the key, and `instToSuffix` (the hash
-      # that builds the *new* instantiation's name) likewise strips the
-      # module. Without matching canonicalization here, the proc-instance
-      # cache (`c.instantiatedProcs`) misses for typeArgs that differ
-      # only in module suffix, while `newInstSymId` still produces the
-      # same name — so we get two definitions of the same proc.
-      let s = pool.syms[buf[i].symId]
-      if isInstantiation(s):
+    elif c.isSymbol:
+      if pool.symIsInstantiation(c.symId):
         result.add " s\""
-        result.add removeModule(s)
+        result.add pool.symWithoutModule(c.symId)
         result.add '"'
       else:
         result.add " s"
-        result.addInt buf[i].symId.int
-    of CharLit:
-      result.add " c"
-      result.addInt buf[i].uoperand.int
-    of IntLit:
-      result.add " i"
-      result.addInt buf[i].intId.int
-    of UIntLit:
-      result.add " u"
-      result.addInt buf[i].uintId.int
-    of FloatLit:
-      result.add " f"
-      result.addInt buf[i].floatId.int
+        result.addInt c.symId.int
+    elif c.isCharLit:
+      result.add " c"; result.addInt c.uoperand.int
+    elif c.isIntLit:
+      result.add " i"; result.addInt c.intVal.int
+    elif c.isUIntLit:
+      result.add " u"; result.addInt c.uintVal.int
+    skip c
+
+proc typeToCanon*(buf: TokenBuf; start: int): string =
+  result = ""
+  var c = cursorAt(cast[ptr TokenBuf](unsafeAddr buf)[], start)
+  while c.hasMore:
+    typeToCanonAux(result, c)
 
 proc typeToCursor*(c: var SemContext; buf: TokenBuf; start: int): TypeCursor =
   let key = typeToCanon(buf, start)

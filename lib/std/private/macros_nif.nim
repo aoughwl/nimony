@@ -234,6 +234,9 @@ proc fromNifToken(r: var Reader; t: ExpandedToken): NimNode =
   of CharLit:
     result = newNimNode(nnkCharLit)
     result.intValField = BiggestInt(decodeChar(t))
+  of TagLit, ExtendedSuffix, LineInfoLit:
+    # in-memory-only kinds; the reader's lexical token stream never yields them
+    result = nil
   of ParLe:
     let tag = $t.data
     # Special cases for keywords that are leaf nodes
@@ -314,7 +317,8 @@ proc toNif*(b: var Builder; n: NimNode) =
     # and pragma) so the result matches what nifler emits.
     let tag = nimNodeKindToTag(n.kind)
     b.withTree tag:
-      for c in n.kids:
+      for i in 0 ..< n.kids.len:
+        let c = n.kids[i]
         if c.kind == nnkIdentDefs and c.len == 3:
           # name
           b.toNif(c.kids[0])
@@ -332,12 +336,14 @@ proc toNif*(b: var Builder; n: NimNode) =
     let tag = nimNodeKindToTag(n.kind)
     if tag.len > 0:
       b.withTree tag:
-        for c in n.kids:
+        for i in 0 ..< n.kids.len:
+          let c = n.kids[i]
           b.toNif(c)
     else:
       # Fallback: use stmts
       b.withTree "stmts":
-        for c in n.kids:
+        for i in 0 ..< n.kids.len:
+          let c = n.kids[i]
           b.toNif(c)
 
 # ============================================================================

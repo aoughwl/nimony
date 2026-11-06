@@ -152,6 +152,11 @@ proc traverseObjectBody(m: var MainModule; o: var TypeOrder; t: Cursor) =
         elif n.typeKind in {ObjectT, UnionT}: # anonymous object/union
           traverseObjectBody(m, o, n)  # recurse into the anonymous subtree
           skip n                        # advance past it
+        elif isUnionBranch(n):          # discriminated union branch
+          let b = asUnionBranch(n)
+          if b.body.typeKind == ObjectT:
+            traverseObjectBody(m, o, b.body)
+          skip n
         else:
           error m, "unexpected node inside object: ", n
           skip n
@@ -194,7 +199,13 @@ proc traverseTypes(m: var MainModule; o: var TypeOrder) =
       o.ordered.add n, TypedefKeyword
     of EnumT:
       o.ordered.add n, TypedefKeyword
-    else: discard
+    else:
+      # An imported scalar such as `Handle {.importc: "HANDLE", header:
+      # "<windef.h>".} = distinct int` has no body to order, but its header
+      # still has to be included — a proc signature or a local may be its
+      # only use in this module.
+      if usesHeader(decl.pragmas):
+        o.forwardedDecls.add n, TypedefKeyword
     inc i
 
 proc integralBits(t: Cursor): string {.inline.} =
@@ -279,7 +290,7 @@ proc getPtrQualifier(c: var GeneratedCode; n: Cursor; isCppRef: var bool): strin
       result = ""
   of RestrictQ:
     result = "restrict "
-  of CppRefQ:
+  of CpprefQ:
     if c.m.config.backend == backendCpp:
       isCppRef = true
     result = ""
@@ -322,7 +333,7 @@ proc atomNumber(c: var GeneratedCode; n: var Cursor; typeName, name: string; isC
           # TODO: cpp doesn't support _Atomic
           discard
         skip n
-      of RestrictQ, CppRefQ:
+      of RestrictQ, CpprefQ:
         error c.m, "expected number qualifier but got: ", n
       of NoQualifier:
         case n.pragmaKind
@@ -437,9 +448,17 @@ proc genProcType(c: var GeneratedCode; n: var Cursor; name = ""; isConst = false
 proc mangleSym(c: var GeneratedCode; s: SymId): string =
   let x = c.m.getDeclOrNil(s)
   if x != nil and x.extern != StrId(0):
-    result = c.m.pool.strings[x.extern]
+    if x.kind == ProcY and x.bareImport:
+      # A bare-importc proc keeps its MANGLED C identifier; its prototype
+      # carries an `__asm__` label binding it to the real symbol (see
+      # `genProcDecl`). Using the libc identifier here would collide with a
+      # header prototype whenever a splice moves the reference into a module
+      # that includes that header.
+      result = mangleToC(c.m.pool.symString(s))
+    else:
+      result = c.m.pool.strings[x.extern]
   else:
-    result = mangleToC(c.m.pool.syms[s])
+    result = mangleToC(c.m.pool.symString(s))
 
 proc genType(c: var GeneratedCode; n: var Cursor; name = ""; isConst = false) =
   case n.typeKind
@@ -497,7 +516,7 @@ proc mangleField(c: var GeneratedCode; s: SymId; pragmas: Cursor; skipDecl: var 
           discard
         skip p
     if result.len > 0: return result
-  result = mangleToC(c.m.pool.syms[s])
+  result = mangleToC(c.m.pool.symString(s))
 
 proc mangleDecl(c: var GeneratedCode; n, pragmas: Cursor; skipDecl: var bool): string =
   if n.kind == SymbolDef:
@@ -545,6 +564,20 @@ proc genObjectOrUnionBody(c: var GeneratedCode; n: var Cursor) =
           genObjectOrUnionBody(c, n)
           c.add CurlyRi
           c.add Semicolon
+        elif isUnionBranch(n):
+          # A discriminated-union branch. C has no variant concept, so the
+          # `(ranges ...)` are ignored and only the payload is emitted - the
+          # same anonymous struct this branch produced before the branches
+          # were tagged. A field-less branch emits nothing, as before.
+          let b = asUnionBranch(n)
+          if b.body.typeKind == ObjectT:
+            var body = b.body
+            c.add AnonStruct
+            c.add CurlyLe
+            genObjectOrUnionBody(c, body)
+            c.add CurlyRi
+            c.add Semicolon
+          skip n
         else:
           error c.m, "expected `fld` but got: ", n
           skip n
@@ -568,7 +601,7 @@ proc genEnumDecl(c: var GeneratedCode; n: var Cursor; name: string) =
       if n.substructureKind == EfldU:
         n.into:
           if n.kind == SymbolDef:
-            let enumFieldName = mangleToC(c.m.pool.syms[n.symId])
+            let enumFieldName = mangleToC(c.m.pool.symString(n.symId))
             inc n
             c.add "#define "
             c.add enumFieldName

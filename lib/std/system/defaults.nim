@@ -17,6 +17,11 @@ template default*(x: typedesc[float32]): float32 = 0.0'f32
 template default*(x: typedesc[float64]): float64 = 0.0'f64
 template default*(x: typedesc[string]): string = ""
 template default*[T: enum](x: typedesc[T]): T = low(T)
+template default*[T: range](x: typedesc[T]): T = low(T)
+  ## The low bound, which is the one value a `range` is guaranteed to hold.
+  ## Zero would be the obvious answer but `range[1..10]` does not contain it,
+  ## and a default that is out of range is exactly what the range type exists
+  ## to make impossible.
 
 template default*[T: nil (ptr)](x: typedesc[T]): T = T(nil)
 template default*[T: nil (ref)](x: typedesc[T]): T = T(nil)
@@ -29,8 +34,10 @@ func default*[T: object](x: typedesc[T]): T {.magic: DefaultObj.}
 func default*[T: tuple](x: typedesc[T]): T {.magic: DefaultTup.}
 
 func default*[I: Ordinal; T: HasDefault](x: typedesc[array[I, T]]): array[I, T] {.inline, noinit, nodestroy.} =
-  for i in low(array[I, T]) .. high(array[I, T]):
-    result[i] = default(T)
+  # Not `for i in low(I)..high(I)`: `I` may be a `distinct` ordinal, which has
+  # no `<=` for `..` unless it borrows one.
+  for x in mitems(result):
+    x = default(T)
 
 template default*[T](x: typedesc[set[T]]): set[T] =
   ## Returns the default value for `set[T]` (the empty set).

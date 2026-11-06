@@ -1,6 +1,6 @@
 import std/[assertions, syncio]
 
-# Verifies the GC_ref / GC_unref primitives added to system/arcops:
+# Verifies the GC_ref / GC_unref primitives in system/refops:
 #   GC_ref   -> +1 on the reference count (via the `=dup` hook, `nodestroy`)
 #   GC_unref -> -1, freeing the object when it crosses zero (via `=destroy`)
 #
@@ -13,6 +13,7 @@ type
   Node = ref NodeObj
 
 var destroyed = 0
+proc `=wasMoved`(x: var NodeObj) {.nodestroy, inline.} = zeroMem(addr x, sizeof(x))
 proc `=destroy`(n: NodeObj) =
   inc destroyed
 
@@ -52,3 +53,5 @@ leaks()
 assert destroyed == 0           # survived: still referenced
 
 echo "ok"
+
+{.feature: "assumeSync".}  # test program: globals shared freely

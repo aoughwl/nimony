@@ -9,17 +9,31 @@
 
 ## A type navigator can recompute the type of an expression.
 
+when defined(nimony):
+  # The scope chain is a nilable linked list: `TypeCache.current` is nil until
+  # the first `openScope`, and `closeScope` pops the outermost one back to nil.
+  {.feature: "lenientnils".}
+
 import std/assertions
 include ".." / lib / nifprelude
+include ".." / lib / compat2
 
 import std/tables
 from std/strutils import endsWith
-import ".." / njvl / njvl_model
+import ".." / finalir / finalir_model
 import nimony_model, builtintypes, decls, programs, typeprops
 
 const
+  # `.00`, not `.0`: a disambiguator is a NUMBER and a number has no leading
+  # zero, so `r.00` is a name no user symbol can collide with -- which is the
+  # point, since these three are injected into types the user also writes
+  # fields into. The pool keeps such a name whole rather than reading `00` as a
+  # disambiguator (#2457), so it stays distinct from `r.0`.
   RcField* = "r.00"
   DataField* = "d.00"
+  RootIdxField* = "ri.00"
+    ## `--mm:orc` only: the cycle collector's second header word, between
+    ## `RcField` and `DataField` (see `lib/std/system/orc.nim`).
   VTableField* = "vt.00"
   DisplayLenField* = "dl.0"
   DisplayField* = "dy.0"
@@ -34,37 +48,63 @@ type
   ScopeKind* = enum
     OtherScope, ProcScope, UnusedScope
   TypeScope* {.acyclic.} = ref object
-    locals: Table[SymId, LocalInfo]
+    locals: OrderedTable[SymId, LocalInfo]  ## in declaration order, which is
+                                            ## the order of a scope's `kill`
     parent: TypeScope
     kind: ScopeKind
 
   TypeCache* = object
     builtins*: BuiltinTypes
-    mem: seq[TokenBuf]
     current: TypeScope
+    keepOwned: bool ## `getType` answers `owned T` as `T` unless set: only the
+                    ## passes that implement the ownership rules (RFC #575)
+                    ## care, to everybody else it is the `ref` or closure
 
-proc createTypeCache*(bits: int = 64): TypeCache =
-  TypeCache(builtins: createBuiltinTypes(bits))
+proc createTypeCache*(bits: int; keepOwned = false): TypeCache =
+  TypeCache(builtins: createBuiltinTypes(bits), keepOwned: keepOwned)
 
 proc registerLocal*(c: var TypeCache; s: SymId; kind: SymKind; typ: Cursor;
                     val: Cursor = default(Cursor)) =
   c.current.locals[s] = LocalInfo(kind: kind, typ: typ, val: val)
 
 proc openScope*(c: var TypeCache; kind = OtherScope) =
-  c.current = TypeScope(locals: initTable[SymId, LocalInfo](), parent: c.current, kind: kind)
+  c.current = TypeScope(locals: initOrderedTable[SymId, LocalInfo](), parent: c.current, kind: kind)
 
 proc closeScope*(c: var TypeCache) =
   c.current = c.current.parent
 
+const
+  ScopedLocals = {VarY, TvarY, GvarY, LetY, TletY, GletY, CursorY, PatternvarY}
+    ## the locals whose lifetime a scope bounds
+
 iterator currentScopeLocals*(c: var TypeCache): SymId =
-  for s, k in c.current.locals:
-    if k.kind in {VarY, TvarY, GvarY, LetY, TletY, GletY}:
+  for s, k in uncheckedBorrow(c.current.locals):
+    if k.kind in ScopedLocals:
       yield s
 
+func scopeDepth*(c: TypeCache): int =
+  result = 0
+  var sc = c.current
+  while sc != nil:
+    inc result
+    sc = sc.parent
+
+iterator localsOfScopesAbove*(c: var TypeCache; depth: int): SymId =
+  ## The locals of every scope opened while `scopeDepth` exceeded `depth`:
+  ## what a jump out to a construct entered at `depth` leaves behind.
+  var sc = c.current
+  var d = scopeDepth(c)
+  while d > depth:
+    for s, k in uncheckedBorrow(sc.locals):
+      if k.kind in ScopedLocals:
+        yield s
+    sc = sc.parent
+    dec d
+
 proc registerParams*(c: var TypeCache; routine: SymId; decl, params: Cursor) =
-  if params.kind == ParLe:
+  if params.isTagLit:
     var p = params
-    inc p
+    p = sub(p) # bound the param walk
     while p.hasMore:
       let r = takeLocal(p, SkipFinalParRi)
       registerLocal(c, r.name.symId, ParamY, r.typ, r.val)
@@ -72,7 +112,7 @@ proc registerParams*(c: var TypeCache; routine: SymId; decl, params: Cursor) =
 
 proc openProcScope*(c: var TypeCache; routine: SymId; decl, params: Cursor) =
   registerLocal(c, routine, ProcY, decl)
-  c.current = TypeScope(locals: initTable[SymId, LocalInfo](), parent: c.current, kind: ProcScope)
+  c.current = TypeScope(locals: initOrderedTable[SymId, LocalInfo](), parent: c.current, kind: ProcScope)
 
 proc getInitValueImpl(c: var TypeCache; s: SymId): Cursor =
   ## Returns the init value for a constant. Restricted to `ConstY` for callers
@@ -97,32 +137,34 @@ proc getInitValueImpl(c: var TypeCache; s: SymId): Cursor =
       # the ordinal literal so constant folding can inline it at use sites
       # (e.g. a `case` label emitted by Lengc must be an integer constant).
       result = local.val
-      if result.kind == ParLe and result.exprKind == TupX:
+      if result.isTagLit and result.exprKind == TupX:
         inc result
         return result
       return default(Cursor)
   return default(Cursor)
 
 proc getLocalInfo*(c: var TypeCache; s: SymId): LocalInfo =
+  ## `crossedProc` is the number of routine boundaries between the use and the
+  ## declaration; nonzero means a capture. That includes a local of a module
+  ## level statement such as a `block` (#2555); a global is never captured.
   var it {.cursor.} = c.current
   var crossedProc = 0
-  var compareTo = UnusedScope
   while it != nil:
     var res = it.locals.getOrDefault(s)
-    if it.kind == compareTo:
-      inc crossedProc
-    elif it.kind == ProcScope:
-      compareTo = ProcScope
     if res.kind != NoSym:
+      if crossedProc > 0 and res.kind in {GvarY, GletY, TvarY, TletY, ConstY}:
+        crossedProc = 0
       res.crossedProc = int16(crossedProc)
       return res
+    if it.kind == ProcScope:
+      inc crossedProc
     it = it.parent
   return default(LocalInfo)
 
 proc getInitValue*(c: var TypeCache; s: SymId): Cursor =
   result = getInitValueImpl(c, s)
   var counter = 0
-  while counter < 20 and not cursorIsNil(result) and result.kind == Symbol:
+  while counter < 20 and not cursorIsNil(result) and result.isSymbol:
     inc counter
     # see if we can resolve it even further:
     let res = getInitValueImpl(c, result.symId)
@@ -166,7 +208,7 @@ proc fetchSymKind*(c: var TypeCache; s: SymId): SymKind =
   result = if res.status == LacksNothing: res.decl.symKind else: NoSym
 
 proc registerLocals(c: var TypeCache; n: var Cursor) =
-  if n.kind == ParLe:
+  if n.isTagLit:
     let k = n.stmtKind
     case k
     of StmtsS:
@@ -174,17 +216,16 @@ proc registerLocals(c: var TypeCache; n: var Cursor) =
         while n.hasMore:
           registerLocals(c, n)
     of LetS, CursorS, PatternvarS, VarS, TvarS, TletS, GvarS, GletS:
-      inc n
-      let name = n.symId
-      inc n # name
-      skip n, SkipExport # export marker
-      skip n, SkipPragmas # pragmas
-      let typ = n
-      skip n, SkipType # type
-      let val = n
-      c.registerLocal name, cast[SymKind](k), typ, val
-      skip n, SkipValue # init value
-      skipParRi n
+      n.into:
+        let name = n.symId
+        inc n # name
+        skip n, SkipExport # export marker
+        skip n, SkipPragmas # pragmas
+        let typ = n
+        skip n, SkipType # type
+        let val = n
+        c.registerLocal name, cast[SymKind](k), typ, val
+        skip n, SkipValue # init value
     else:
       skip n
   else:
@@ -198,76 +239,104 @@ type
 proc skipToObjectBody(n: Cursor): Cursor =
   var counter = 20
   result = n
+  if result.typeKind == OwnedT:
+    inc result
   if result.typeKind in {PtrT, RefT}:
     inc result
-  while counter > 0 and result.kind == Symbol:
+  while counter > 0 and result.isSymbol:
     dec counter
     let d = getTypeSection(result.symId)
     if d.kind == TypeY:
       result = d.body
+      if result.typeKind == OwnedT:
+        inc result
       if result.typeKind in {PtrT, RefT}:
         inc result
     else:
       break
 
-proc typeOfField(c: var TypeCache; n: var Cursor; fld: SymId): Cursor =
+proc skipTypeAliases*(n: Cursor): Cursor =
+  ## Follow `type A = B` chains until a structural type is reached. Bounded so
+  ## a cyclic alias cannot hang the navigator.
+  var counter = 20
+  result = n
+  while counter > 0 and result.isSymbol:
+    dec counter
+    let d = getTypeSection(result.symId)
+    if d.kind == TypeY:
+      result = d.body
+    else:
+      break
+
+proc fieldDecl(c: var TypeCache; n: var Cursor; fld: SymId): Local =
+  ## Find `fld`'s declaration in an object body, inheritance and case
+  ## sections included. Not-found is signalled by `result.typ` being the
+  ## nil cursor (a found `(fld …)` always carries a type).
   if n.substructureKind in {FldU, GfldU}:
     let decl = takeLocal(n, SkipFinalParRi)
-    if decl.name.kind == SymbolDef and decl.name.symId == fld:
-      result = decl.typ
+    if decl.name.isSymbolDef and decl.name.symId == fld:
+      result = decl
     else:
-      result = default(Cursor)
+      result = default(Local)
   elif n.substructureKind == StmtsU:
     n.into:
       while n.hasMore:
-        result = typeOfField(c, n, fld)
-        if not cursorIsNil(result): return result
-    result = default(Cursor)
+        result = fieldDecl(c, n, fld)
+        if not cursorIsNil(result.typ): return result
+    result = default(Local)
   elif n.substructureKind == CaseU:
-    inc n
-    result = typeOfField(c, n, fld) # selector field
-    if not cursorIsNil(result): return result
-    while n.hasMore:
-      case n.substructureKind
-      of OfU:
-        n.into:
-          skip n, SkipValue # ranges
-          n.into:                                # (stmts ...)
-            while n.hasMore:
-              result = typeOfField(c, n, fld)
-              if not cursorIsNil(result): return result
-      of ElseU:
-        n.into:
-          n.into:                                # (stmts ...)
-            while n.hasMore:
-              result = typeOfField(c, n, fld)
-              if not cursorIsNil(result): return result
-      else:
-        skip n
-    skipParRi n
-    result = default(Cursor)
-  else:
-    result = default(Cursor)
-    let tk = n.typeKind
-    if tk in {ObjectT, TupleT}:
-      inc n
-      var baseObj = default(Cursor)
-      if tk == ObjectT:
-        baseObj = n
-        skip n # inheritance
+    n.into:
+      result = fieldDecl(c, n, fld) # selector field
+      if not cursorIsNil(result.typ): return result
       while n.hasMore:
-        result = typeOfField(c, n, fld)
-        if not cursorIsNil(result): return result
-      inc n
+        case n.substructureKind
+        of OfU:
+          n.into:
+            skip n, SkipValue # ranges
+            n.into:                                # (stmts ...)
+              while n.hasMore:
+                result = fieldDecl(c, n, fld)
+                if not cursorIsNil(result.typ): return result
+        of ElseU:
+          n.into:
+            n.into:                                # (stmts ...)
+              while n.hasMore:
+                result = fieldDecl(c, n, fld)
+                if not cursorIsNil(result.typ): return result
+        else:
+          skip n
+    result = default(Local)
+  else:
+    result = default(Local)
+    let tk = n.typeKind
+    if tk in {ObjectT} + TupleTypes:
+      var baseObj = default(Cursor)
+      n.into:
+        if tk == ObjectT:
+          baseObj = n
+          skip n # inheritance
+        while n.hasMore:
+          result = fieldDecl(c, n, fld)
+          if not cursorIsNil(result.typ): return result
       if not cursorIsNil(baseObj):
         var b = skipToObjectBody baseObj
-        result = typeOfField(c, b, fld)
+        result = fieldDecl(c, b, fld)
     else:
       skip n # empty sum type body
+
+proc typeOfField(c: var TypeCache; n: var Cursor; fld: SymId): Cursor =
+  fieldDecl(c, n, fld).typ
 
 proc lookupField*(c: var TypeCache; typ: Cursor; fld: SymId): Cursor =
   var body = skipToObjectBody(typ)
   result = typeOfField(c, body, fld)
+
+proc lookupFieldDecl*(c: var TypeCache; typ: Cursor; fld: SymId): Local =
+  ## Like `lookupField`, but the whole declaration — for callers that need
+  ## more than the type (e.g. the field's pragmas). `result.typ` is the nil
+  ## cursor when the field is absent.
+  var body = skipToObjectBody(typ)
+  result = fieldDecl(c, body, fld)
 
 proc getTypeImpl(c: var TypeCache; n: Cursor; flags: set[GetTypeFlag]): Cursor
 
@@ -276,18 +345,51 @@ proc tupatType(c: var TypeCache; n: Cursor; flags: set[GetTypeFlag]): Cursor =
   var n = n
   inc n # into tuple
   var tupType = getTypeImpl(c, n, flags)
-  tupType = skipModifier(tupType)
-  if tupType.typeKind == TupleT:
+  tupType = skipModifierAndOwned(tupType)
+  if tupType.typeKind in TupleTypes:
     skip n # skip tuple expression
-    if n.kind == IntLit:
-      var idx = pool.integers[n.intId]
+    if n.isIntLit:
+      var idx = n.intVal
       inc tupType # into the tuple type
       while idx > 0:
         skip tupType
         dec idx
       result = getTupleFieldType(tupType)
+  elif tupType.typeKind in {ProctypeT, ItertypeT} and procHasPragma(tupType, ClosureP):
+    # A `.closure` value is the pair (fn, env) once hexer's lambdalifting has
+    # lowered it: `(tupat v 0)` is the routine, `(tupat v 1)` its environment.
+    # Hexer keeps querying the semchecked, precisely annotated type of `v` —
+    # a closure global declared in another module is never rewritten, only
+    # its uses are — so the projection has to follow from the annotation.
+    skip n # skip the closure expression
+    if n.isIntLit:
+      if n.intVal == 0:
+        result = tupType
+      elif n.intVal == 1:
+        var buf = createTokenBuf(4)
+        buf.addParLe(RefT, n.info)
+        buf.addSymUse pool.symId(BareRootObjName), n.info
+        buf.addParRi()
+        result = cursorAt(buf, 0)
   elif BeStrict in flags:
     assert false, "wanted tuple type but got: " & toString(tupType, false)
+
+proc typeofBranchBody(c: var TypeCache; br: Cursor; flags: set[GetTypeFlag]): Cursor =
+  ## The type of an if/case/try/block branch body. Sem wraps expression
+  ## branches in `(stmts …)` in some shapes (template-expanded bodies), so a
+  ## stmts-wrapped branch takes the type of its TRAILING item; an empty
+  ## `(stmts)` is void.
+  var br = br
+  while br.isTagLit and stmtKind(br) == StmtsS:
+    var it = sub(br)
+    if not it.hasMore:
+      return c.builtins.voidType
+    var last = it
+    while it.hasMore:
+      last = it
+      skip it
+    br = last
+  result = getTypeImpl(c, br, flags)
 
 proc getTypeImpl(c: var TypeCache; n: Cursor; flags: set[GetTypeFlag]): Cursor =
   result = c.builtins.autoType # to indicate error
@@ -297,7 +399,7 @@ proc getTypeImpl(c: var TypeCache; n: Cursor; flags: set[GetTypeFlag]): Cursor =
     of Symbol:
       result = lookupSymbol(c, n.symId)
       if cursorIsNil(result):
-        bug "could not find symbol: " & pool.syms[n.symId]
+        bug "could not find symbol: " & pool.symString(n.symId)
     of IntLit:
       result = c.builtins.intType
     of UIntLit:
@@ -306,60 +408,75 @@ proc getTypeImpl(c: var TypeCache; n: Cursor; flags: set[GetTypeFlag]): Cursor =
       result = c.builtins.charType
     of FloatLit:
       result = c.builtins.floatType
-    of StringLit:
+    of StrLit:
       result = c.builtins.stringType
-    of ParLe:
+    of TagLit:
       case stmtKind(n)
       of IfS:
         # Walk all branches and pick the first non-void branch's type. A
-        # branch tagged `(stmts ...)` (e.g. one whose last expression is a
-        # `return`/`raise`) yields void; the if-expression's value comes
-        # from a sibling branch that does yield.
+        # branch body may be `(stmts ...)` — sem emits that shape for
+        # template-expanded if-EXPRESSIONS too, so the branch's value is its
+        # TRAILING item, not blanket void (typing it void made xelim declare
+        # a typeless temp and drop the branch values — deps.nim's wasmInput).
+        # A branch that genuinely yields nothing (trailing `return`/call of a
+        # void proc) still types void through the recursion.
         var n = n
         inc n # skip `if`
         result = c.builtins.voidType
-        while n.kind == ParLe:
+        while n.isTagLit:
           let sub = n.substructureKind
           if sub notin {ElifU, ElseU}: break
           var br = n
           inc br # `elif` or `else`
           if sub == ElifU:
             skip br # condition
-          let brType = getTypeImpl(c, br, flags)
+          let brType = typeofBranchBody(c, br, flags)
           if brType.typeKind != VoidT:
             result = brType
             break
           skip n
       of CaseS:
+        # Like `if`: the first non-void branch decides, a leading branch that
+        # ends in `return` must not type the whole `case` as void (#2612).
         var n = n
         inc n # skip `case`
         skip n # skip selector
-        inc n # skip `of`
-        skip n # skip set
-        result = getTypeImpl(c, n, flags)
+        result = c.builtins.voidType
+        while n.isTagLit:
+          let sub = n.substructureKind
+          if sub notin {OfU, ElseU}: break
+          var br = n
+          inc br # `of` or `else`
+          if sub == OfU:
+            skip br # set
+          let brType = typeofBranchBody(c, br, flags)
+          if brType.typeKind != VoidT:
+            result = brType
+            break
+          skip n
       of TryS:
         var n = n
         inc n
-        result = getTypeImpl(c, n, flags)
+        result = typeofBranchBody(c, n, flags)
       of BlockS:
         var n = n
         inc n
         skip n # label or DotToken
-        result = getTypeImpl(c, n, flags)
+        result = typeofBranchBody(c, n, flags)
       of StmtsS, RetS, CommentS:
         result = c.builtins.voidType
       else:
-        case njvlKind(n)
+        case finalIrKind(n)
         of VV:
-          result = getTypeImpl(c, n.firstSon, flags)
+          result = getTypeImpl(c, n.childCursor, flags)
         of EtupatV:
           result = tupatType(c, n, flags)
         else: discard
     else:
-      # XXX FIXME This can never be true as we know n.kind != ParLe!
+      # XXX FIXME This can never be true as we know not n.isTagLit!
       case n.substructureKind
       of RangesU, RangeU:
-        result = getTypeImpl(c, n.firstSon, flags)
+        result = getTypeImpl(c, n.childCursor, flags)
       else: discard
   of KvX:
     var m = n
@@ -367,7 +484,10 @@ proc getTypeImpl(c: var TypeCache; n: Cursor; flags: set[GetTypeFlag]): Cursor =
     skip m # skip key
     result = getTypeImpl(c, m, flags)
   of AtX, ArratX:
-    result = getTypeImpl(c, n.firstSon, flags)
+    result = getTypeImpl(c, n.childCursor, flags)
+    # a `sink array` parameter, say: the modifier only says how it is passed
+    while typeKind(result) in {SinkT, LentT, MutT, OutT}:
+      inc result
     case typeKind(result)
     of ArrayT, SetT:
       inc result # to the element type
@@ -375,8 +495,14 @@ proc getTypeImpl(c: var TypeCache; n: Cursor; flags: set[GetTypeFlag]): Cursor =
       result = c.builtins.charType
     else:
       result = c.builtins.autoType # still an error
+  of PluginCallX:
+    # A deferred plugin call only ever survives inside an unresolved generic
+    # body; every instantiation drives the plugin and replaces it. Its type is
+    # the template's declared return type, which is not reachable from here,
+    # and nothing typed enough for `typenav` to navigate ever holds one.
+    result = c.builtins.autoType
   of PatX:
-    result = getTypeImpl(c, n.firstSon, flags)
+    result = getTypeImpl(c, n.childCursor, flags)
     case typeKind(result)
     of PtrT:
       inc result
@@ -397,25 +523,27 @@ proc getTypeImpl(c: var TypeCache; n: Cursor; flags: set[GetTypeFlag]): Cursor =
     result = getTypeImpl(c, n, flags)
   of DoX:
     # the parameter list that follows `(do)` is actually a good type
-    result = getTypeImpl(c, n.firstSon, flags)
+    result = getTypeImpl(c, n.childCursor, flags)
   of ExprX:
     var n = n
-    inc n # skip "expr"
-    while n.hasMore:
-      let prev = n
-      registerLocals(c, n)
-      if n.kind == ParRi:
-        result = getTypeImpl(c, prev, flags)
+    n.into: # skip "expr"
+      while n.hasMore:
+        let prev = n
+        registerLocals(c, n)
+        if not n.hasMore:
+          result = getTypeImpl(c, prev, flags)
   of CallX, CallstrlitX, InfixX, PrefixX, CmdX, HcallX, ProccallX:
-    result = getTypeImpl(c, n.firstSon, flags)
+    result = skipOwned getTypeImpl(c, n.childCursor, flags)
     if result.typeKind in RoutineTypes:
       skipToReturnType result
   of FalseX, TrueX, AndX, OrX, XorX, NotX, DefinedX, DeclaredX, IsmainmoduleX, EqX, NeqX, LeX, LtX,
      EqsetX, LesetX, LtsetX, InsetX, OvfX, CompilesX, InstanceofX, FailedX, IsX:
     result = c.builtins.boolType
+  of StaticX:
+    result = getTypeImpl(c, n.childCursor, flags)
   of NeginfX, NanX, InfX:
     result = c.builtins.floatType
-  of EnumtostrX, DefaultobjX, DefaulttupX, DefaultdistinctX, InternalTypeNameX,
+  of EnumtostrX, InstantiationinfoX, DefaultobjX, DefaulttupX, DefaultdistinctX, InternalTypeNameX,
      AstToStrX, BindSymNameX:
     result = c.builtins.stringType
   of BindSymX:
@@ -425,17 +553,20 @@ proc getTypeImpl(c: var TypeCache; n: Cursor; flags: set[GetTypeFlag]): Cursor =
     result = c.builtins.autoType
   of SizeofX, CardX, AlignofX, OffsetofX:
     result = c.builtins.intType
+  of CanFormCyclesX, SupportsCopyMemX:
+    result = c.builtins.boolType
   of DelayX, Delay0X, SuspendX:
     result = c.builtins.continuationType
-  of AddX, SubX, MulX, DivX, ModX, ShlX, ShrX, AshrX, BitandX, BitorX, BitxorX, BitnotX, NegX,
+  of AddX, SubX, SuccX, PredX, MulX, DivX, ModX, ShlX, ShrX, AshrX, BitandX, BitorX, BitxorX, BitnotX, NegX,
      PlussetX, MinussetX, MulsetX, XorsetX,
      CastX, ConvX, HconvX, DconvX, BaseobjX,
      OconstrX, NewobjX, AconstrX, SetconstrX, TupconstrX, NewrefX:
-    result = n.firstSon
+    result = n.childCursor
   of ParX, EmoveX:
-    result = getTypeImpl(c, n.firstSon, flags)
+    result = getTypeImpl(c, n.childCursor, flags)
   of NilX:
-    result = c.builtins.nilType
+    let t = n.childCursor
+    result = if t.hasMore: t else: c.builtins.nilType
   of DotX, DdotX:
     var n = n
     inc n # skip "dot"
@@ -447,21 +578,21 @@ proc getTypeImpl(c: var TypeCache; n: Cursor; flags: set[GetTypeFlag]): Cursor =
 
     result = typeOfField(c, objType, fld)
     if cursorIsNil(result):
-      if pool.syms[fld] == VTableField:
+      if pool.symString(fld) == VTableField:
         # VTableField is a magic internal field for RTTI
         result = c.builtins.vtableType
-      elif pool.syms[fld] == DataField and
+      elif pool.symString(fld) == DataField and
             obj.exprKind in {DerefX, HderefX}:
         inc obj
-        var t = getTypeImpl(c, obj, flags)
-        if t.kind == Symbol:
+        var t = skipOwned getTypeImpl(c, obj, flags)
+        if t.isSymbol:
           var counter = 20
-          while counter > 0 and t.kind == Symbol:
+          while counter > 0 and t.isSymbol:
             dec counter
             let res = tryLoadSym(t.symId)
             if res.status == LacksNothing and res.decl.stmtKind == TypeS:
               let decl = asTypeDecl(res.decl)
-              t = decl.body
+              t = skipOwned decl.body
             else:
               break
         if t.typeKind == RefT:
@@ -471,12 +602,12 @@ proc getTypeImpl(c: var TypeCache; n: Cursor; flags: set[GetTypeFlag]): Cursor =
         result = c.builtins.autoType
 
   of DerefX, HderefX:
-    result = getTypeImpl(c, n.firstSon, flags)
-    if typeKind(result) == SinkT:
+    result = getTypeImpl(c, n.childCursor, flags)
+    if typeKind(result) in {SinkT, OwnedT}:
       inc result
 
     var counter = 20
-    while counter > 0 and result.kind == Symbol:
+    while counter > 0 and result.isSymbol:
       dec counter
       let d = getTypeSection(result.symId)
       if d.kind == TypeY:
@@ -496,26 +627,24 @@ proc getTypeImpl(c: var TypeCache; n: Cursor; flags: set[GetTypeFlag]): Cursor =
     # determining the type of `(err)` is not an error by itself:
     result = n
   of AddrX, HaddrX:
-    let elemType = getTypeImpl(c, n.firstSon, flags)
+    let elemType = getTypeImpl(c, n.childCursor, flags)
     var buf = createTokenBuf(4)
-    buf.add parLeToken(PtrT, n.info)
+    buf.addParLe(PtrT, n.info)
     buf.addSubtree elemType
     buf.addParRi()
-    c.mem.add buf
-    result = cursorAt(c.mem[c.mem.len-1], 0)
+    result = cursorAt(buf, 0)
   of CurlyX:
     # should not be encountered but keep this code for now
-    let elemType = getTypeImpl(c, n.firstSon, flags)
+    let elemType = getTypeImpl(c, n.childCursor, flags)
     var buf = createTokenBuf(4)
-    buf.add parLeToken(SetT, n.info)
+    buf.addParLe(SetT, n.info)
     buf.addSubtree elemType
     buf.addParRi()
-    c.mem.add buf
-    result = cursorAt(c.mem[c.mem.len-1], 0)
+    result = cursorAt(buf, 0)
   of TupX:
     # should not be encountered but keep this code for now
     var buf = createTokenBuf(4)
-    buf.add parLeToken(TupleT, n.info)
+    buf.addParLe(TupleT, n.info)
     var n = n
     n.into:
       while n.hasMore:
@@ -526,15 +655,14 @@ proc getTypeImpl(c: var TypeCache; n: Cursor; flags: set[GetTypeFlag]): Cursor =
         buf.addSubtree getTypeImpl(c, val, flags)
         skip n
     buf.addParRi()
-    c.mem.add buf
-    result = cursorAt(c.mem[c.mem.len-1], 0)
+    result = cursorAt(buf, 0)
   of TupatX:
     result = tupatType(c, n, flags)
   of BracketX:
     # should not be encountered but keep this code for now
-    let elemType = getTypeImpl(c, n.firstSon, flags)
+    let elemType = getTypeImpl(c, n.childCursor, flags)
     var buf = createTokenBuf(4)
-    buf.add parLeToken(ArrayT, n.info)
+    buf.addParLe(ArrayT, n.info)
     buf.addSubtree elemType
     var n = n
     var arrayLen = 0
@@ -545,12 +673,11 @@ proc getTypeImpl(c: var TypeCache; n: Cursor; flags: set[GetTypeFlag]): Cursor =
         inc arrayLen
     buf.addIntLit(arrayLen, info)
     buf.addParRi()
-    c.mem.add buf
-    result = cursorAt(c.mem[c.mem.len-1], 0)
+    result = cursorAt(buf, 0)
   of DestroyX, CopyX, WasmovedX, SinkhX, TraceX:
     result = c.builtins.voidType
   of DupX:
-    result = getTypeImpl(c, n.firstSon, flags)
+    result = getTypeImpl(c, n.childCursor, flags)
   of CurlyatX, TabconstrX:
     # error: should have been eliminated earlier
     result = c.builtins.autoType
@@ -558,8 +685,8 @@ proc getTypeImpl(c: var TypeCache; n: Cursor; flags: set[GetTypeFlag]): Cursor =
     var n = n
     inc n # tag
     skip n # expr
-    if n.kind in {Ident, StringLit}:
-      case pool.strings[n.litId]
+    if n.isIdent or n.isStringLit:
+      case pool.strings[n.strId]
       of "i": result = c.builtins.intType
       of "i8": result = c.builtins.int8Type
       of "i16": result = c.builtins.int16Type
@@ -579,47 +706,62 @@ proc getTypeImpl(c: var TypeCache; n: Cursor; flags: set[GetTypeFlag]): Cursor =
   of EnvpX:
     result = c.builtins.autoType
   of ToClosureX:
-    let srcProc = getTypeImpl(c, n.firstSon, flags).asRoutine
-    assert srcProc.kind != NoSym
+    # `sigmatch.procTypeMatch` wraps *any* nimcall source in `(toClosure X)`,
+    # not only a routine symbol: a variable, field or parameter of nimcall proc
+    # type lands here too (nim-lang/nimony#2404). Whatever the source is, the
+    # type of the wrapper is a proctype/itertype carrying `(closure)` -- the
+    # same shape `sigmatch.procTypeOfRoutineSym` builds for the matching side.
+    var t = skipTypeAliases(getTypeImpl(c, n.childCursor, flags))
+    let kind = t.typeKind
+    if kind notin RoutineTypes:
+      # not a proc type at all: report it unchanged instead of inventing a
+      # type the rest of the pipeline cannot use.
+      return t
+    var nilTag = t
+    inc nilTag                    # slot 0, the nilability tag of a type form
+    skipToParams t                # the params, for a decl and a type form alike
     var buf = createTokenBuf()
-    copyIntoKind(buf, srcProc.kind, n.info):
-      buf.addDotToken() # name
-      buf.addDotToken() # exported
-      buf.addSubtree srcProc.pattern
-      buf.addDotToken() # typevars
-      buf.addSubtree srcProc.params
-      buf.addSubtree srcProc.retType
-      copyIntoKind(buf, PragmasU, srcProc.pragmas.info):
-        if srcProc.pragmas.kind != DotToken:
-          var n2 = srcProc.pragmas
-          loopInto n2:
-            buf.takeTree n2
+    copyIntoKind(buf, (if kind in {IteratorT, ItertypeT}: ItertypeT else: ProctypeT), n.info):
+      if kind in {ProctypeT, ItertypeT}:
+        buf.takeTree nilTag       # nilability
+      else:
+        buf.addDotToken()         # a routine decl has no nilability tag
+      buf.takeTree t              # params
+      buf.takeTree t              # return type
+      copyIntoKind(buf, PragmasU, t.info):
+        if t.isDotToken:
+          inc t
+        else:
+          loopInto t:
+            buf.takeTree t
         buf.addParPair(ClosureP)
-      buf.addDotToken # effects
-    c.mem.add buf
-    result = cursorAt(c.mem[c.mem.len-1], 0)
+    result = cursorAt(buf, 0)
 
   assert result.hasMore, "ParRi for expression: " & toString(n, false)
 
 proc getType*(c: var TypeCache; n: Cursor; flags: set[GetTypeFlag] = {}): Cursor =
   result = getTypeImpl(c, n, flags)
   #assert result.typeKind != AutoT
+  if not c.keepOwned and result.typeKind == OwnedT:
+    inc result
   if SkipAliases in flags:
     var counter = 20
-    while counter > 0 and result.kind == Symbol:
+    while counter > 0 and result.isSymbol:
       dec counter
       let d = lookupSymbol(c, result.symId)
       if not cursorIsNil(d) and d.stmtKind == TypeS:
         let decl = asTypeDecl(d)
         result = decl.body
+        if not c.keepOwned and result.typeKind == OwnedT:
+          inc result
       else:
         break
   assert result.hasMore
 
-proc takeRoutineHeader*(c: var TypeCache; dest: var TokenBuf; decl: Cursor; n: var Cursor): bool =
+proc takeRoutineHeader*(c: var TypeCache; dest: var TokenBuf; decl: Cursor; n: var Cursor): bool {.nifReads.} =
   # returns false if the routine is generic
   result = true # assume it is concrete
-  assert n.kind == SymbolDef, "expected SymbolDef, got: " & toString(n, false)
+  assert n.isSymbolDef, "expected SymbolDef, got: " & toString(n, false)
   let sym = n.symId
   for i in 0..<BodyPos:
     if i == ParamsPos:
@@ -628,7 +770,7 @@ proc takeRoutineHeader*(c: var TypeCache; dest: var TokenBuf; decl: Cursor; n: v
       result = n.substructureKind != TypevarsU
     takeTree dest, n
 
-proc takeLocalHeader*(c: var TypeCache; dest: var TokenBuf; n: var Cursor; kind: SymKind) =
+proc takeLocalHeader*(c: var TypeCache; dest: var TokenBuf; n: var Cursor; kind: SymKind) {.nifReads.} =
   let name = n.symId
   takeTree dest, n # name
   takeTree dest, n # export marker
@@ -639,8 +781,7 @@ proc takeLocalHeader*(c: var TypeCache; dest: var TokenBuf; n: var Cursor; kind:
 
 proc registerLocalPtrOf*(c: var TypeCache; name: SymId; kind: SymKind; elemType: Cursor) =
   var buf = createTokenBuf(4)
-  buf.add parLeToken(PtrT, elemType.info)
+  buf.addParLe(PtrT, elemType.info)
   buf.addSubtree elemType
   buf.addParRi()
-  c.mem.add buf
-  c.registerLocal(name, kind, cursorAt(c.mem[c.mem.len-1], 0))
+  c.registerLocal(name, kind, cursorAt(buf, 0))

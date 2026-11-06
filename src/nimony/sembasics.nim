@@ -19,13 +19,18 @@ import ".." / gear2 / modnames
 
 # -------------- symbol lookups -------------------------------------
 
+type
+  ChoiceOption* = enum
+    FindAll, FindOverloads, InnerMost
+
 template buildTree*(dest: var TokenBuf; kind: StmtKind|ExprKind|TypeKind|SymKind|NimonyOther;
-                    info: PackedLineInfo; body: untyped) =
+                    info: NifLineInfo; body: untyped) =
   addParLe(dest, kind, info)
   body
   dest.addParRi()
 
-proc considerImportedSymbols(c: var SemContext; dest: var TokenBuf; name: StrId; info: PackedLineInfo): int =
+proc considerImportedSymbols(c: var SemContext; dest: var TokenBuf; name: StrId; info: NifLineInfo;
+                             marker: var HashSet[SymId]; option = FindAll): int =
   result = 0
   let ignoreStyle = IgnoreStyleFeature in c.features
   for realName in stylesOfImport(c.importTab, name, ignoreStyle):
@@ -33,14 +38,23 @@ proc considerImportedSymbols(c: var SemContext; dest: var TokenBuf; name: StrId;
       let iface = addr c.importedModules.getOrQuit(moduleId).iface
       for foreignName in stylesOfIface(iface[], realName, ignoreStyle):
         let candidates = addr iface[].getOrQuit(foreignName)
-        inc result, candidates[].len
         for defId in candidates[]:
-          dest.add symToken(defId, info)
+          # when resolving a caller `fn`, keep re-exported modules out of the
+          # sym choice so `foo[...]` binds the proc, not a same-named module
+          # (nim-lang/nimony#2130):
+          var callable = true
+          if option == FindOverloads:
+            let res = tryLoadSym(defId)
+            if res.status == LacksNothing:
+              callable = isValidFnHead(res.decl.symKind)
+          if callable and not marker.containsOrIncl(defId):
+            inc result
+            dest.addSymUse(defId, info)
 
-proc addSymUse*(dest: var TokenBuf; s: Sym; info: PackedLineInfo) =
-  dest.add symToken(s.name, info)
+proc addSymUse*(dest: var TokenBuf; s: Sym; info: NifLineInfo) =
+  dest.addSymUse(s.name, info)
 
-proc buildSymChoiceForDot(c: var SemContext; dest: var TokenBuf; identifier: StrId; info: PackedLineInfo) =
+proc buildSymChoiceForDot(c: var SemContext; dest: var TokenBuf; identifier: StrId; info: NifLineInfo) =
   # not used yet
   var count = 0
   let oldLen = dest.len
@@ -54,18 +68,19 @@ proc buildSymChoiceForDot(c: var SemContext; dest: var TokenBuf; identifier: Str
             dest.addSymUse sym, info
             inc count
       it = it.up
-    inc count, considerImportedSymbols(c, dest, identifier, info)
+    var marker = initHashSet[SymId]()
+    inc count, considerImportedSymbols(c, dest, identifier, info, marker)
 
   # if the sym choice is empty, create an ident node:
   if count == 0:
     dest.shrink oldLen
-    dest.add identToken(identifier, info)
+    dest.addIdent(identifier, info)
 
 proc isNonOverloadable*(t: SymKind): bool {.inline.} =
-  t in {LetY, VarY, ParamY, TypevarY, StaticTypevarY, ConstY, TypeY, ResultY, FldY, GfldY, CursorY, PatternvarY, BlockY, GletY, TletY, GvarY, TvarY}
+  t in {LetY, VarY, ParamY, StaticParamY, TypevarY, StaticTypevarY, ConstY, TypeY, ResultY, FldY, GfldY, CursorY, PatternvarY, BlockY, GletY, TletY, GvarY, TvarY}
 
 proc buildSymChoiceForSelfModule*(c: var SemContext; dest: var TokenBuf;
-                                  identifier: StrId; info: PackedLineInfo): int =
+                                  identifier: StrId; info: NifLineInfo): int =
   result = 0
   let oldLen = dest.len
   let ignoreStyle = IgnoreStyleFeature in c.features
@@ -80,7 +95,7 @@ proc buildSymChoiceForSelfModule*(c: var SemContext; dest: var TokenBuf;
   # if the sym choice is empty, create an ident node:
   if result == 0:
     dest.shrink oldLen
-    dest.add identToken(identifier, info)
+    dest.addIdent(identifier, info)
 
 iterator topLevelSyms*(c: var SemContext; identifier: StrId): SymId {.sideEffect.} =
   let ignoreStyle = IgnoreStyleFeature in c.features
@@ -91,7 +106,7 @@ iterator topLevelSyms*(c: var SemContext; identifier: StrId): SymId {.sideEffect
       yield sym.name
 
 proc rawBuildSymChoiceForForeignModule(c: var SemContext; dest: var TokenBuf; module: SymId;
-                                       identifier: StrId; info: PackedLineInfo;
+                                       identifier: StrId; info: NifLineInfo;
                                        marker: var HashSet[SymId]): int =
   result = 0
   let m = addr c.importedModules.getOrQuit(module)
@@ -100,14 +115,14 @@ proc rawBuildSymChoiceForForeignModule(c: var SemContext; dest: var TokenBuf; mo
     let candidates = m[].iface.getOrDefault(k)
     for defId in candidates:
       if not marker.containsOrIncl(defId):
-        dest.add symToken(defId, info)
+        dest.addSymUse(defId, info)
       inc result
   for forward, filter in m[].exports:
     if filterAllows(filter, identifier):
       inc result, rawBuildSymChoiceForForeignModule(c, dest, forward, identifier, info, marker)
 
 proc buildSymChoiceForForeignModule*(c: var SemContext; dest: var TokenBuf; module: SymId;
-                                     identifier: StrId; info: PackedLineInfo): int =
+                                     identifier: StrId; info: NifLineInfo): int =
   let oldLen = dest.len
   dest.buildTree OchoiceX, info:
     var marker = initHashSet[SymId]()
@@ -115,44 +130,83 @@ proc buildSymChoiceForForeignModule*(c: var SemContext; dest: var TokenBuf; modu
   # if the sym choice is empty, create an ident node:
   if result == 0:
     dest.shrink oldLen
-    dest.add identToken(identifier, info)
+    dest.addIdent(identifier, info)
 
-type
-  ChoiceOption* = enum
-    FindAll, FindOverloads, InnerMost
-
-proc rawBuildSymChoice(c: var SemContext; dest: var TokenBuf; identifier: StrId; info: PackedLineInfo;
-                       option = FindAll): int =
+proc rawBuildSymChoice(c: var SemContext; dest: var TokenBuf; identifier: StrId; info: NifLineInfo;
+                       option: ChoiceOption; nearestIsUnique: var bool): int =
+  ## Gathers every candidate for `identifier` into `dest`, innermost level
+  ## first. A module's own toplevel scope and everything imported into it are
+  ## the SAME, outermost level: `import` is not a shadowing boundary, it is the
+  ## `Scope` / `ImportScope` distance that overload resolution already ranks by
+  ## (see "Identifier lookup" and "Module-of-origin" in doc/language.md).
+  ##
+  ## `nearestIsUnique` reports whether the nearest level that contributed
+  ## anything contributed exactly one candidate; that is what lets a consumer
+  ## fall back to scope distance once type information has had its say.
+  ##
+  ## A symbol is a candidate once, however many ways it is visible: a module
+  ## imported directly and re-exported by another is one module, not an
+  ## ambiguity between two.
   result = 0
+  var nearest = -1
+  var marker = initHashSet[SymId]()
   let ignoreStyle = IgnoreStyleFeature in c.features
   var it = c.currentScope
   while it != nil:
     var nonOverloadable = 0
+    let before = result
     for k in stylesOfScope(it, identifier, ignoreStyle):
       for sym in it.tab.getOrDefault(k):
-        dest.addSymUse sym, info
-        inc result
-        if sym.kind.isNonOverloadable:
-          inc nonOverloadable
-    if result == 1 and (option == InnerMost or
-        (option == FindOverloads and nonOverloadable == 1)):
-      # unambiguous local symbol found
-      # in case of FindOverloads, if symbol is overloadable, consider other overloads
+        # An object field is only reachable through `obj.field`; it is added
+        # to its object's scope purely so a duplicate field name is caught by
+        # `addNonOverloadable`, and (unlike every other local) it is never
+        # `publish`ed (see `semLocal`). Do not hand it out as a bare-identifier
+        # candidate: a field can otherwise shadow an outer type of the same
+        # name while its own sibling fields are still being sem-checked
+        # (`type Holder = object; seq: int; items: seq[Item]`), and the field
+        # symbol's position is meaningless outside its `(fld ...)` — resolving
+        # it as a value crashes `declToCursor`'s local-type skip instead of
+        # just being the "undeclared identifier" a bare field name is in Nim.
+        #
+        # when resolving a caller `fn`, keep the module symbol out of the sym
+        # choice so `foo[...]` binds a same-named proc (nim-lang/nimony#2130):
+        if sym.kind notin {FldY, GfldY} and
+            (option != FindOverloads or isValidFnHead(sym.kind)) and
+            not marker.containsOrIncl(sym.name):
+          dest.addSymUse sym, info
+          inc result
+          if sym.kind.isNonOverloadable:
+            inc nonOverloadable
+    if nearest < 0 and result > before: nearest = result - before
+    # A lone NON-overloadable declaration (let, var, const, type, param, …)
+    # shadows: nothing further out is visible. Overloadable ones — routines
+    # and enum fields — never shadow; they accumulate, and context plus scope
+    # distance sort them out later. `FindAll` wants everything regardless.
+    if result == 1 and nonOverloadable == 1 and option != FindAll:
+      nearestIsUnique = true
       return
     it = it.up
-  inc result, considerImportedSymbols(c, dest, identifier, info)
+  let beforeImports = result
+  inc result, considerImportedSymbols(c, dest, identifier, info, marker, option)
+  if nearest < 0 and result > beforeImports: nearest = result - beforeImports
+  nearestIsUnique = nearest == 1
 
-proc buildSymChoice*(c: var SemContext; dest: var TokenBuf; identifier: StrId; info: PackedLineInfo;
-                    option: ChoiceOption): int =
+proc buildSymChoice*(c: var SemContext; dest: var TokenBuf; identifier: StrId; info: NifLineInfo;
+                    option: ChoiceOption; nearestIsUnique: var bool): int =
   let oldLen = dest.len
   dest.buildTree OchoiceX, info:
-    result = rawBuildSymChoice(c, dest, identifier, info, option)
+    result = rawBuildSymChoice(c, dest, identifier, info, option, nearestIsUnique)
   # if the sym choice is empty, create an ident node:
   if result == 0:
     dest.shrink oldLen
-    dest.add identToken(identifier, info)
+    dest.addIdent(identifier, info)
 
-proc addSymChoiceSyms*(c: var SemContext; dest: var TokenBuf; identifier: StrId; marker: var HashSet[SymId]; info: PackedLineInfo) =
+proc buildSymChoice*(c: var SemContext; dest: var TokenBuf; identifier: StrId; info: NifLineInfo;
+                    option: ChoiceOption): int =
+  var nearestIsUnique = false
+  result = buildSymChoice(c, dest, identifier, info, option, nearestIsUnique)
+
+proc addSymChoiceSyms*(c: var SemContext; dest: var TokenBuf; identifier: StrId; marker: var HashSet[SymId]; info: NifLineInfo) =
   # like rawBuildSymChoice but adds to an existing symchoice, ignoring duplicates
   let ignoreStyle = IgnoreStyleFeature in c.features
   var it = c.currentScope
@@ -170,7 +224,7 @@ proc addSymChoiceSyms*(c: var SemContext; dest: var TokenBuf; identifier: StrId;
         let candidates = addr iface[].getOrQuit(foreignName)
         for defId in candidates[]:
           if not marker.containsOrIncl(defId):
-            dest.add symToken(defId, info)
+            dest.addSymUse(defId, info)
 
 proc isDeclared*(c: var SemContext; name: StrId): bool =
   let ignoreStyle = IgnoreStyleFeature in c.features
@@ -198,17 +252,26 @@ template withNewScope*(c: var SemContext; body: untyped) =
 
 # -------------------------- error handling -------------------------
 
-proc pushErrorContext*(c: var SemContext; info: PackedLineInfo) = c.instantiatedFrom.add info
+proc pushErrorContext*(c: var SemContext; info: NifLineInfo) = c.instantiatedFrom.add info
 proc popErrorContext(c: var SemContext) = discard c.instantiatedFrom.pop
 
-template withErrorContext*(c: var SemContext; info: PackedLineInfo; body: untyped) =
+template withErrorContext*(c: var SemContext; info: NifLineInfo; body: untyped) =
   pushErrorContext(c, info)
   try:
     body
   finally:
     popErrorContext(c)
 
-proc buildErr*(c: var SemContext; dest: var TokenBuf; info: PackedLineInfo; msg: string; orig: Cursor) =
+proc buildErr*(c: var SemContext; dest: var TokenBuf; info: NifLineInfo; msg: string; orig: Cursor) =
+  ## Call this proc when you find compile errors.
+  ## Adds `ErrT` node on `dest` and `msg` is printed with `info` later.
+  ## `orig` points to the node causing the compile error.
+  ## If there is any `Err` node in `orig`,  `orig` and `msg` in the child node is used.
+  ##
+  ## There are nodes that have a specific number of children.
+  ## You should avoid making a node with wrong number of children with this proc.
+  ##
+  ## Errors in `ErrT` are printed in `reportErrors` proc in `nimony/reporters.nim`.
   when defined(debugBuildErr):
     if not c.debugAllowErrors:
       writeStackTrace()
@@ -216,17 +279,17 @@ proc buildErr*(c: var SemContext; dest: var TokenBuf; info: PackedLineInfo; msg:
         echo "instantiated from: ", infoToStr(instFrom)
 
       echo infoToStr(info) & " Error: " & msg
-      if orig.kind != DotToken:
+      if not orig.isDotToken:
         echo "Source: ", toString(orig, false)
       quit 1
   var n = orig
   var hasErr = false
-  if n.kind == ParLe:
-    if n.tagId == nifstreams.ErrT:
+  if n.isTagLit:
+    if n.cursorTagId == nifpools.ErrT:
       hasErr = true
     else:
       n.linearScan:
-        if n.tagId == nifstreams.ErrT:
+        if n.cursorTagId == nifpools.ErrT:
           hasErr = true
           break
   let info = if hasErr: n.info else: info
@@ -237,19 +300,19 @@ proc buildErr*(c: var SemContext; dest: var TokenBuf; info: PackedLineInfo; msg:
     else:
       dest.addSubtree orig
     for instFrom in items(c.instantiatedFrom):
-      dest.add dotToken(instFrom)
+      dest.addDotToken(instFrom)
     if hasErr:
-      while n.kind == DotToken: inc n
+      while n.isDotToken: inc n
       dest.takeTree n
     else:
-      dest.add strToken(pool.strings.getOrIncl(msg), info)
+      dest.addStrLit(msg, info)
 
-proc buildErr*(c: var SemContext; dest: var TokenBuf; info: PackedLineInfo; msg: string) =
+proc buildErr*(c: var SemContext; dest: var TokenBuf; info: NifLineInfo; msg: string) =
   var orig = createTokenBuf(1)
   orig.addDotToken()
   c.buildErr dest, info, msg, cursorAt(orig, 0)
 
-proc warn*(c: var SemContext; info: PackedLineInfo; msg: string) =
+proc warn*(c: var SemContext; info: NifLineInfo; msg: string) =
   ## Emit a user-facing compile-time warning. Unlike `buildErr`, a warning is not
   ## written into the tree (it must not abort compilation or reach later passes);
   ## it is printed immediately through a `Reporter`, exactly as `reportErrors`
@@ -268,29 +331,56 @@ proc warn*(c: var SemContext; info: PackedLineInfo; msg: string) =
     var r = Reporter(verbosity: 2, noColors: not useColors())
     r.warn infoToStr(info), msg
 
-proc combineErr*(c: var SemContext; dest: var TokenBuf; pos: int; info: PackedLineInfo; msg: string; orig: Cursor) =
-  ## Builds ErrT node and combine it with the node at `pos` so that no nodes are added outside of
-  ## the node at `pos`.
-  ## When there is no node at `pos`, New ErrT node is added to `c.dest`.
-  ## Assumes the node at `pos` is the last node.
-  var needsParRi = false
-  if dest.len > pos:
-    needsParRi = true
-    if dest[pos].stmtKind == StmtsS:
-      assert dest[dest.len - 1].kind == ParRi
-      dest.shrink(dest.len - 1)
-    else:
-      dest.insert [parLeToken(StmtsS, dest[pos].info)], pos
-  buildErr c, dest, info, msg, orig
-  if needsParRi:
-    dest.addParRi
+proc buildErrAt*(c: var SemContext; dest: var TokenBuf; pos: int; msg: string) =
+  ## Builds ErrT node on the existing node at `pos` and it becomes the origin of the error.
+  ## If the node at `pos` is a tag node, it must be closed.
+  ## e.g:
+  ## input:
+  ## content of `dest`: (tagX (tagY a) (tagZ b))
+  ## `pos`:                   ^
+  ## output:
+  ## content of `dest`: (tagX (err (tagY a) ...) (tagZ b))
+  assert dest.len > pos
+  var tmpBuf = createTokenBuf()
+  block:
+    let n = readonlyCursorAt(dest, pos)
+    buildErr c, tmpBuf, n.info, msg, n
+  let errAt = beginRead(tmpBuf)
+  replace dest, errAt, pos
 
-proc combineErr*(c: var SemContext; dest: var TokenBuf; pos: int; info: PackedLineInfo; msg: string) =
+proc combineErr*(c: var SemContext; dest: var TokenBuf; pos: int; info: NifLineInfo; msg: string; orig: Cursor) =
+  ## Builds an ErrT node and combines it with the node at `pos` so that what
+  ## spans from `pos` on is still a SINGLE node.
+  ##
+  ## That is the entire contract, and it is not cosmetic. A caller that had
+  ## emitted one child of the node it is building must still have emitted one
+  ## child afterwards, or the enclosing node silently grows an arity nobody
+  ## reading it expects — an `(elif cond body)` becomes `(elif cond err body)`,
+  ## and the next pass to walk it takes `err` for the body and `body` for
+  ## nothing at all.
+  ##
+  ## Assumes the node at `pos` is the last node in `dest`.
+  if dest.len <= pos:
+    # Nothing was emitted at all, so the error node *is* the node.
+    buildErr c, dest, info, msg, orig
+  elif dest[pos].stmtKind == StmtsS:
+    # A statement list can hold the error as one more child of itself.
+    dest.reopenLastTree pos
+    buildErr c, dest, info, msg, orig
+    dest.addParRi
+  else:
+    # Anything else gets wrapped, so one node stays one node. The node at
+    # `pos` becomes the error's origin, which is also the better diagnostic:
+    # it is the expression that was actually wrong, where `orig` is a dot at
+    # every call site there is.
+    buildErrAt c, dest, pos, msg
+
+proc combineErr*(c: var SemContext; dest: var TokenBuf; pos: int; info: NifLineInfo; msg: string) =
   var orig = createTokenBuf(1)
   orig.addDotToken()
   c.combineErr dest, pos, info, msg, cursorAt(orig, 0)
 
-proc buildLocalErr*(dest: var TokenBuf; info: PackedLineInfo; msg: string; orig: Cursor) =
+proc buildLocalErr*(dest: var TokenBuf; info: NifLineInfo; msg: string; orig: Cursor) =
   when defined(debug):
     if true: # not c.debugAllowErrors: - c not given
       writeStackTrace()
@@ -298,9 +388,9 @@ proc buildLocalErr*(dest: var TokenBuf; info: PackedLineInfo; msg: string; orig:
       quit msg
   dest.buildTree ErrT, info:
     dest.addSubtree orig
-    dest.add strToken(pool.strings.getOrIncl(msg), info)
+    dest.addStrLit(msg, info)
 
-proc buildLocalErr*(dest: var TokenBuf; info: PackedLineInfo; msg: string) =
+proc buildLocalErr*(dest: var TokenBuf; info: NifLineInfo; msg: string) =
   var orig = createTokenBuf(1)
   orig.addDotToken()
   dest.buildLocalErr info, msg, cursorAt(orig, 0)
@@ -324,21 +414,15 @@ proc ptrTypeOf*(c: var SemContext; dest: var TokenBuf; typ: TypeCursor): TypeCur
 proc declToCursor*(c: var SemContext; dest: var TokenBuf; s: Sym): LoadResult =
   if knowsSym(s.name) or s.pos == ImportedPos:
     result = tryLoadSym(s.name)
-  elif s.pos > 0:
+  elif s.pos > 0 and s.pos <= dest.len:
+    # `pos` is an offset into the buffer the declaration was emitted into; a
+    # scratch `dest` (a type expression, say) that is shorter cannot hold it,
+    # e.g. a routine named inside its own still unfinished signature
     var buf = createTokenBuf(10)
-    var pos = s.pos - 1
-    var nested = 0
     # XXX optimize this for non-generic procs. No need to
     # copy their bodies here.
-    while true:
-      buf.add dest[pos]
-      case dest[pos].kind
-      of ParLe: inc nested
-      of ParRi:
-        dec nested
-        if nested == 0: break
-      else: discard
-      inc pos
+    let decl = cursorAt(dest, s.pos - 1)
+    buf.addSubtree decl
     result = LoadResult(status: LacksNothing, decl: cursorAt(buf, 0))
     programs.publish s.name, buf, c.phase
   else:
@@ -373,14 +457,18 @@ proc makeLocalSym*(c: var SemContext; result: var string) =
   result.add '.'
   result.addInt counter[]
 
-proc newSymId*(c: var SemContext; s: SymId): SymId =
-  var isGlobal = false
-  var name = extractBasename(pool.syms[s], isGlobal)
-  if isGlobal:
+proc newSymId*(c: var SemContext; s: SymId; forceGlobal = false): SymId =
+  ## A fresh name for a copy of `s`, keeping its layout — `forceGlobal` promotes
+  ## a local-layout one because the copy lands at MODULE scope where the original
+  ## did not (a template body declares in the template's scope; expanding it at
+  ## toplevel puts the declaration in the module). See `expandTemplateImpl`.
+  let isGlobal = not pool.symIsLocal(s)
+  var name = pool.symBasename(s)
+  if isGlobal or forceGlobal:
     c.makeGlobalSym(name)
   else:
     c.makeLocalSym(name)
-  result = pool.syms.getOrIncl(name)
+  result = pool.symId(name)
 
 proc classifyType*(c: var SemContext; n: Cursor): TypeKind =
   result = typeKind(n)
@@ -389,24 +477,47 @@ proc hasErrorSince*(dest: TokenBuf; start: int): bool =
   ## True when `dest[start..]` already contains an `(err ...)` node. Used to
   ## avoid stacking a redundant follow-up error on top of one semExpr already
   ## produced (e.g. `auto`-typed expression from an undeclared identifier).
-  let errTag = pool.tags.getOrIncl("err")
+  let errTag = globalTags.registerTag("err")
   var i = start
   result = false
   while i < dest.len:
-    if dest[i].kind == ParLe and dest[i].tagId == errTag:
+    if dest[i].kind == TagLit and dest[i].tagId == errTag:
       result = true
       break
     inc i
 
-proc makeTemplateSym*(c: var SemContext; result: var string) =
+const RoutineLikeSyms* = {TypevarY, StaticTypevarY, ProcY, FuncY, ConverterY,
+                          MethodY, TemplateY, MacroY, IteratorY, TypeY, EfldY,
+                          ConstY}
+  ## The kinds that get GLOBAL symbol layout wherever they are written, because
+  ## the backends lift every one of them out to module scope regardless of the
+  ## scope it was declared in (a const: `finalir.toFinalIr`). `identToSym` and `makeTemplateSym` must agree on
+  ## this set or the same declaration is named two different ways depending on
+  ## whether a template introduced it.
+
+proc makeTemplateSym*(c: var SemContext; result: var string; kind: SymKind) =
   ## Make a fresh symbol for a name introduced by a template body. Templates
   ## need a separate mechanism from `makeLocalSym` so that cross-module
   ## interference can be addressed without promoting the sym to global
   ## layout — i.e. without mangling in `c.thisModuleSuffix`.
-  var counter = addr c.locals.mgetOrPut(result, -1)
-  counter[] += 1
-  result.add '.'
-  result.addInt counter[]
+  ##
+  ## Except for the kinds that are module-level declarations no matter where
+  ## they are WRITTEN. A gensym'd `proc` inside an untyped template used to come
+  ## out as `helper.1`, a local-layout name, on a declaration the backends emit
+  ## at module scope: `nifcoreparse.toModuleString` indexes a decl only when its
+  ## name says global, so nothing named it in the module's `(.index …)`, and the
+  ## module was fine to compile and impossible to IMPORT — nifasm resolves a
+  ## foreign module's decls through that index and reported "Unknown symbol:
+  ## helper.1" in the importer. A local name on a module-level decl is also two
+  ## modules' `helper.1` in one link, which is the same bug waiting for a name
+  ## collision.
+  if kind in RoutineLikeSyms:
+    c.makeGlobalSym(result)
+  else:
+    var counter = addr c.locals.mgetOrPut(result, -1)
+    counter[] += 1
+    result.add '.'
+    result.addInt counter[]
 
 type
   SymStatus* = enum
@@ -416,7 +527,7 @@ type
     status*: SymStatus
     lit*: StrId
     s*: Sym
-    info*: PackedLineInfo
+    info*: NifLineInfo
 
 proc identToSym*(c: var SemContext; str: sink string; kind: SymKind): SymId =
   var name = str
@@ -428,27 +539,26 @@ proc identToSym*(c: var SemContext; str: sink string; kind: SymKind): SymId =
   if kind in {FldY, GfldY}:
     c.makeFieldSym(name)
   elif c.currentScope.kind == ToplevelScope or
-      kind in {TypevarY, StaticTypevarY, ProcY, FuncY, ConverterY, MethodY, TemplateY, MacroY, IteratorY, TypeY, EfldY}:
+      kind in RoutineLikeSyms:
     c.makeGlobalSym(name)
   else:
     c.makeLocalSym(name)
-  result = pool.syms.getOrIncl(name)
+  result = pool.symId(name)
 
 proc identToSym*(c: var SemContext; lit: StrId; kind: SymKind): SymId =
   result = identToSym(c, pool.strings[lit], kind)
 
 proc symToIdent*(s: SymId): StrId =
-  var name = pool.syms[s]
-  extractBasename name
   when false:
     # XXX activate this later!
+    var name = pool.symBasename(s)
     for i in 0..<name.len:
       if name[i] == ' ': name[i] = '.'
-  result = pool.strings.getOrIncl name
+  result = pool.symNameId(s)
 
 proc declareSym*(c: var SemContext; dest: var TokenBuf; it: var Item; kind: SymKind): SymStatus =
   let info = it.n.info
-  if it.n.kind == SymbolDef:
+  if it.n.isSymbolDef:
     if not c.freshSyms.missingOrExcl(it.n.symId):
       result = OkExistingFresh
     else:
@@ -466,18 +576,17 @@ proc declareSym*(c: var SemContext; dest: var TokenBuf; it: var Item; kind: SymK
         c.buildErr dest, info, "attempt to redeclare: " & pool.strings[lit]
         result = ErrRedef
       else:
-        dest.add symdefToken(s.name, info)
+        dest.addSymDef(s.name, info)
         result = OkNew
 
 proc declareOverloadableSym*(c: var SemContext; dest: var TokenBuf; it: var Item; kind: SymKind): (SymId, SymStatus) =
   let info = it.n.info
-  if it.n.kind == SymbolDef:
+  if it.n.isSymbolDef:
     var status = OkExisting
     if not c.freshSyms.missingOrExcl(it.n.symId):
       status = OkExistingFresh
     result = (it.n.symId, status)
-    dest.add it.n
-    inc it.n
+    dest.takeTree it.n
   else:
     let lit = takeIdent(it.n)
     if lit == StrId(0):
@@ -488,7 +597,7 @@ proc declareOverloadableSym*(c: var SemContext; dest: var TokenBuf; it: var Item
       let s = Sym(kind: kind, name: result[0],
                   pos: dest.len)
       addOverloadable(c.currentScope, lit, s)
-      dest.add symdefToken(s.name, info)
+      dest.addSymDef(s.name, info)
 
 proc success*(s: SymStatus): bool {.inline.} = s in {OkNew, OkExisting, OkExistingFresh}
 proc success*(s: DelayedSym): bool {.inline.} = success s.status
@@ -497,8 +606,8 @@ proc markSymInProgress*(c: var SemContext; s: SymId)  # forward decl
 
 proc handleSymDef*(c: var SemContext; dest: var TokenBuf; n: var Cursor; kind: SymKind): DelayedSym =
   let info = n.info
-  if n.kind == Ident:
-    let lit = n.litId
+  if n.isIdent:
+    let lit = n.strId
     if kind in {LetY, VarY, GletY, GvarY, TletY, TvarY} and
         c.currentScope.kind == ToplevelScope and
         c.onDemandResolved.hasKey(lit):
@@ -510,36 +619,35 @@ proc handleSymDef*(c: var SemContext; dest: var TokenBuf; n: var Cursor; kind: S
       let def = c.onDemandResolved.getOrDefault(lit, SymId(0))
       let s = Sym(kind: kind, name: def, pos: dest.len)
       result = DelayedSym(status: OkExistingFresh, lit: lit, s: s, info: info)
-      dest.add symdefToken(def, info)
+      dest.addSymDef(def, info)
       inc n
     else:
       let def = identToSym(c, lit, kind)
       let s = Sym(kind: kind, name: def,
                   pos: dest.len)
       result = DelayedSym(status: OkNew, lit: lit, s: s, info: info)
-      dest.add symdefToken(def, info)
+      dest.addSymDef(def, info)
       inc n
-  elif n.kind == SymbolDef:
+  elif n.isSymbolDef:
     discard "ok, and no need to re-add it to the symbol table ... or is there?"
     let status =
-      if c.phase == SemcheckBodies and kind in {ParamY, TypevarY, StaticTypevarY}: OkNew
+      if c.phase == SemcheckBodies and kind in {ParamY, StaticParamY, TypevarY, StaticTypevarY}: OkNew
       elif not c.freshSyms.missingOrExcl(n.symId): OkExistingFresh
       else: OkExisting
 
     let s = Sym(kind: kind, name: n.symId, pos: dest.len)
     result = DelayedSym(status: status, lit: symToIdent(s.name), s: s, info: info)
-    dest.add n
-    inc n
+    dest.takeTree n
     # Mark toplevel declarations as InProgress for cycle detection
     if kind in {TypeY, ProcY, FuncY, IteratorY, ConverterY, MethodY, TemplateY, MacroY}:
       markSymInProgress(c, s.name)
-  elif n.kind == DotToken:
+  elif n.isDotToken:
     var name = "`anon"
     c.makeLocalSym(name)
-    let symId = pool.syms.getOrIncl(name)
+    let symId = pool.symId(name)
     let s = Sym(kind: kind, name: symId, pos: dest.len)
     result = DelayedSym(status: OkExisting, s: s, info: info)
-    dest.add symdefToken(symId, info)
+    dest.addSymDef(symId, info)
     inc n
   else:
     let lit = takeIdent(n)
@@ -551,7 +659,7 @@ proc handleSymDef*(c: var SemContext; dest: var TokenBuf; n: var Cursor; kind: S
       let s = Sym(kind: kind, name: def,
                   pos: dest.len)
       result = DelayedSym(status: OkNew, lit: lit, s: s, info: info)
-      dest.add symdefToken(def, info)
+      dest.addSymDef(def, info)
 
 proc addSym*(c: var SemContext; dest: var TokenBuf; s: DelayedSym) =
   if s.status == OkNew:
@@ -582,8 +690,7 @@ proc publish*(c: var SemContext; dest: var TokenBuf; s: SymId; start: int) =
 # -------------------------------------------------------------------------------------------------
 
 proc wantDot*(c: var SemContext; dest: var TokenBuf; n: var Cursor) =
-  if n.kind == DotToken:
-    dest.add n
-    inc n
+  if n.isDotToken:
+    dest.takeTree n
   else:
     buildErr c, dest, n.info, "expected '.'"

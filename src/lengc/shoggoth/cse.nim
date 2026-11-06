@@ -24,23 +24,84 @@
 ## leaf. That precise "does this call clobber what I read?" question is answered
 ## by the alias-aware function summaries (`invalidateForCall`).
 ##
+## ## Loop-invariant code motion
+##
+## A load (or cheap arith) whose operands are not written in a loop — and that
+## no in-loop store/call can clobber — is hoisted to the loop's pre-header
+## (insert-before the `(while)` / `(loop)`). A single occurrence in the body
+## still counts: the loop is the reuse. The load must also **execute every
+## iteration** of that loop: a field load behind `if` / `case` / `try`, or
+## inside an inner loop, stays put. Hoisting `a.more.fullLen` out of
+## `if aslen > PayloadSize` segfaults when `a` is a short string (`more ==
+## nil`). Variant expressions (an index the body increments, a field a store
+## aliases) stay inside, with the existing lazy CSE. The same write/alias/
+## summary reasoning as invalidation decides invariance; an unknown call is
+## assumed to clobber anything it can reach.
+##
 ## Candidates: any memory load — `(dot …)`, `(at …)`, `(deref …)`, `(pat …)`.
 ## An assignment's LHS is a write target, not a value, so it is never cached;
 ## `addr` operands (e.g. `var`-parameter arguments) are likewise left alone.
 ##
 ## Invalidation: a cached entry is dropped when an event can change the memory
 ## it reads — a write to a mentioned symbol, an `addr` of a mentioned symbol, a
-## through-pointer/field store (drops everything), or a call whose alias-aware
-## summary says it may write the graph of one of the entry's symbols.
+## through-pointer/field store (class-based; a forging `cast` makes through-
+## pointer stores unknown), or a call whose alias-aware summary says it may
+## write the graph of one of the entry's symbols.
+##
+## ## Second job: redundant index checks
+##
+## `hexer` lowers a `.requires` contract to `if COND: panic` at the top of the
+## callee, and `seq.[]` is `.inline`, so after inlining every element access
+## carries its own copy — `t.hashes[h]` written three times in one loop iteration
+## pays for three. `panic` does not return, so **reaching a second identical
+## guard proves the first one's condition was false**, and the second is dead.
+##
+## That lives here rather than in a pass of its own because it is the same
+## analysis: a canonical key per expression, a branch-scoped `Tracker`, and
+## "has anything since invalidated this?" — answered by the alias classes and
+## function summaries above, which is strictly more precise than a standalone
+## pass could afford. The one thing it needs that the load cache must NOT have is
+## `provenKey`, which resolves a symbol to the expression it was defined from
+## (see the comment there).
 
-import std / [tables, sets, hashes, assertions, strutils, formatfloat]
+import std / [tables, sets, hashes, assertions, strutils, formatfloat, algorithm]
 import ".." / ".." / "lib" / nifcoreparse   # re-exports nifcore
 import ".." / ".." / "lib" / nifcdecl        # stmtKind/exprKind/pragmaKind, tag enums
 import ".." / ".." / "models" / tags          # *TagId ordinals for synthesis
+
+include ".." / ".." / "lib" / compat2         # getOrQuit (host Nim)
+
+proc cmpInts(a, b: int): int = cmp(a, b)
 import trackers, patchsets
 import aliasing                               # intra-proc Steensgaard alias classes
+import accesspaths                            # root :: selector paths (doc/cse.md)
 import ".." / nifmodules                      # MainModule (type context, threaded through)
 import ".." / typenav                         # getType — to skip value-CSE of aggregates
+import intrinsiceffects                       # is this `(instr …)` a pure value?
+
+const AddressCSE = false
+  ## Address-CSE caches `&location` (as a held pointer temp) so repeated read/write
+  ## of one lvalue reuses the address. DISABLED: on the arkham targets a memory
+  ## address is folded into the load/store addressing mode (`or [base+idx*8], m`)
+  ## for free, so caching it saves no work and instead ties up a pointer register
+  ## across the whole live range — measured as the dominant register-pressure source
+  ## in the allocator hot path (9 held pointers in rawAlloc). Value-CSE of genuine
+  ## loads stays on (a load is a real memory access worth factoring); the write-target
+  ## aggregate-skip at `handleCandidate` still holds with an empty `writeTargets`.
+
+const
+  PathStoreInvalidation* = not defined(cseTypeInvalidation)
+    ## Invalidate on a store by comparing ACCESS PATHS (`doc/cse.md`), not by
+    ## comparing the alias classes of every symbol the entry mentions.
+  PathCallInvalidation* = not defined(cseTypeInvalidation)
+    ## The same for the clobber step of a call whose summary is known.
+  ##
+  ## `-d:cseTypeInvalidation` restores both to the type/alias-class analysis
+  ## exactly as `master` has it — the reference the path rules are measured
+  ## against, and the fallback if they ever cost more than they save. Everything
+  ## the type-based analysis needs (`aliasing`, `pointerBearing`, the summary
+  ## partition) is untouched and still built in both modes; only which of the two
+  ## answers the invalidation question changes.
 
 # ---- function summaries (alias-aware; pure data, mirrors hexer/funcsummary) -
 # These are read from `(smry …)` pragmas in the buffer by the nifcore loader
@@ -50,21 +111,75 @@ type
   ParamEffect* = object
     cls*: uint32
     reads*, writes*, slotWritten*, escapes*: bool
+    constRef*: bool                  ## `(constref)`: the parameter is a pointer
+                                     ## `lengcgen` introduced for a BY-VALUE
+                                     ## source parameter. Nothing can write
+                                     ## through it — the precondition that
+                                     ## licensed the pointer, not an analysis
+                                     ## result, so it outlives `callsUnknown`.
 
   FunctionSummary* = object
     writesGlobal*, readsGlobal*, callsUnknown*, raises*: bool
+    noReturn*: bool                  ## `(attr "noreturn")` — control never comes
+                                     ## back, so NOTHING after the call observes
+                                     ## anything it wrote. Not part of `(smry …)`;
+                                     ## read off the same pragmas node.
     resultCls*: uint32
     resultEscapes*: bool
     params*: seq[ParamEffect]
+
+  ForeignSummary = object
+    known: bool                      ## false = probed, genuinely has none
+    s: FunctionSummary
 
   FunctionSummaryTable* = Table[SymId, FunctionSummary]
     ## Collected once from the whole module; cse runs per body. The module and
     ## all per-body buffers share one pool, so `SymId` keys stay consistent.
 
-proc paramMayWrite(s: FunctionSummary; idx: int): bool {.inline.} =
+  SummaryResolver* = object
+    ## Callee `SymId` → `FunctionSummary`: the module's own table first, then
+    ## the callee's own module through `m` (`canLoadForeign`/`getDeclOrNil`),
+    ## memoized either way — a negative is as worth caching as a positive.
+    ## Extracted from `callSummary` so other passes (copyprop's read-only
+    ## addr-taken classification) share the exact resolution and trust model.
+    summaries*: ptr FunctionSummaryTable
+    m*: ptr MainModule
+    cache: Table[SymId, ForeignSummary]
+
+when defined(cseSummaryStats):
+  var gCallsSeen*, gForeignFound*, gForeignMissing*, gNoReturnSaved*: int
+  var gClearUnknown*, gClearGlobal*: int
+  var gEntriesKept*: int
+  var gPathTests*, gPathSavedStore*, gPathSavedCall*: int
+    ## How often the PATH rule kept a cache entry the alias partition alone
+    ## would have dropped — i.e. how much work `doc/cse.md`'s rule 1 is doing on
+    ## real input. Zero here means the two analyses agree everywhere, which is a
+    ## result about the input (SROA has already scalarized the local objects
+    ## whose sibling fields the path rule separates), not about the rule.
+
+proc paramMayWrite*(s: FunctionSummary; idx: int): bool {.inline.} =
+  ## `constRef` survives `callsUnknown`: that blanket is there because an
+  ## unseen callee might write through a pointer it was handed, but a by-value
+  ## source parameter can only be passed onwards by value (again `(constref)`)
+  ## or copied. It says nothing about the POINTEE — another argument may alias
+  ## the same object and be written through, which is why callers ask about
+  ## every argument position separately. See `hexer/funcsummary`.
+  if idx < 0 or idx >= s.params.len: return true
+  if s.params[idx].constRef: return false
+  if s.callsUnknown: return true
+  result = s.params[idx].writes or s.params[idx].slotWritten
+
+proc paramEscapes*(s: FunctionSummary; idx: int): bool {.inline.} =
+  ## Whether the callee lets pointers into this param's graph out. Conservative
+  ## on out-of-range actuals (varargs) and unknown callees.
   if s.callsUnknown: return true
   if idx < 0 or idx >= s.params.len: return true
-  result = s.params[idx].writes or s.params[idx].slotWritten
+  result = s.params[idx].escapes
+
+proc initSummaryResolver*(summaries: ptr FunctionSummaryTable;
+                          m: ptr MainModule): SummaryResolver =
+  SummaryResolver(summaries: summaries, m: m,
+                  cache: initTable[SymId, ForeignSummary]())
 
 # ---- nifcore helpers ------------------------------------------------------
 
@@ -82,9 +197,30 @@ proc child0(c: Cursor): Cursor {.inline.} =
 # ---- context --------------------------------------------------------------
 
 type
+  LoopFrame = object
+    pos: int                    ## token position of the `(while)` / `(loop)` —
+                                ## `addInsert` there is the pre-header
+    writes: HashSet[SymId]      ## symbols assigned in the loop
+    memStoreRoots: HashSet[SymId] ## `rootOf` of through-pointer stores;
+                                  ## `SymId(0)` = indeterminate store
+    memStorePaths: seq[AccessPath] ## the same stores as PATHS, in the same
+                                   ## order they were seen. Invariance asks the
+                                   ## question `invalidateForStore` asks, so it
+                                   ## gets the same two answers intersected
+                                   ## (`doc/cse.md`)
+    callPos: seq[int]           ## `(call …)` nodes, for summary-based clobber
+
   CachedEntry = object
     hasFirst: bool       # a first occurrence has been recorded
-    firstExprPos: int    # position in `orig` of the first occurrence
+    firstExprPos: int    # position in `orig` of the first occurrence's LVALUE `L`
+                         # (for an `(addr L)` occurrence this is `L`, the child) —
+                         # it is what the decl caches (`L` or `addr L`)
+    firstUsePos: int     # position of the NODE to rewrite for the first occurrence:
+                         # `L` for a load/write, the whole `(addr L)` node for an
+                         # address-of. Usually == firstExprPos (differs only for
+                         # an address-of first occurrence).
+    firstIsAddrOf: bool  # the first occurrence was `(addr L)` (rewrite → bare temp),
+                         # not a load/write of `L` (rewrite → `(deref temp)`)
     firstStmtPos: int    # position of the statement directly enclosing the first
                          # occurrence — the (sound) decl-insertion point
     anchorStack: seq[int] # the first occurrence's enclosing hoist anchors
@@ -95,15 +231,20 @@ type
 
   PendingDecl = object   # a materialized temp; its decl is emitted at flush time
     tempName: string
-    exprPos: int         # the first occurrence's expression position
-    addrMode: bool
+    exprPos: int         # the first occurrence's LVALUE position (what the decl caches)
+    addrMode: bool       # the temp holds `addr L` (a pointer); loads/writes of `L`
+                         # rewrite to `(deref t)`, address-of occurrences to bare `t`
     hoistPos: int        # = first occurrence's `firstStmtPos` (dominates every
                          # cache-flow-matched occurrence, and follows all stores
                          # that precede the first use in its block)
-    usePositions: seq[int] # occurrence positions to rewrite to the temp; applied
-                           # at flush (NOT eagerly) so a temp whose hoist position
-                           # turns out unsound can be dropped without leaving
-                           # dangling uses
+    usePositions: seq[tuple[pos: int; deref: bool]]
+                           # occurrence positions to rewrite to the temp, each with
+                           # its rewrite form: `deref` ⇒ `(deref t)` (an lvalue load/
+                           # write under address-CSE), else the bare temp `t` (a value-
+                           # CSE use, or an address-of occurrence whose value IS the
+                           # cached address). Applied at flush (NOT eagerly) so a temp
+                           # whose hoist position turns out unsound can be dropped
+                           # without leaving dangling uses
 
   Context = object
     orig: ptr TokenBuf
@@ -116,6 +257,14 @@ type
                                        # assignment target → those are address-
                                        # CSE'd (`(deref t)`), not value-CSE'd
     addrTaken: HashSet[SymId]
+    guardDepth: int                 ## >0 while walking an operand of `(and …)`/`(or …)`
+                                    ## that the FIRST operand guards. Such a
+                                    ## sub-expression does not run whenever its enclosing
+                                    ## statement does, so it may not define a hoist point
+                                    ## — see `handleCandidate`.
+    bodyLocals: HashSet[SymId]      ## symbols declared by a `(var …)` in THIS body —
+                                    ## strictly less than `localDefPos`, which also holds
+                                    ## `gvar`/`tvar` (globals a callee CAN reach)
     patchset: Patchset
     synth: seq[TokenBuf]
     stmtStack: seq[int]
@@ -124,30 +273,74 @@ type
                                 ## dominates the first occurrence and sits AFTER
                                 ## every store/decl preceding it in that block
     tempCounter: int
-    moduleSuffix: string
-    summaries: ptr FunctionSummaryTable
+    resolver: SummaryResolver       ## module table + foreign-module fallback,
+                                    ## memoized (see `resolveCallee`)
     aa: Aliasing                ## intra-proc alias partition of this body
+    pathScratch: seq[AccessPath]    ## reused by the path invalidator so that
+                                    ## describing an entry allocates nothing
+    paramSyms: HashSet[SymId]       ## this proc's parameters. For the path rules
+                                    ## they count as locals: a DIRECT path rooted
+                                    ## at a by-value param names the callee's own
+                                    ## copy, and a `var`/`out` param is a pointer,
+                                    ## so a read through it is an INDIRECT path
+                                    ## and never takes the direct branch anyway
     m: ptr MainModule           ## module type context; nil ⇒ no type-based skips
     localDefPos: Table[SymId, int]  ## local symbol → position of its `(var …)` decl,
                                     ## so a cached load is never hoisted above the
                                     ## declaration of a local it reads
+    symReads: Table[SymId, int]     ## per-symbol count of every `Symbol` occurrence in
+                                    ## the body — the profitability gate for cheap-arith
+                                    ## CSE: fold `a op b` only when its operands appear
+                                    ## NOWHERE else (so folding kills their live ranges
+                                    ## instead of adding the temp on top). See flushPending.
+    # ---- redundant index-check elimination (shares everything above) --------
+    proven: Tracker[string, int]    ## canonical guard condition → 1-based index into
+                                    ## `provenRoots`. `hexer` lowers a `.requires`
+                                    ## contract to `if COND: panic`, and `panic` does
+                                    ## not return — so reaching a second identical
+                                    ## guard PROVES the first one's condition was
+                                    ## false, and the second is dead. The fact is
+                                    ## branch-scoped and invalidated by exactly the
+                                    ## machinery the load cache uses.
+    provenRoots: seq[seq[SymId]]    ## per fact: the RESOLVED symbols it reads
+    defExpr: Table[SymId, int]      ## single-def local → position of its RHS
+    defCount: Table[SymId, int]
+    tainted: HashSet[SymId]         ## address taken, or defined by an impure RHS
+    shortCircuit: Table[SymId, (int, int, bool)]
+                                    ## bool temp → (pos of A, pos of B, isAnd) for the
+                                    ## diamond hexer lowers `A and B` / `A or B` to
+    dotBuf: TokenBuf                ## a single `.` token: replaces a deleted guard
+    checksRemoved*: int
+    loopStack: seq[LoopFrame]   ## enclosing loops, outermost first; LICM reads
+                                ## this to hoist invariant loads to a pre-header
 
-proc createContext(orig: ptr TokenBuf; moduleSuffix: string;
-                   summaries: ptr FunctionSummaryTable): Context =
-  Context(orig: orig,
+proc createContext(orig: ptr TokenBuf;
+                   summaries: ptr FunctionSummaryTable;
+                   m: ptr MainModule): Context =
+  result = Context(orig: orig, m: m,
           cache: initTracker[string, CachedEntry](),
           materialized: initTable[int, string](),
           pending: initTable[int, PendingDecl](),
           writeTargets: initHashSet[string](),
           addrTaken: initHashSet[SymId](),
+          bodyLocals: initHashSet[SymId](),
           patchset: initPatchset(orig),
           synth: @[],
           stmtStack: @[],
           curStmt: -1,
           tempCounter: 0,
-          moduleSuffix: moduleSuffix,
-          summaries: summaries,
-          localDefPos: initTable[SymId, int]())
+          resolver: initSummaryResolver(summaries, m),
+          localDefPos: initTable[SymId, int](),
+          proven: initTracker[string, int](),
+          provenRoots: @[],
+          defExpr: initTable[SymId, int](),
+          defCount: initTable[SymId, int](),
+          tainted: initHashSet[SymId](),
+          shortCircuit: initTable[SymId, (int, int, bool)](),
+          dotBuf: createTokenBuf(2, orig[].pool, orig[].tags),
+          checksRemoved: 0,
+          loopStack: @[])
+  result.dotBuf.addDotToken()
 
 proc currentStmtPos(c: Context): int {.inline.} =
   if c.stmtStack.len > 0: c.stmtStack[^1] else: -1
@@ -198,6 +391,246 @@ proc hashExpr(c: Cursor): string =
   result = ""
   hashExpr(c, result)
 
+# ---- single-def resolution (for the guard facts only) ---------------------
+# `hashExpr` above is the LOAD CACHE's notion of "the same expression" and must
+# stay purely structural: collapsing two temps there would let one temp's value
+# be reused for another's. A guard fact wants the opposite — two inlined copies
+# of `[]` bind `s.len` to their own fresh `sroa` temp each, so without resolving
+# through the definition no two copies ever compare equal. Hence a second key.
+
+const MaxResolveDepth = 8
+  ## The chains this must see through are two or three links (a `sroa` temp to a
+  ## field load); the bound just stops a pathological body.
+
+proc isPureExpr(cur: Cursor; m: ptr MainModule): bool =
+  ## No call, no `addr`: a value that depends only on the memory its symbols
+  ## name, so the root set below fully describes when it can change.
+  ##
+  ## An `(instr …)` is pure only if its ROW says so. This used to fall through to
+  ## the `else` and answer TRUE for every intrinsic, which made two
+  ## `volatileLoad`s of one address a common subexpression — and a status
+  ## register read once and then polled forever. `efPure` is what buys the old
+  ## answer back for `Ctz`/`Clz`/`Popcount`/`Bswap`, where it was always right.
+  ##
+  ## With no module context there is nothing to resolve the callee against, so an
+  ## intrinsic is opaque: silence is not a claim of purity.
+  if not cur.hasMore: return true
+  case cur.kind
+  of TagLit:
+    if cur.exprKind == CallC or cur.stmtKind == CallS: return false
+    if cur.exprKind == InstrC or cur.stmtKind == InstrS:
+      if m == nil or not instrIsPure(m[], cur): return false
+    if cur.exprKind in AddrKinds: return false
+    var n = cur
+    var ok = true
+    n.loopInto:
+      if ok and not isPureExpr(n, m): ok = false
+      skip n
+    return ok
+  else: return true
+
+proc soleStmt(body: Cursor; res: var Cursor): bool =
+  ## Descend through nested single-statement `(stmts …)`/`(scope …)` wrappers to
+  ## the one statement they hold; hexer's scope lowering nests these several deep.
+  var cur = body
+  var guard = 0
+  while true:
+    inc guard
+    if guard > 32: return false
+    if not cur.hasMore or cur.kind != TagLit: return false
+    if cur.stmtKind notin {StmtsS, ScopeS}:
+      res = cur
+      return true
+    var inner = cur
+    var count = 0
+    var only = default(Cursor)
+    inner.loopInto:
+      inc count
+      only = inner
+      skip inner
+    if count != 1: return false
+    cur = only
+
+proc asgnTo(stmt: Cursor; target: var SymId; rhs: var Cursor): bool =
+  if not stmt.hasMore or stmt.kind != TagLit or stmt.stmtKind != AsgnS: return false
+  var lhs = child0(stmt)
+  if lhs.kind != Symbol: return false
+  target = symId(lhs)
+  rhs = lhs
+  skip rhs
+  result = rhs.hasMore
+
+proc matchShortCircuit(c: var Context; n: Cursor) =
+  ## `x = A and B` is lowered to `(if (elif A (asgn x B)) (else (asgn x false)))`,
+  ## `x = A or B` to `(if (elif A (asgn x true)) (else (asgn x B)))`. Without
+  ## recognizing this, a `.requires` written with `and`/`or` leaves its guard keyed
+  ## on an opaque bool temp with two definitions and nothing ever matches.
+  if n.stmtKind != IfS: return
+  var arms = n
+  var count = 0
+  var condA = default(Cursor)
+  var thenBody = default(Cursor)
+  var elseBody = default(Cursor)
+  var haveElse = false
+  var bad = false
+  arms.loopInto:
+    case arms.substructureKind
+    of ElifU:
+      inc count
+      var b = arms
+      var i = 0
+      b.loopInto:
+        if i == 0: condA = b
+        elif i == 1: thenBody = b
+        inc i
+        skip b
+      if i != 2: bad = true
+    of ElseU:
+      haveElse = true
+      var b = arms
+      var i = 0
+      b.loopInto:
+        if i == 0: elseBody = b
+        inc i
+        skip b
+      if i != 1: bad = true
+    else: bad = true
+    skip arms
+  if bad or count != 1 or not haveElse: return
+  var tStmt = default(Cursor)
+  var eStmt = default(Cursor)
+  if not soleStmt(thenBody, tStmt): return
+  if not soleStmt(elseBody, eStmt): return
+  var tSym = SymId(0)
+  var eSym = SymId(0)
+  var tRhs = default(Cursor)
+  var eRhs = default(Cursor)
+  if not asgnTo(tStmt, tSym, tRhs): return
+  if not asgnTo(eStmt, eSym, eRhs): return
+  if tSym != eSym or tSym == SymId(0): return
+  if not isPureExpr(condA, c.m): return
+  if eRhs.kind == TagLit and eRhs.exprKind == FalseC and isPureExpr(tRhs, c.m):
+    c.shortCircuit[tSym] = (cursorToPosition(c.orig[], condA),
+                            cursorToPosition(c.orig[], tRhs), true)
+  elif tRhs.kind == TagLit and tRhs.exprKind == TrueC and isPureExpr(eRhs, c.m):
+    c.shortCircuit[tSym] = (cursorToPosition(c.orig[], condA),
+                            cursorToPosition(c.orig[], eRhs), false)
+
+proc preScanDefs(c: var Context; start: Cursor) =
+  ## One walk recording, per local, how many times it is DEFINED and by what.
+  if not start.hasMore or start.kind != TagLit: return
+  let sk = start.stmtKind
+  if sk == VarS:
+    var n = start
+    var nameSym = SymId(0)
+    var i = 0
+    var rhs = default(Cursor)
+    var have = false
+    n.loopInto:
+      if i == 0 and n.kind == SymbolDef: nameSym = symId(n)
+      elif i == 3:
+        rhs = n; have = true
+      inc i
+      skip n
+    if nameSym != SymId(0):
+      # `(var :x . T .)` is a DECLARATION, not a definition: the value arrives in
+      # a later `(asgn x …)`, which hexer emits for every scope-lowered temp. To
+      # count the decl would make all of them look multiply-defined.
+      if have and rhs.hasMore and rhs.kind != DotToken:
+        c.defCount[nameSym] = c.defCount.getOrDefault(nameSym) + 1
+        if isPureExpr(rhs, c.m):
+          c.defExpr[nameSym] = cursorToPosition(c.orig[], rhs)
+        else:
+          c.tainted.incl nameSym
+  elif sk == AsgnS:
+    var lhs = child0(start)
+    var rhs = lhs
+    skip rhs
+    let root = rootOf(lhs)
+    if root != SymId(0):
+      c.defCount[root] = c.defCount.getOrDefault(root) + 1
+      if lhs.kind == Symbol and rhs.hasMore and isPureExpr(rhs, c.m):
+        c.defExpr[root] = cursorToPosition(c.orig[], rhs)
+      else:
+        c.tainted.incl root
+  elif sk == IfS:
+    matchShortCircuit(c, start)
+  elif start.exprKind in AddrKinds:
+    let a = rootOf(child0(start))
+    if a != SymId(0): c.tainted.incl a
+  var n = start
+  n.loopInto:
+    preScanDefs(c, n)
+    skip n
+
+proc resolvable(c: Context; s: SymId): bool {.inline.} =
+  s notin c.tainted and c.defCount.getOrDefault(s) == 1 and c.defExpr.hasKey(s)
+
+proc isDiamond(c: Context; s: SymId): bool {.inline.} =
+  ## The two arms of the diamond are the symbol's only definitions.
+  s notin c.tainted and c.shortCircuit.hasKey(s) and
+    c.defCount.getOrDefault(s) == 2
+
+proc provenKey(c: var Context; cur: Cursor; result: var string; depth = 0) =
+  ## `hashExpr`, but a symbol normalizes to the expression it was DEFINED from.
+  case cur.kind
+  of Symbol:
+    let s = symId(cur)
+    if depth < MaxResolveDepth and c.isDiamond(s):
+      let (pa, pb, isAnd) = c.shortCircuit.getOrQuit(s)
+      result.add (if isAnd: "(&" else: "(|")
+      var a = cursorAt(c.orig[], pa)
+      provenKey(c, a, result, depth + 1)
+      result.add ' '
+      var b = cursorAt(c.orig[], pb)
+      provenKey(c, b, result, depth + 1)
+      result.add ')'
+    elif depth < MaxResolveDepth and c.resolvable(s):
+      var d = cursorAt(c.orig[], c.defExpr.getOrQuit(s))
+      provenKey(c, d, result, depth + 1)
+    else:
+      result.add 'S'; result.add symName(cur)
+  of TagLit:
+    result.add '('
+    result.addInt int cursorTagId(cur)
+    var n = cur
+    n.loopInto:
+      result.add ' '
+      provenKey(c, n, result, depth)
+      skip n
+    result.add ')'
+  else:
+    hashExpr(cur, result)
+
+proc provenKey(c: var Context; cur: Cursor): string =
+  result = ""
+  provenKey(c, cur, result)
+
+proc collectResolvedRoots(c: var Context; cur: Cursor; acc: var seq[SymId];
+                          depth = 0) =
+  ## The symbols the NORMALIZED key reads — invalidation must track those, not
+  ## the temps the resolution saw through.
+  if not cur.hasMore: return
+  case cur.kind
+  of Symbol:
+    let s = symId(cur)
+    if s notin acc: acc.add s
+    if depth < MaxResolveDepth and c.isDiamond(s):
+      let (pa, pb, _) = c.shortCircuit.getOrQuit(s)
+      var a = cursorAt(c.orig[], pa)
+      collectResolvedRoots(c, a, acc, depth + 1)
+      var b = cursorAt(c.orig[], pb)
+      collectResolvedRoots(c, b, acc, depth + 1)
+    elif depth < MaxResolveDepth and c.resolvable(s):
+      var d = cursorAt(c.orig[], c.defExpr.getOrQuit(s))
+      collectResolvedRoots(c, d, acc, depth + 1)
+  of TagLit:
+    var n = cur
+    n.loopInto:
+      collectResolvedRoots(c, n, acc, depth)
+      skip n
+  else: discard
+
 # ---- subtree inspection ---------------------------------------------------
 
 proc expressionMentions(cur: Cursor; target: SymId): bool =
@@ -235,11 +668,11 @@ proc expressionMentionsAny(cur: Cursor; targets: HashSet[SymId]): bool =
 proc preScanWrites(start: Cursor; writes, addrs: var HashSet[SymId]) =
   if not start.hasMore: return
   if start.kind != TagLit: return
-  if start.stmtKind in {AsgnS, StoreS}:
+  if start.stmtKind == AsgnS:
     let lhs = child0(start)
     if lhs.kind == Symbol:
       writes.incl symId(lhs)
-  if start.exprKind == AddrC:
+  if start.exprKind in AddrKinds:
     let s = rootOf(child0(start))
     if s != SymId(0): addrs.incl s
   var n = start
@@ -249,18 +682,31 @@ proc preScanWrites(start: Cursor; writes, addrs: var HashSet[SymId]) =
 
 # ---- cache invalidation ---------------------------------------------------
 
-proc markAddrTaken(c: var Context; s: SymId)
+proc markAddrTaken(c: var Context; s: SymId; exempt = "")
 proc clearCache(c: var Context)
 
-proc invalidateMentioning(c: var Context; target: SymId) =
+proc dropProvenMentioning(c: var Context; target: SymId) =
+  if target == SymId(0): return
+  var toClear: seq[string] = @[]
+  for key, idx in c.proven.pairs:
+    if idx > 0 and target in c.provenRoots[idx-1]: toClear.add key
+  for key in toClear: c.proven[key] = 0
+
+proc invalidateMentioning(c: var Context; target: SymId; exempt = "") =
+  ## Drop every cached entry whose expression mentions `target` (its value/address
+  ## may have changed). `exempt` keeps one key alive: taking `&L` marks `L`'s root
+  ## addr-taken but does NOT change `&L` itself, so `L`'s own address entry survives
+  ## (mirrors `invalidateForStore`'s exempt of the written location's address temp).
   var toClear: seq[string] = @[]
   for key, entry in c.cache.pairs:
     if not entry.hasFirst: continue
+    if key == exempt: continue
     let exprCur = cursorAt(c.orig[], entry.firstExprPos)
     if expressionMentions(exprCur, target):
       toClear.add key
   for key in toClear:
     c.cache[key] = default(CachedEntry)
+  dropProvenMentioning(c, target)
 
 proc expressionTouchesClass(c: var Context; cur: Cursor;
                             reps: HashSet[SymId]): bool =
@@ -280,6 +726,78 @@ proc expressionTouchesClass(c: var Context; cur: Cursor;
   else:
     return false
 
+proc escapedClassReps(c: var Context): HashSet[SymId] =
+  ## Alias-class representatives of every symbol whose ADDRESS has escaped so far.
+  ## Incremental on purpose: an `addr x` that appears LATER in the body cannot have
+  ## reached a callee we are invalidating for now.
+  result = initHashSet[SymId]()
+  for s in c.addrTaken: result.incl c.aa.find(s)
+
+proc rootsUnreachableByCallee(c: var Context; roots: seq[SymId];
+                              escaped: HashSet[SymId]): bool =
+  ## The root-list form of `unreachableByCallee` — the guard facts carry their
+  ## resolved roots directly, so they answer the same question without a cursor.
+  if roots.len == 0: return false          # nothing to reason about → conservative
+  for s in roots:
+    if s notin c.bodyLocals: return false  # a param/global/unknown: assume reachable
+    if s in c.addrTaken: return false
+    if c.aa.find(s) in escaped: return false
+  result = true
+
+proc unreachableByCallee(c: var Context; exprCur: Cursor;
+                         escaped: HashSet[SymId]): bool =
+  ## True when NO callee — not even one that writes globals or calls unknown code
+  ## — can reach the memory `exprCur` reads.
+  ##
+  ## A callee reaches exactly three things: globals (and their graphs), the graphs
+  ## of the arguments it was passed, and addresses that escaped to it earlier. A
+  ## local declared in THIS body whose address has never been taken is in none of
+  ## them: not a global, not reachable through any pointer (none can point at it),
+  ## and passable only BY VALUE, which copies it. Arguments therefore need no
+  ## separate test — an argument that could expose the local would have had to take
+  ## its address, which `addrTaken` records.
+  ##
+  ## The alias class is consulted because the partition is coarse (field- and
+  ## level-insensitive: `x = *p` unifies `x` with `p` itself): if anything sharing
+  ## the local's class has escaped, we must assume the local has too.
+  var roots: seq[SymId] = @[]
+  accessRoots(exprCur, roots, c.m)
+  result = rootsUnreachableByCallee(c, roots, escaped)
+
+proc clearCacheReachable(c: var Context) =
+  ## The blanket `clearCache` a call used to do, minus the entries the callee
+  ## provably cannot reach. This is the difference between "a call happened, drop
+  ## everything" and using the summaries we compute.
+  var toClear: seq[string] = @[]
+  let escaped = escapedClassReps(c)
+  for key, entry in c.cache.pairs:
+    if not entry.hasFirst: continue
+    if not unreachableByCallee(c, cursorAt(c.orig[], entry.firstExprPos), escaped):
+      toClear.add key
+    else:
+      when defined(cseSummaryStats): inc gEntriesKept
+  for key in toClear:
+    c.cache[key] = default(CachedEntry)
+  var dropFacts: seq[string] = @[]
+  var provenRoots = move c.provenRoots # moved out: `c` is passed alongside
+  for key, idx in c.proven.pairs:
+    if idx > 0 and not rootsUnreachableByCallee(c, provenRoots[idx-1], escaped):
+      dropFacts.add key
+  c.provenRoots = move provenRoots
+  for key in dropFacts: c.proven[key] = 0
+
+proc dropFactsInClasses(c: var Context; reps: HashSet[SymId]) =
+  ## The guard facts carry resolved ROOTS, not paths, so they keep the
+  ## alias-class rule in both modes — identical to `master` either way.
+  var dropFacts: seq[string] = @[]
+  for key, idx in c.proven.pairs:
+    if idx == 0: continue
+    for s in c.provenRoots[idx-1]:
+      if c.aa.find(s) in reps:
+        dropFacts.add key
+        break
+  for key in dropFacts: c.proven[key] = 0
+
 proc clobberClasses(c: var Context; reps: HashSet[SymId]; exempt = "") =
   ## Drop every cached entry that reads memory in one of the alias classes,
   ## except the entry keyed `exempt` (the address temp of the exact location a
@@ -293,29 +811,314 @@ proc clobberClasses(c: var Context; reps: HashSet[SymId]; exempt = "") =
       toClear.add key
   for key in toClear:
     c.cache[key] = default(CachedEntry)
+  dropFactsInClasses(c, reps)
+
+# ---- path-based invalidation (doc/cse.md) ---------------------------------
+
+proc reachableByPointer(c: var Context; root: SymId;
+                        escaped: HashSet[SymId]): bool =
+  ## Can any pointer in this body name `root`'s storage? Only if the address of
+  ## `root` (or of something its alias class was merged with) has been taken, or
+  ## if it is not a local of this body at all — a global or a parameter is
+  ## reachable from outside by construction. This is `unreachableByCallee`'s
+  ## argument, applied to one root instead of to a whole expression.
+  if root == SymId(0): return true
+  if root notin c.bodyLocals and root notin c.paramSyms: return true
+  if root in c.addrTaken: return true
+  result = c.aa.find(root) in escaped
+
+proc classesMayAlias(c: var Context; a, b: SymId): bool {.inline.} =
+  ## `master`'s answer: the intra-proc alias partition, which is what the type
+  ## information feeds. Unknown roots alias everything.
+  if a == SymId(0) or b == SymId(0): return true
+  result = c.aa.find(a) == c.aa.find(b)
+
+proc mayOverlap(c: var Context; p, w: AccessPath;
+                escaped: HashSet[SymId]): bool =
+  ## Can a write to `w` change what a read of `p` reads?
+  ##
+  ## Two independent over-approximations, and an entry only dies when BOTH say
+  ## it may: the path rule (this proc) and the alias partition
+  ## (`classesMayAlias`). Intersecting two sound answers stays sound, and it is
+  ## what keeps this at least as precise as `master` everywhere — the partition
+  ## carries the case paths deliberately refuse to decide (two unrelated
+  ## pointers), the paths carry the case the partition is blind to (two fields
+  ## of one object).
+  if not p.known or not w.known: return true
+  var byPath: bool
+  if w.isDirect:
+    if p.isDirect:
+      # Both name storage directly: distinct roots are distinct storage, and
+      # within one root it is the prefix test. `o.x = 1` leaves `o.y` alone.
+      byPath = directOverlap(p, w)
+    else:
+      # `p` reads through a pointer; it can only land on `w`'s storage if that
+      # storage is something a pointer can name at all.
+      byPath = reachableByPointer(c, w.root, escaped)
+  else:
+    if p.isDirect:
+      byPath = reachableByPointer(c, p.root, escaped)
+    else:
+      # Two indirect paths: nothing in the path distinguishes two pointers
+      # (`doc/cse.md`, lesson 4), so this is where the partition answers.
+      byPath = true
+  result = byPath and classesMayAlias(c, p.root, w.root)
+
+proc expressionOverlaps(c: var Context; cur: Cursor; w: AccessPath;
+                        escaped: HashSet[SymId]): bool =
+  ## Does any path the expression READS overlap the written path?
+  c.pathScratch.setLen 0
+  collectReadPaths(cur, c.pathScratch)
+  if c.pathScratch.len == 0: return true      # described nothing → conservative
+  var paths = move c.pathScratch # moved out: `c` is passed alongside
+  result = false
+  for i in 0 ..< paths.len:
+    if mayOverlap(c, paths[i], w, escaped):
+      result = true
+      break
+  c.pathScratch = move paths
+
+proc callClobbersEntry(c: var Context; cur: Cursor; written: seq[AccessPath];
+                       reps: HashSet[SymId]; escaped: HashSet[SymId]): bool =
+  ## Rule 4 of `doc/cse.md`, for a call whose summary is known and which writes
+  ## neither a global nor through an unknown callee. What it can still write is
+  ## the written arguments' own locations, and the memory reachable THROUGH them
+  ## — which is indirect memory this analysis does not name. So a read survives
+  ## when it is direct, rooted where no pointer can reach, and disjoint from
+  ## every written argument.
+  c.pathScratch.setLen 0
+  collectReadPaths(cur, c.pathScratch)
+  if c.pathScratch.len == 0: return true
+  for i in 0 ..< c.pathScratch.len:
+    let p = c.pathScratch[i]
+    if not p.known: return true
+    # `reps` is `master`'s answer (the classes of the written actuals plus the
+    # escaped ones); as in `mayOverlap`, a kill needs both analyses to agree.
+    if p.root != SymId(0) and c.aa.find(p.root) notin reps: continue
+    if p.isIndirect: return true
+    if reachableByPointer(c, p.root, escaped): return true
+    for w in written:
+      if mayOverlap(c, p, w, escaped): return true
+  result = false
+
+proc clobberForCall(c: var Context; written: seq[AccessPath];
+                    reps: HashSet[SymId]) =
+  var toClear: seq[string] = @[]
+  let escaped = escapedClassReps(c)
+  for key, entry in c.cache.pairs:
+    if not entry.hasFirst: continue
+    let exprCur = cursorAt(c.orig[], entry.firstExprPos)
+    let killed = callClobbersEntry(c, exprCur, written, reps, escaped)
+    when defined(cseSummaryStats):
+      if not killed and expressionTouchesClass(c, exprCur, reps):
+        inc gPathSavedCall
+    if killed:
+      toClear.add key
+  for key in toClear:
+    c.cache[key] = default(CachedEntry)
+  dropFactsInClasses(c, reps)
+
+proc clobberPath(c: var Context; w: AccessPath; exempt = "") =
+  ## Drop every cached load a write to `w` may have changed.
+  var toClear: seq[string] = @[]
+  let escaped = escapedClassReps(c)
+  when defined(cseSummaryStats):
+    var reps = initHashSet[SymId]()
+    reps.incl c.aa.find(w.root)
+  for key, entry in c.cache.pairs:
+    if not entry.hasFirst: continue
+    if key == exempt: continue
+    let exprCur = cursorAt(c.orig[], entry.firstExprPos)
+    let killed = expressionOverlaps(c, exprCur, w, escaped)
+    when defined(cseSummaryStats):
+      inc gPathTests
+      if not killed and expressionTouchesClass(c, exprCur, reps):
+        inc gPathSavedStore
+    if killed:
+      toClear.add key
+  for key in toClear:
+    c.cache[key] = default(CachedEntry)
+
+proc goesThroughPointer(lhs: Cursor): bool =
+  ## True if the lvalue is reached through a deref/index — not a stack field.
+  var n = lhs
+  while n.kind == TagLit:
+    case n.exprKind
+    of DerefC, PatC: return true
+    of DotC, AtC, AddrC, HaddrC:
+      n = child0(n)
+    of ConvC, CastC:
+      inc n
+      skip n
+    else:
+      return false
+  result = false
 
 proc invalidateForStore(c: var Context; lhs: Cursor) =
   ## A store through a pointer/field writes the location `lhs`. Drop only the
   ## cached loads whose chain may alias it — i.e. read memory in the same alias
   ## class as `lhs`'s base — instead of clearing the whole cache. The *address*
   ## temp of `lhs` itself survives: writing a location does not move its address.
+  ## A forging `cast` makes every through-pointer store an unknown write: the
+  ## pointee is outside the partition.
+  if c.aa.forged and goesThroughPointer(lhs):
+    clearCacheReachable c
+    return
   let s = rootOf(lhs)
   if s == SymId(0):
-    clearCache c                 # indeterminate target → conservative
+    # Indeterminate store target: it goes THROUGH a pointer, and no pointer can
+    # point at a local whose address was never taken. Same reasoning as a call.
+    clearCacheReachable c
     return
   var reps = initHashSet[SymId]()
   reps.incl c.aa.find(s)
-  clobberClasses(c, reps, exempt = hashExpr(lhs))
+  when PathStoreInvalidation:
+    # Same event, described as a path: the loads it can reach are the ones whose
+    # own paths overlap it (prefix either way), plus — when the written storage
+    # is something a pointer can name — the loads that go through a pointer.
+    # The guard facts keep the class rule.
+    let w = pathOfLvalue(lhs)
+    if not w.known:
+      clobberClasses(c, reps, exempt = hashExpr(lhs))
+    else:
+      clobberPath(c, w, exempt = hashExpr(lhs))
+      dropFactsInClasses(c, reps)
+  else:
+    clobberClasses(c, reps, exempt = hashExpr(lhs))
 
-proc callSummary(c: Context; call: Cursor; summary: var FunctionSummary): bool =
-  if c.summaries == nil: return false
+# ---- summary loader: read `(smry …)` pragmas from the buffer ---------------
+# A nifcore reader for the wire format produced by hexer/funcsummary (which
+# runs on the older nifcursors API). Keying by this buffer's own nifcore SymIds
+# keeps the table consistent with the code cse is optimizing. NOTE: never
+# `return` out of an `into`/`loopInto` body — that skips cursor restoration.
+
+proc readParamSummary(n: var Cursor; s: var FunctionSummary) =
+  n.into:
+    if n.hasMore and n.kind == IntLit:
+      let idx = int(intVal(n))
+      inc n
+      if idx >= 0:
+        while s.params.len <= idx: s.params.add ParamEffect()
+        var cls = uint32(idx)
+        if n.hasMore and n.kind == IntLit:
+          cls = uint32(intVal(n))
+          inc n
+        s.params[idx].cls = cls
+        while n.hasMore:
+          if n.kind == Ident:
+            case strVal(n)
+            of "reads": s.params[idx].reads = true
+            of "writes": s.params[idx].writes = true
+            of "slot": s.params[idx].slotWritten = true
+            of "escapes": s.params[idx].escapes = true
+            of "constref": s.params[idx].constRef = true
+            else: discard
+            inc n
+          else:
+            skip n
+    while n.hasMore: skip n         # drain so `into` sees rem == 0
+
+proc readSummary(n: var Cursor; outSummary: var FunctionSummary) =
+  outSummary = FunctionSummary()
+  var sawResult = false
+  n.into:
+    while n.hasMore:
+      if n.kind == Ident:
+        case strVal(n)
+        of "writeGlobal": outSummary.writesGlobal = true; inc n
+        of "readGlobal": outSummary.readsGlobal = true; inc n
+        of "callsUnknown": outSummary.callsUnknown = true; inc n
+        of "raises": outSummary.raises = true; inc n
+        of "resultEscapes": outSummary.resultEscapes = true; inc n
+        of "result":
+          inc n
+          if n.hasMore and n.kind == IntLit:
+            outSummary.resultCls = uint32(intVal(n))
+            sawResult = true
+            inc n
+        else: inc n
+      elif n.kind == TagLit and n.substructureKind == ParamU:
+        readParamSummary(n, outSummary)
+      else:
+        skip n
+  if not sawResult:
+    outSummary.resultCls = uint32(outSummary.params.len)
+
+proc readSummaryPragma*(pragmas: Cursor; outSummary: var FunctionSummary): bool =
+  ## Reads a proc's `(smry …)` AND its `(attr "noreturn")`, which is a separate
+  ## pragma but the same question: what can this callee do to memory we cached?
+  ## True when either was present — a bare `noreturn` proc still deserves a table
+  ## entry, since it is the one callee that provably clobbers nothing.
+  if pragmas.kind != TagLit: return false
+  var found = false
+  var noRet = false
+  var p = pragmas
+  p.loopInto:
+    if p.kind == TagLit and p.pragmaKind == SmryP:
+      if not found:
+        var q = p
+        readSummary(q, outSummary)
+        found = true
+    elif p.kind == TagLit and p.pragmaKind == AttrP:
+      var q = p
+      q.into:
+        while q.hasMore:
+          if q.kind == StrLit and strVal(q) == "noreturn": noRet = true
+          skip q
+    skip p
+  if noRet:
+    outSummary.noReturn = true
+    found = true
+  result = found
+
+proc resolveCallee*(r: var SummaryResolver; key: SymId;
+                    summary: var FunctionSummary): bool =
+  ## The module's own table first; then the callee's OWN module.
+  ##
+  ## `collectFunctionSummaries` only sees procs declared in the buffer being
+  ## optimized, so every cross-module call used to fall through to "unknown
+  ## callee" and clear the entire cache — 86% of all clears in a measured module,
+  ## and `panic` (in every bounds check) among them. But the summary is not
+  ## missing, only elsewhere: it is a pragma on the callee's `(proc …)` in its own
+  ## `.c.nif`, and `MainModule` already resolves foreign symbols through an
+  ## embedded index, parsing exactly that one declaration into THIS module's pool
+  ## — so the SymIds line up and nothing else is read. `canLoadForeign` keeps a
+  ## symbol we cannot resolve (an intrinsic, a syscall, a module built without an
+  ## index) an answer rather than an assertion.
+  ##
+  ## Results are memoized either way: a negative is as worth caching as a
+  ## positive, since the alternative is re-probing the index at every call site.
+  if r.summaries == nil: return false
+  if r.summaries[].hasKey(key):
+    summary = r.summaries[].getOrDefault(key)
+    return true
+  if r.m == nil: return false
+  if r.cache.hasKey(key):
+    let e = r.cache.getOrDefault(key)
+    if not e.known: return false
+    summary = e.s
+    return true
+  var found = false
+  var s = FunctionSummary()
+  if canLoadForeign(r.m[], key):
+    let d = getDeclOrNil(r.m[], key)
+    if d != nil and d.kind == ProcY:
+      var p = d.pos
+      let pd = takeProcDecl(p)
+      if readSummaryPragma(pd.pragmas, s): found = true
+  r.cache[key] = ForeignSummary(known: found, s: s)
+  when defined(cseSummaryStats):
+    if found: inc gForeignFound else: inc gForeignMissing
+  if not found: return false
+  summary = s
+  result = true
+
+proc callSummary(c: var Context; call: Cursor; summary: var FunctionSummary): bool =
   if call.kind != TagLit: return false
   let callee = child0(call)
   if callee.kind != Symbol: return false
-  let key = symId(callee)
-  if not c.summaries[].hasKey(key): return false
-  summary = c.summaries[].getOrDefault(key)
-  result = true
+  when defined(cseSummaryStats): inc gCallsSeen
+  result = resolveCallee(c.resolver, symId(callee), summary)
 
 proc invalidateForCall(c: var Context; call: Cursor) =
   ## A cached entry is a `loadsAPointer` address chain whose value depends on
@@ -339,16 +1142,23 @@ proc invalidateForCall(c: var Context; call: Cursor) =
   ## `writesGlobal` in the summary, handled below.
   var summary = FunctionSummary()
   if not callSummary(c, call, summary):
-    clearCache c                 # unknown callee: assume it writes any memory
-    return
+    when defined(cseSummaryStats): inc gClearUnknown
+    clearCacheReachable c        # unknown callee: assume it writes any memory IT
+    return                       # CAN REACH — which is not a non-escaped local
+  if summary.noReturn:
+    when defined(cseSummaryStats): inc gNoReturnSaved
+    return                       # control never comes back: nothing after this
+                                 # call can observe anything it wrote
   if summary.writesGlobal or summary.callsUnknown:
-    clearCache c                 # may write through a global → any memory
+    when defined(cseSummaryStats): inc gClearGlobal
+    clearCacheReachable c        # may write through a global → any REACHABLE memory
     return
 
   # Pass 1: per-actual root symbol, the partition classes the callee may write,
   # and mark escaping pointer args as addr-taken. Iterate with `into` so the
   # scope is bounded to the call's own children (nifcore has no ParRi).
   var argSyms: seq[SymId] = @[]
+  var argPaths: seq[AccessPath] = @[]
   var writtenClasses = initHashSet[uint32]()
   var argIndex = 0
   var ca = call
@@ -357,6 +1167,7 @@ proc invalidateForCall(c: var Context; call: Cursor) =
     while ca.hasMore:
       let s = rootOf(ca)
       argSyms.add s
+      argPaths.add pathOfLvalue(ca)   # `(haddr x.f)` ⇒ the path `x.f`
       if s != SymId(0) and argIndex < summary.params.len and
          summary.params[argIndex].escapes:
         markAddrTaken(c, s)
@@ -381,7 +1192,187 @@ proc invalidateForCall(c: var Context; call: Cursor) =
     let cls = if i < summary.params.len: summary.params[i].cls else: uint32(i)
     if cls in writtenClasses:
       reps.incl c.aa.find(argSyms[i])
-  clobberClasses(c, reps)
+  when PathCallInvalidation:
+    # The same summary, read as paths: which ARGUMENTS the callee may write.
+    # A parameter the callee placed in a written partition class counts too —
+    # it may have aliased them internally — which is the class information doing
+    # the job it is actually good at (relating parameters to each other), while
+    # the paths decide what in THIS body those arguments can reach.
+    var written: seq[AccessPath] = @[]
+    for i in 0 ..< argPaths.len:
+      let cls = if i < summary.params.len: summary.params[i].cls else: uint32(i)
+      if cls in writtenClasses: written.add argPaths[i]
+    clobberForCall(c, written, reps)
+  else:
+    clobberClasses(c, reps)
+
+# ---- loop-invariant code motion ------------------------------------------
+
+proc preScanLoop(c: Context; start: Cursor; frame: var LoopFrame) =
+  ## Collect assignments, through-pointer stores, and calls in `start` (the loop).
+  if not start.hasMore: return
+  if start.kind != TagLit: return
+  let sk = start.stmtKind
+  let ek = start.exprKind
+  if sk == AsgnS:
+    let lhs = child0(start)
+    if lhs.kind == Symbol:
+      frame.writes.incl symId(lhs)
+    else:
+      if c.aa.forged and goesThroughPointer(lhs):
+        frame.memStoreRoots.incl SymId(0)
+        frame.memStorePaths.add unknownPath()
+      else:
+        frame.memStoreRoots.incl rootOf(lhs)
+        frame.memStorePaths.add pathOfLvalue(lhs)
+  if sk == CallS or ek == CallC:
+    frame.callPos.add cursorToPosition(c.orig[], start)
+  var n = start
+  n.loopInto:
+    preScanLoop(c, n, frame)
+    skip n
+
+proc callWouldClobber(c: var Context; call, expr: Cursor): bool =
+  ## True if `call` would drop a cache entry for `expr` (same reasoning as
+  ## `invalidateForCall`, without mutating the cache).
+  result = false
+  var summary = FunctionSummary()
+  if not callSummary(c, call, summary):
+    return not unreachableByCallee(c, expr, escapedClassReps(c))
+  if summary.noReturn: return false
+  if summary.writesGlobal or summary.callsUnknown:
+    return not unreachableByCallee(c, expr, escapedClassReps(c))
+  var argSyms: seq[SymId] = @[]
+  var argPaths: seq[AccessPath] = @[]
+  var writtenClasses = initHashSet[uint32]()
+  var argIndex = 0
+  var ca = call
+  ca.into:
+    if ca.hasMore: skip ca
+    while ca.hasMore:
+      let s = rootOf(ca)
+      argSyms.add s
+      argPaths.add pathOfLvalue(ca)
+      if paramMayWrite(summary, argIndex):
+        let cls = if argIndex < summary.params.len: summary.params[argIndex].cls
+                  else: uint32(argIndex)
+        writtenClasses.incl cls
+      skip ca
+      inc argIndex
+  if writtenClasses.len == 0: return false
+  var reps = initHashSet[SymId]()
+  for s in c.addrTaken: reps.incl c.aa.find(s)
+  for i in 0 ..< argSyms.len:
+    if argSyms[i] == SymId(0): continue
+    let cls = if i < summary.params.len: summary.params[i].cls else: uint32(i)
+    if cls in writtenClasses:
+      reps.incl c.aa.find(argSyms[i])
+  when PathCallInvalidation:
+    # Hoisting must ask the question invalidation asks, or LICM would leave a
+    # load in the loop that the cache would have kept across the same call.
+    var written: seq[AccessPath] = @[]
+    for i in 0 ..< argPaths.len:
+      let cls = if i < summary.params.len: summary.params[i].cls else: uint32(i)
+      if cls in writtenClasses: written.add argPaths[i]
+    result = callClobbersEntry(c, expr, written, reps, escapedClassReps(c))
+  else:
+    result = expressionTouchesClass(c, expr, reps)
+
+proc storeInLoopClobbersByClass(c: var Context; expr: Cursor;
+                                frame: LoopFrame): bool =
+  ## `master`'s invariance test: an in-loop store kills the expression when its
+  ## root's alias class touches it, at root granularity.
+  for s in frame.memStoreRoots:
+    if s == SymId(0):
+      if not unreachableByCallee(c, expr, escapedClassReps(c)): return true
+    else:
+      var one = initHashSet[SymId]()
+      one.incl c.aa.find(s)
+      if expressionTouchesClass(c, expr, one): return true
+  result = false
+
+proc storeInLoopClobbers(c: var Context; expr: Cursor; frame: LoopFrame): bool =
+  ## Does any store in the loop reach `expr`? The path answer, intersected with
+  ## the alias classes inside `mayOverlap` — the same rule the cache uses for a
+  ## store, so a loop that writes `o.b` stops holding a load of `o.a` down.
+  let escaped = escapedClassReps(c)
+  for i in 0 ..< frame.memStorePaths.len:
+    let w = frame.memStorePaths[i]
+    if not w.known:
+      if not unreachableByCallee(c, expr, escaped): return true
+    elif expressionOverlaps(c, expr, w, escaped):
+      return true
+  result = false
+
+proc invariantIn(c: var Context; expr: Cursor; frame: LoopFrame): bool =
+  ## True when `expr` is a loop invariant of `frame`: no mentioned symbol is
+  ## assigned, no in-loop store aliases it, no in-loop call clobbers it.
+  if expressionMentionsAny(expr, frame.writes): return false
+  when PathStoreInvalidation:
+    if storeInLoopClobbers(c, expr, frame): return false
+  else:
+    if storeInLoopClobbersByClass(c, expr, frame): return false
+  for pos in frame.callPos:
+    if callWouldClobber(c, cursorAt(c.orig[], pos), expr): return false
+  result = true
+
+proc controlDependentIn(c: Context; loopPos: int): bool =
+  ## True when the current statement sits under an `if`/`case`/`try` or an
+  ## inner loop nested in `loopPos`. Those regions may not run on a given
+  ## iteration (or inner trip count), so a load from there must not move to
+  ## `loopPos`'s pre-header.
+  result = false
+  var under = false
+  for p in c.stmtStack:
+    if p == loopPos:
+      under = true
+      continue
+    if not under: continue
+    let sk = cursorAt(c.orig[], p).stmtKind
+    if sk in {IfS, CaseS, TryS, OnerrS, WhileS, LoopS}:
+      return true
+
+proc licmHoistPos(c: var Context; expr: Cursor): int =
+  ## Outermost enclosing loop that `expr` is invariant in **and** executes
+  ## every iteration of, or -1. An outer miss resets: invariance in an inner
+  ## loop does not survive an outer body that writes the same location, and
+  ## a load in an inner loop / branch is not a must-execute of the outer.
+  result = -1
+  # `invariantIn` takes `c` as `var`, which may not happen while `c.loopStack`
+  # is borrowed by the loop; nothing it calls reads the stack, so lend it out.
+  var stack = move c.loopStack
+  for frame in stack:
+    if invariantIn(c, expr, frame) and not controlDependentIn(c, frame.pos):
+      if result < 0: result = frame.pos
+    else:
+      result = -1
+  c.loopStack = move stack
+
+proc anchorsForHoist(c: Context; loopPos: int): seq[int] =
+  ## Anchor stack of the pre-header: enclosing blocks minus the loop we insert
+  ## before (and any inner loops nested under it).
+  result = c.stmtStack
+  while result.len > 0:
+    let p = result[^1]
+    let sk = cursorAt(c.orig[], p).stmtKind
+    if sk in {WhileS, LoopS}:
+      discard result.pop()
+      if p == loopPos: break
+    else:
+      break
+
+proc dropVariantCache(c: var Context; frame: LoopFrame) =
+  ## Keep cache entries that are invariant in `frame`; drop the rest. Replaces
+  ## a blanket `clearCache` at loop entry so a pre-loop load can be reused
+  ## inside (and after) a loop that does not clobber it.
+  var toClear: seq[string] = @[]
+  for key, entry in c.cache.pairs:
+    if not entry.hasFirst: continue
+    let expr = cursorAt(c.orig[], entry.firstExprPos)
+    if not invariantIn(c, expr, frame):
+      toClear.add key
+  for key in toClear:
+    c.cache[key] = default(CachedEntry)
 
 # ---- synthesis ------------------------------------------------------------
 
@@ -396,19 +1387,16 @@ proc emitTempType(c: var Context; buf: var TokenBuf; valueExpr: Cursor; ptrWrap:
   ## inter-module-inlined *foreign* object, whose type the backend cannot navigate
   ## in this module's context. The optimizer's own type context CAN resolve it, so
   ## we bake the result in here. `ptrWrap` wraps it as `(ptr T)` for the
-  ## address-cache form (`var t = addr L`). Falls back to `.` when unresolvable
-  ## (the candidate gate already rejects such loads, so this is belt-and-braces).
-  if c.m != nil:
-    let t = getNominalType(c.m[], valueExpr)
-    if not (t.kind == TagLit and t.typeKind == NoType):
-      if ptrWrap:
-        buf.openTag TagId(ord(PtrTagId))
-        buf.addSubtree t
-        buf.closeTag()
-      else:
-        buf.addSubtree t
-      return
-  buf.addDotToken()
+  ## address-cache form (`var t = addr L`). Without a type context (the self-tests)
+  ## the slot is left empty.
+  if c.m == nil:
+    buf.addDotToken()
+  elif ptrWrap:
+    buf.openTag TagId(ord(PtrTagId))
+    buf.addSubtree getNominalType(c.m[], valueExpr)
+    buf.closeTag()
+  else:
+    buf.addSubtree getNominalType(c.m[], valueExpr)
 
 proc addValueVarDecl(c: var Context; tempName: string; expr: Cursor;
                      info: NifLineInfo): int =
@@ -468,52 +1456,74 @@ proc addSubstPatch(c: var Context; pos: int; synthIdx: int) =
 
 # ---- branch-state forwarding ----------------------------------------------
 
-proc openBranches(c: var Context) = c.cache.openBranches()
-proc openBranch(c: var Context) = c.cache.openBranch()
-proc openFinalBranch(c: var Context) = c.cache.openFinalBranch()
-proc closeBranch(c: var Context) = c.cache.closeBranch()
-proc closeBranches(c: var Context) = c.cache.closeBranches()
-proc gotoLabel(c: var Context; L: LabelId) = c.cache.gotoLabel L
-proc landLabel(c: var Context; L: LabelId) = c.cache.landLabel L
-proc clearCache(c: var Context) = c.cache.clearAll()
+proc openBranches(c: var Context) = (c.cache.openBranches(); c.proven.openBranches())
+proc openBranch(c: var Context) = (c.cache.openBranch(); c.proven.openBranch())
+proc openFinalBranch(c: var Context) = (c.cache.openFinalBranch(); c.proven.openFinalBranch())
+proc closeBranch(c: var Context) = (c.cache.closeBranch(); c.proven.closeBranch())
+proc closeBranches(c: var Context) = (c.cache.closeBranches(); c.proven.closeBranches())
+proc gotoLabel(c: var Context; L: LabelId) = (c.cache.gotoLabel L; c.proven.gotoLabel L)
+proc landLabel(c: var Context; L: LabelId) = (c.cache.landLabel L; c.proven.landLabel L)
+proc clearCache(c: var Context) = (c.cache.clearAll(); c.proven.clearAll())
 
-proc markAddrTaken(c: var Context; s: SymId) =
+proc markAddrTaken(c: var Context; s: SymId; exempt = "") =
   if s in c.addrTaken: return
   c.addrTaken.incl s
-  invalidateMentioning(c, s)
+  invalidateMentioning(c, s, exempt)
 
 # ---- main traversal -------------------------------------------------------
 
 proc tr(c: var Context; n: var Cursor)   # forward
 
-proc substUse(c: var Context; exprPos: int; tempName: string; addrMode: bool) =
+proc substUse(c: var Context; exprPos: int; tempName: string; deref: bool) =
+  ## Rewrite the occurrence at `exprPos` to the temp: `(deref t)` when `deref`
+  ## (an lvalue load/write sharing an address temp), else the bare temp `t` (a
+  ## value-CSE use, or an address-of occurrence whose value is the cached address).
   addSubstPatch(c, exprPos,
-    (if addrMode: addDerefSynth(c, tempName) else: addSymUseSynth(c, tempName)))
+    (if deref: addDerefSynth(c, tempName) else: addSymUseSynth(c, tempName)))
 
 type
   LoadTypeClass = enum
     ltcScalar      ## a value type we can materialize a temp for
-    ltcAggregate   ## object/union/array — caching copies the whole thing
-    ltcUnknown     ## type navigation failed (`(err)` sentinel)
+    ltcAggregate   ## object/union/array/flexarray — caching copies the whole thing
+    ltcUnknown     ## type navigation failed (`(err)` sentinel, or a nominal
+                   ## type this module's context cannot resolve)
+
+const
+  ValueTypes = {IT, UT, FT, CT, BoolT, PtrT, AptrT, EnumT, ProctypeT}
+    ## The type kinds a temp can HOLD: everything that fits in a register and
+    ## whose spelling is a complete type. This is an ALLOW-list on purpose.
+    ## It used to be a deny-list of `{ObjectT, UnionT, ArrayT}`, and what a
+    ## deny-list does when a kind is missing from it is not "miss an
+    ## optimization" but "emit a temp that cannot exist": `FlexarrayT` was
+    ## missing, so the string payload `(dot (deref s.more) data)` became
+    ## `NC8 t[] = …` — gcc says "invalid initializer", arkham segfaulted. Any
+    ## type kind this list does not name is refused, including one added to
+    ## Leng tomorrow.
 
 proc classifyLoad(c: var Context; n: Cursor): LoadTypeClass =
   ## Classify the value loaded by `n` for value-CSE eligibility. Needs the type
   ## context; without it (`m == nil`, e.g. the self-tests) we assume scalar.
   ##
-  ## `ltcAggregate`: object/union/array — caching copies the whole aggregate into
-  ## a temp (a pessimization), and the temp would need its aggregate type spelled.
+  ## `ltcAggregate`: anything outside `ValueTypes` — an object/union/array copies
+  ## the whole thing into a temp (a pessimization) and needs its aggregate type
+  ## spelled; a `flexarray` cannot be spelled at all, having no size. The string
+  ## payload `(dot (deref s.more) data)` is exactly that shape, and it only
+  ## became a repeated load once loop unswitching specialized the long-string
+  ## path (`unswitch.nim`), which is how the deny-list's omission surfaced.
   ##
-  ## `ltcUnknown`: `getType` returned its `(err)` sentinel (a non-type tag) — the
-  ## value's type cannot be navigated, so a hoisted `(var :t . . load)` would force
-  ## the C backend to *infer* a type it equally cannot resolve, emitting `(err)` in
-  ## a type position. This happens after inter-module inlining splices a foreign
-  ## body whose loads reference types not in this module's context. We must not
-  ## value-CSE such a load.
+  ## `ltcUnknown`: `getType` returned its `(err)` sentinel (a non-type tag), or a
+  ## bare `Symbol` — `navigateToObjectBody` gave up because the nominal type is
+  ## not in this module's context (an inter-module-inlined foreign body's loads
+  ## do that). Either way the value's type cannot be navigated, so a hoisted
+  ## `(var :t . . load)` would force the C backend to *infer* a type it equally
+  ## cannot resolve, emitting `(err)` in a type position. We must not value-CSE
+  ## such a load — and "I could not resolve it" is no evidence that it is small.
   if c.m == nil: return ltcScalar
   let t = getType(c.m[], n)             # navigates nominal → object/array body
-  if t.typeKind in {ObjectT, UnionT, ArrayT}: ltcAggregate
-  elif t.kind == TagLit and t.typeKind == NoType: ltcUnknown
-  else: ltcScalar
+  if t.kind != TagLit: ltcUnknown
+  elif t.typeKind in ValueTypes: ltcScalar
+  elif t.typeKind == NoType: ltcUnknown
+  else: ltcAggregate
 
 proc latestLocalDef(c: Context; start: Cursor): int =
   ## The largest declaration position among the locals read anywhere in the
@@ -534,37 +1544,110 @@ proc latestLocalDef(c: Context; start: Cursor): int =
       if p > result: result = p
     inc i
 
-proc handleCandidate(c: var Context; n: Cursor): bool =
+proc handleCandidate(c: var Context; n: Cursor; isAddrOf = false): bool =
   ## Lazy CSE. The *first* occurrence is only recorded — no temp yet — so
   ## single-use expressions are left untouched. On the *second* occurrence the
   ## temp is materialized; the cache (control flow) decides *whether* reuse is
   ## valid, while the decl is hoisted at the deepest hoist-anchor common to all
   ## occurrences (the emitted scope that encloses them) — placed at the end so it
   ## can move up as further occurrences appear. An lvalue that is also an
-  ## assignment target (in `writeTargets`) is cached by ADDRESS (`var t = addr L`;
-  ## every read/write becomes `(deref t)`); everything else by value.
-  let key = hashExpr(n)
+  ## assignment target OR whose address is taken (in `writeTargets`) is cached by
+  ## ADDRESS (`var t = addr L`; every load/write becomes `(deref t)` and every
+  ## `(addr L)` becomes bare `t`); everything else by value.
+  ##
+  ## `isAddrOf`: `n` is an `(addr L)` node; the caller has verified `L` (its child)
+  ## is an address-CSE'd memory lvalue. We key on `L` (so it unifies with plain
+  ## loads/writes of `L`) but rewrite the whole `(addr L)` node to the bare temp.
+  let lvalueCur = if isAddrOf: child0(n) else: n
+  let key = hashExpr(lvalueCur)
   # Don't *value*-CSE an aggregate load: it copies the whole object/array. An
-  # lvalue that is also a write target is address-CSE'd (caches a cheap pointer),
-  # so it stays eligible — only plain value loads are skipped here. A load whose
-  # type cannot be navigated is never CSE'd (in either mode): the materialized
+  # lvalue that is also a write target / addr-of'd is address-CSE'd (caches a cheap
+  # pointer), so it stays eligible — only plain value loads are skipped here. A load
+  # whose type cannot be navigated is never CSE'd (in either mode): the materialized
   # temp's inferred type would be `(err)` and break the C backend.
-  let cls = classifyLoad(c, n)
+  let cls = classifyLoad(c, lvalueCur)
   if cls == ltcUnknown: return false
   if key notin c.writeTargets and cls == ltcAggregate:
     return false
-  let exprPos = cursorToPosition(c.orig[], n)
+  let addrMode = key in c.writeTargets
+  when not AddressCSE:
+    # `addrMode`/`isAddrOf` means we'd cache an ADDRESS (`&L`) as a held pointer temp.
+    # Don't: on the arkham targets the address folds into the load/store addressing mode
+    # for free, so caching it saves nothing and ties up a register across the live range.
+    # Leave the lvalue inline (no temp) — NOT value-CSE'd (unsound across its own writes).
+    #
+    # This also blocks VALUE-CSE of every lvalue that is written anywhere in the
+    # body, which is the compiler's dominant idiom: the fields of a `var`
+    # parameter. `enterScope` reads `c.p` seven times and assigns it once at the
+    # end, and all seven reads are refused because of that one assignment. That
+    # is 2073 refused loads over nifbench's modules — so it looks like the reason
+    # the emitted arm64 code reloads the same `[base, #off]` inside one basic
+    # block 6.2% of the time, against gcc's 0.3%.
+    #
+    # It is not, and this was measured rather than argued (2026-09-05, nifbench,
+    # `nimony n -d:danger`). Narrowing the refusal to the addr-of'd subset — a
+    # plain store target is invalidated precisely by `invalidateForStore`, which
+    # is strictly sharper than refusing it body-wide — does eliminate the loads,
+    # and LOSES:
+    #
+    #     loads          75.63M -> 73.02M   -2.61M
+    #     frame push/pop 50.36M -> 52.82M   +2.46M
+    #     reg-to-reg mov 44.93M -> 45.88M   +0.95M
+    #     TOTAL         439.52M -> 440.32M  +0.80M
+    #
+    # A CSE temp trades N loads for one load plus a value that must live in a
+    # register across its whole range. A load here is a single `ldr` with the
+    # offset folded in, so eliminating one saves exactly one instruction; a range
+    # that straddles a call can only be homed callee-saved, and arkham charges a
+    # whole prologue/epilogue PAIR for that on every entry to the proc. Refusing
+    # ranges that straddle a call turns the loss into a 0.35M win (-0.08%) —
+    # still not worth the machinery, because arkham's volatile local pool is five
+    # registers (x9-x13; x0-x7 are withheld) so even a call-free temp lands in a
+    # callee-saved register as soon as anything else is live.
+    #
+    # So this refusal is not what makes CSE ineffective on these targets: the
+    # register cost is. Revisit it when a cross-call value stops costing a
+    # prologue pair — shrink-wrapping, or spending callee-saved registers only on
+    # values that genuinely cross a call — and the same 2.61M becomes a real win.
+    if addrMode or isAddrOf: return false
+  let usePos = cursorToPosition(c.orig[], n)          # node to rewrite
+  let lvaluePos = cursorToPosition(c.orig[], lvalueCur)  # `L`, what the decl caches
   let entry = c.cache[key]
+  let derefThis = addrMode and not isAddrOf
   if not entry.hasFirst:
-    if c.curStmt < 0: return false         # no enclosing statement → nowhere to hoist
-    let stmtPos = c.currentStmtPos
-    if stmtPos >= 0 and cursorAt(c.orig[], stmtPos).stmtKind in {WhileS, LoopS}:
-      # Loop-condition candidate: hoisting before the loop would compute a stale
-      # pre-loop value every iteration. Don't CSE here.
-      return false
-    c.cache[key] = CachedEntry(hasFirst: true, firstExprPos: exprPos,
-                               firstStmtPos: c.curStmt, anchorStack: c.stmtStack)
-    return false                           # recorded only — not yet a temp
+    # A guarded occurrence may not become the FIRST: every hoist site below is
+    # derived from it (the enclosing statement, or a loop pre-header) and neither
+    # dominates a short-circuited operand. Reusing an ALREADY dominating temp from
+    # inside a guard stays fine, which is why this only rejects the first.
+    if c.guardDepth > 0: return false
+    let invHoist = licmHoistPos(c, lvalueCur)
+    if invHoist < 0:
+      if c.curStmt < 0: return false         # no enclosing statement → nowhere to hoist
+      let stmtPos = c.currentStmtPos
+      if stmtPos >= 0 and cursorAt(c.orig[], stmtPos).stmtKind in {WhileS, LoopS}:
+        # Variant load in the loop condition: hoisting before the loop would
+        # compute a stale pre-loop value every iteration. Don't CSE here.
+        return false
+      c.cache[key] = CachedEntry(hasFirst: true, firstExprPos: lvaluePos,
+                                 firstUsePos: usePos, firstIsAddrOf: isAddrOf,
+                                 firstStmtPos: c.curStmt, anchorStack: c.stmtStack)
+      return false                           # recorded only — not yet a temp
+    # Loop-invariant: the pre-header dominates every iteration. Memory loads
+    # materialize on the first occurrence (the loop is the reuse); cheap arith
+    # stays lazy so a single `a+b` in the body does not grow a live range.
+    c.cache[key] = CachedEntry(hasFirst: true, firstExprPos: lvaluePos,
+                               firstUsePos: usePos, firstIsAddrOf: isAddrOf,
+                               firstStmtPos: invHoist,
+                               anchorStack: anchorsForHoist(c, invHoist))
+    if lvalueCur.kind == TagLit and lvalueCur.exprKind in {DotC, AtC, DerefC, PatC}:
+      let fp = lvaluePos
+      let tempName = freshTempName(c)
+      c.materialized[fp] = tempName
+      c.pending[fp] = PendingDecl(tempName: tempName, exprPos: fp, addrMode: addrMode,
+                                  hoistPos: invHoist,
+                                  usePositions: @[(pos: usePos, deref: derefThis)])
+      return true
+    return false
   # Second-or-later occurrence. The cache is flow-sensitive and intersects at
   # branch joins, so this occurrence is dominated by the first; the first's
   # enclosing statement is therefore a valid, dominating decl site — no widening.
@@ -576,21 +1659,78 @@ proc handleCandidate(c: var Context; n: Cursor): bool =
     if a.len > c.stmtStack.len: return false
     for i in 0 ..< a.len:
       if a[i] != c.stmtStack[i]: return false
-  let addrMode = key in c.writeTargets
+  # A use's rewrite form: an address-of occurrence yields the bare address temp;
+  # any other occurrence under address-CSE is an lvalue → `(deref t)`; value-CSE
+  # is always bare.
+  let derefFirst = addrMode and not entry.firstIsAddrOf
   let fp = entry.firstExprPos
   var tempName: string
   if c.materialized.hasKey(fp):
     tempName = c.materialized.getOrDefault(fp)
     var pd = c.pending.getOrDefault(fp)
-    pd.usePositions.add exprPos
+    pd.usePositions.add (usePos, derefThis)
     c.pending[fp] = pd
   else:
     tempName = freshTempName(c)
     c.materialized[fp] = tempName
     c.pending[fp] = PendingDecl(tempName: tempName, exprPos: fp, addrMode: addrMode,
                                 hoistPos: entry.firstStmtPos,
-                                usePositions: @[fp, exprPos]) # first + this occurrence
+                                usePositions: @[(pos: entry.firstUsePos, deref: derefFirst),
+                                                (pos: usePos, deref: derefThis)])
   result = true
+
+proc isPureRegArith(n: Cursor): bool =
+  ## True if `n` is a CHEAP arithmetic binop/unop whose operands are only
+  ## symbols, literals, or nested pure arithmetic — a pure *register* computation
+  ## with NO memory load or call inside. Such a value depends solely on its
+  ## operand symbols, so the existing operand-write invalidation
+  ## (`invalidateMentioning` / `clobberClasses`, which scan the whole expression)
+  ## already covers it with no memory/alias reasoning — no load/aggregate/aliasing
+  ## logic is needed. Used both to gate the CSE candidate and, at flush, to apply
+  ## the cheap-arith profitability gate.
+  if n.kind != TagLit: return false
+  case n.exprKind
+  of AddC, SubC, MulC, DivC, ModC, ShlC, ShrC,
+     BitandC, BitorC, BitxorC, NegC, BitnotC:
+    result = true
+    var m = n
+    var idx = 0
+    m.loopInto:
+      # idx 0 is the result-TYPE child (typed ops carry it first); only operands
+      # need the purity check.
+      if idx > 0:
+        case m.kind
+        of Symbol, IntLit, UIntLit, CharLit, FloatLit, Ident: discard
+        of TagLit:
+          if not isPureRegArith(m): result = false
+        else: result = false
+      inc idx
+      skip m
+  else: result = false
+
+proc countLeafSyms(cur: Cursor; counts: var Table[SymId, int]) =
+  ## Tally each `Symbol` leaf of the expression `cur` (multiplicity: `a*a` → a:2).
+  case cur.kind
+  of Symbol:
+    counts[symId(cur)] = counts.getOrDefault(symId(cur), 0) + 1
+  of TagLit:
+    var n = cur
+    n.loopInto:
+      countLeafSyms(n, counts)
+      skip n
+  else: discard
+
+proc computeSymReads(c: var Context) =
+  ## One linear pass over the body counting every `Symbol` occurrence per symbol.
+  ## Used only as the cheap-arith CSE profitability gate — an over-count (it also
+  ## tallies write targets and non-folded occurrences) only makes the gate more
+  ## conservative (reject a marginal CSE), never unsound. Run LAZILY (only when a
+  ## cheap-arith temp actually needs gating), so bodies with no arith CSE — the
+  ## overwhelming majority — pay nothing.
+  for i in 0 ..< c.orig[].len:
+    let tok = cursorAt(c.orig[], i)
+    if tok.kind == Symbol:
+      c.symReads[tok.symId] = c.symReads.getOrDefault(tok.symId, 0) + 1
 
 proc flushPending(c: var Context) =
   ## Emit each materialized temp's decl at its final (shallowest) hoist position,
@@ -599,25 +1739,69 @@ proc flushPending(c: var Context) =
   ## the cached expression's free locals must all be in scope at the decl site.
   ## Because the rewrites are applied here (not eagerly), dropping leaves the
   ## original expressions untouched and correct.
-  for fp, pd in c.pending:
+  var symReadsReady = false
+  # In SOURCE order, never the table's. Two temps can hoist to the same spot,
+  # and their decls come out in the order this loop visits them; hash order
+  # made that depend on how `Table` happens to be implemented — a shoggoth
+  # built by Nimony and one built by Nim disagreed on 24 of nimsem's modules —
+  # and on the token layout of the input (`pending` is keyed by position).
+  var order = newSeqOfCap[int](c.pending.len)
+  for fp in c.pending.keys: order.add fp
+  sort(order, cmpInts)
+  for fp in order:
+    let pd = c.pending.getOrQuit(fp)
     if pd.hoistPos < 0: continue
     let firstCur = cursorAt(c.orig[], pd.exprPos)
     if pd.hoistPos <= latestLocalDef(c, firstCur):
       continue                              # unsound hoist — keep the originals
+    if isPureRegArith(firstCur):
+      if not symReadsReady:                 # lazy: only scan when arith gating is needed
+        computeSymReads(c); symReadsReady = true
+      # Cheap-arith profitability gate (the tweak's "`a` only used in `binop(a,b)`/
+      # `unop(a)` or unused after these"). A cheap op is only worth a temp when
+      # folding its duplicates KILLS the operands' live ranges rather than adding
+      # the temp on top of them. Sufficient & checkable: every non-literal operand
+      # appears NOWHERE outside this expression's folded occurrences — i.e. its
+      # total `Symbol` count equals (occurrences × its multiplicity in one copy).
+      # If any operand is used elsewhere it stays live regardless, so the temp is
+      # pure register pressure (this is exactly what regressed rawAlloc's
+      # `alignment - 1`). Reject → keep the originals; the recompute is cheaper.
+      let k = pd.usePositions.len
+      var operandCounts = initTable[SymId, int]()
+      countLeafSyms(firstCur, operandCounts)
+      var paysOff = true
+      for s, mult in operandCounts:
+        if c.symReads.getOrDefault(s, 0) != k * mult:
+          paysOff = false
+          break
+      if not paysOff: continue              # cheap recompute wins — leave inline
     let varIdx = if pd.addrMode: addAddrVarDecl(c, pd.tempName, firstCur, rawLineInfo(firstCur))
                  else: addValueVarDecl(c, pd.tempName, firstCur, rawLineInfo(firstCur))
     c.patchset.addInsert(pd.hoistPos, synthCursor(c, varIdx))
-    for pos in pd.usePositions:
-      substUse(c, pos, pd.tempName, pd.addrMode)
+    for u in pd.usePositions:
+      substUse(c, u.pos, pd.tempName, u.deref)
 
 proc trExpr(c: var Context; n: var Cursor) =
   case n.kind
   of TagLit:
     case n.exprKind
-    of AddrC:
-      let s = rootOf(child0(n))
-      if s != SymId(0): markAddrTaken(c, s)
-      skip n
+    of AddrC, HaddrC:
+      let inner = child0(n)
+      # `(addr L)` where `L` is an address-CSE'd memory lvalue: unify with loads/
+      # writes of `L`. Cache `addr L` once; this whole node rewrites to the bare
+      # temp (its value IS the address). `markAddrTaken` still fires for the value-
+      # entry soundness of OTHER cached loads through the root, but EXEMPTS `L`'s
+      # own address entry — taking `&L` does not change `&L`.
+      if inner.kind == TagLit and inner.exprKind in {DotC, AtC, DerefC, PatC} and
+         hashExpr(inner) in c.writeTargets:
+        discard handleCandidate(c, n, isAddrOf = true)
+        let s = rootOf(inner)
+        if s != SymId(0): markAddrTaken(c, s, exempt = hashExpr(inner))
+        skip n
+      else:
+        let s = rootOf(inner)
+        if s != SymId(0): markAddrTaken(c, s)
+        skip n
     of CallC:
       let call = n
       n.into:
@@ -625,23 +1809,52 @@ proc trExpr(c: var Context; n: var Cursor) =
         while n.hasMore: trExpr(c, n)
       invalidateForCall(c, call)
     of DotC, AtC, DerefC, PatC:
-      # A memory load. A materialized occurrence (2nd+) is replaced by a temp so
-      # we stop; otherwise recurse into the index/value children but NOT the base
-      # — the base is a location/aggregate, not a value worth caching (caching
-      # `(deref b)` would copy the whole object).
+      # A memory load. A materialized occurrence (2nd+, or a loop-invariant first)
+      # is replaced by a temp so we stop; otherwise recurse into every child —
+      # including the base, so `(at (dot keys data) h)` still CSE's the invariant
+      # `keys.data` pointer when the indexed load itself is not invariant.
       if handleCandidate(c, n):
         skip n
       else:
-        n.into:
-          if n.hasMore: skip n             # base
-          while n.hasMore: trExpr(c, n)    # indices / value children
+        n.loopInto:
+          trExpr(c, n)
+    of AndC, OrC:
+      # SHORT-CIRCUIT. Only the first operand is unconditional; the rest run just
+      # when it decides they do. Walking them like ordinary children let a load in
+      # the second operand become a CSE candidate whose decl was then hoisted to
+      # the enclosing STATEMENT — i.e. above the very test that guards it.
+      # `c.owner != nil and c.owner.p != nil` turned into "load c.owner.p; if
+      # c.owner != nil and that load was non-nil", which dereferences nil.
+      var first = true
+      n.loopInto:
+        if first:
+          trExpr(c, n)
+          first = false
+        else:
+          inc c.guardDepth
+          trExpr(c, n)
+          dec c.guardDepth
+    of AddC, SubC, MulC, DivC, ModC, ShlC, ShrC,
+       BitandC, BitorC, BitxorC, NegC, BitnotC:
+      # Cheap pure arithmetic. A repeated `a op b` is CSE'd on its 2nd occurrence
+      # (the same lazy/flow-sensitive path as loads); `handleCandidate` hoists the
+      # temp no higher than the first occurrence, so a trapping `div`/checked op
+      # keeps its original fault ordering. Only PURE register arithmetic qualifies
+      # (`isPureRegArith`): a load/call inside would need memory reasoning we leave
+      # to load-CSE. On the first occurrence (or a non-pure tree) fall through and
+      # recurse so nested loads / sub-expressions still get their own chance.
+      if isPureRegArith(n) and handleCandidate(c, n):
+        skip n
+      else:
+        n.loopInto:
+          trExpr(c, n)
     else:
       n.loopInto:
         trExpr(c, n)
   else:
     inc n
 
-proc trVar(c: var Context; n: var Cursor) =
+proc trVar(c: var Context; n: var Cursor; isBodyLocal: bool) =
   let declPos = cursorToPosition(c.orig[], n)
   var nameStart = default(Cursor)
   var typeStart = default(Cursor)
@@ -665,6 +1878,7 @@ proc trVar(c: var Context; n: var Cursor) =
     # cached load above the declaration of a local it reads (which would emit a
     # use of an out-of-scope symbol).
     c.localDefPos[nameStart.symId] = declPos
+    if isBodyLocal: c.bodyLocals.incl nameStart.symId
     if c.m != nil and not cursorIsNil(typeStart) and typeStart.kind != DotToken:
       c.m[].registerLocal(nameStart.symId, typeStart)
   # Var decls don't write existing symbols; nothing to invalidate.
@@ -690,7 +1904,19 @@ proc trAsgn(c: var Context; n: var Cursor) =
     # recurs it is address-CSE'd — `handleCandidate` rewrites it to `(deref t)`,
     # still a valid assignment target. Then invalidate the aliasing class; the
     # address temp of this exact location survives (its address didn't move).
-    discard handleCandidate(c, lhsStart)
+    #
+    # The `when` is load-bearing, not tidiness. This call is sound ONLY in
+    # address mode, where the rewrite `L` → `(deref t)` is still an assignment
+    # target. A VALUE temp is not: rewriting an LHS to a bare symbol turns
+    # `p.pos = p.pos + 1` into `t = p.pos; t = t + 1` and drops the store. With
+    # `AddressCSE` off nothing reaches here today only because `handleCandidate`
+    # refuses every `writeTargets` key outright — so the guard is invisible until
+    # someone narrows that refusal, and then it is a silent miscompile (measured:
+    # parseopt's `next` stopped advancing and walked off the string). Keep the
+    # write-vs-read distinction here, where it belongs, instead of relying on a
+    # refusal three modules away.
+    when AddressCSE:
+      discard handleCandidate(c, lhsStart)
     invalidateForStore(c, lhsStart)
   else: discard
 
@@ -754,28 +1980,34 @@ proc trLoopBody(c: var Context; n: var Cursor) =
       while n.hasMore: skip n
   of LoopS:
     n.into:
-      if n.hasMore: tr(c, n)
-      if n.hasMore: trExpr(c, n)
-      if n.hasMore: tr(c, n)
-      if n.hasMore: tr(c, n)
+      if n.hasMore: tr(c, n)             # body; the infinite loop has no cond
       while n.hasMore: skip n
   else:
     skip n
 
 proc trLoop(c: var Context; n: var Cursor) =
-  var writes = initHashSet[SymId]()
+  let loopPos = cursorToPosition(c.orig[], n)
+  var frame = LoopFrame(pos: loopPos,
+                        writes: initHashSet[SymId](),
+                        memStoreRoots: initHashSet[SymId](),
+                        callPos: @[])
+  preScanLoop(c, n, frame)
   var addrs = initHashSet[SymId]()
-  preScanWrites(n, writes, addrs)
+  preScanWrites(n, frame.writes, addrs)
   for s in addrs: markAddrTaken(c, s)
+
+  c.loopStack.add frame
+  c.proven.clearAll()
+  dropVariantCache(c, frame)
 
   openBranches c
   openBranch c
   closeBranch c
   openBranch c
-  clearCache c
   trLoopBody(c, n)
   closeBranch c
   closeBranches c
+  discard c.loopStack.pop()
 
 proc trJmp(c: var Context; n: var Cursor) =
   let probe = child0(n)
@@ -793,11 +2025,64 @@ proc trBreakOrRet(c: var Context; n: var Cursor) =
   skip n
   clearCache c
 
+proc callIsNoReturn(c: var Context; call: Cursor): bool =
+  ## Reuses `callSummary`'s resolution — module table, then the callee's own
+  ## `.c.nif` through `c.m` — and its memoization, negatives included.
+  var s = default(FunctionSummary)
+  result = callSummary(c, call, s) and s.noReturn
+
+proc guardCondition(c: var Context; n: Cursor; cond: var Cursor): bool =
+  ## `n` is `(if (elif COND (stmts (call NORETURN …))))` — one branch, no `else`,
+  ## the arm a single call that never returns. Such a statement ASSERTS `not COND`
+  ## for everything it dominates. Yields COND.
+  if n.stmtKind != IfS: return false
+  var arm = n
+  var count = 0
+  var body = default(Cursor)
+  var got = default(Cursor)
+  var bad = false
+  arm.loopInto:
+    inc count
+    if arm.substructureKind != ElifU: bad = true
+    else:
+      var b = arm
+      var i = 0
+      b.loopInto:
+        if i == 0: got = b
+        elif i == 1: body = b
+        inc i
+        skip b
+      if i != 2: bad = true
+    skip arm
+  if bad or count != 1: return false
+  if not body.hasMore or body.stmtKind != StmtsS: return false
+  var sc = body
+  var stmts = 0
+  var theCall = default(Cursor)
+  sc.loopInto:
+    inc stmts
+    theCall = sc
+    skip sc
+  if stmts != 1: return false
+  if not theCall.hasMore or theCall.kind != TagLit: return false
+  if theCall.stmtKind != CallS: return false
+  if not callIsNoReturn(c, theCall): return false
+  cond = got
+  result = true
+
 proc isHoistAnchor(sk: LengStmt): bool {.inline.} =
-  # `(scope …)` IS an anchor: it becomes a C `{…}` block, so it must appear on
-  # the anchor stack or a temp could be hoisted inside it while a sibling use is
-  # outside. `(stmts …)` is transparent (no block of its own).
-  sk notin {NoStmt, StmtsS}
+  # An anchor is a statement that forms a nested lexical scope — a C `{…}` block:
+  # a temp hoisted at the first occurrence's statement must not be reused by an
+  # occurrence OUTSIDE that block, so the block must appear on the anchor stack.
+  # `(scope)`/`(if)`/`(case)`/`(while)`/`(loop)`/`(try)`/`(onerr)` qualify.
+  # `(stmts)` is transparent, and LEAF statements (asgn/call/var/ret/…) form
+  # no block of their own — anchoring them would give two sibling statements
+  # DIFFERENT anchor stacks and defeat all cross-statement CSE (which is the whole
+  # point of hoisting a shared load/address to a dominating decl). Unknown/other
+  # statements stay anchored (the safe, CSE-suppressing default).
+  sk notin {NoStmt, StmtsS,
+            AsgnS, CallS, VarS, GvarS, TvarS, ConstS, DiscardS,
+            RetS, BreakS, RaiseS, JmpS, LabS, EmitS, KeepovfS, MflagS, VflagS}
 
 proc tr(c: var Context; n: var Cursor) =
   if not n.hasMore: return
@@ -808,10 +2093,27 @@ proc tr(c: var Context; n: var Cursor) =
     if pushed:
       c.stmtStack.add cursorToPosition(c.orig[], n)
     case sk
-    of VarS, GvarS, TvarS, ConstS: trVar(c, n)
-    of AsgnS, StoreS:              trAsgn(c, n)
+    of VarS, ConstS:               trVar(c, n, isBodyLocal = true)
+    of GvarS, TvarS:               trVar(c, n, isBodyLocal = false)
+    of AsgnS:                      trAsgn(c, n)
     of CallS:                      trCallStmt(c, n)
-    of IfS:                        trIf(c, n)
+    of IfS:
+      var gcond = default(Cursor)
+      if guardCondition(c, n, gcond):
+        let key = provenKey(c, gcond)
+        if c.proven[key] > 0:
+          # A dominating guard already tested this and did not panic.
+          c.patchset.addSubst(cursorToPosition(c.orig[], n), cursorAt(c.dotBuf, 0))
+          inc c.checksRemoved
+          skip n
+        else:
+          var roots: seq[SymId] = @[]
+          collectResolvedRoots(c, gcond, roots)
+          c.provenRoots.add ensureMove(roots)
+          c.proven[key] = c.provenRoots.len     # 1-based: 0 means "not proven"
+          trIf(c, n)                            # still a normal `if` for the cache
+      else:
+        trIf(c, n)
     of CaseS:                      trCase(c, n)
     of WhileS, LoopS:              trLoop(c, n)
     of JmpS:                       trJmp(c, n)
@@ -829,75 +2131,6 @@ proc tr(c: var Context; n: var Cursor) =
       discard c.stmtStack.pop()
   else:
     inc n
-
-# ---- summary loader: read `(smry …)` pragmas from the buffer ---------------
-# A nifcore reader for the wire format produced by hexer/funcsummary (which
-# runs on the older nifcursors API). Keying by this buffer's own nifcore SymIds
-# keeps the table consistent with the code cse is optimizing. NOTE: never
-# `return` out of an `into`/`loopInto` body — that skips cursor restoration.
-
-proc readParamSummary(n: var Cursor; s: var FunctionSummary) =
-  n.into:
-    if n.hasMore and n.kind == IntLit:
-      let idx = int(intVal(n))
-      inc n
-      if idx >= 0:
-        while s.params.len <= idx: s.params.add ParamEffect()
-        var cls = uint32(idx)
-        if n.hasMore and n.kind == IntLit:
-          cls = uint32(intVal(n))
-          inc n
-        s.params[idx].cls = cls
-        while n.hasMore:
-          if n.kind == Ident:
-            case strVal(n)
-            of "reads": s.params[idx].reads = true
-            of "writes": s.params[idx].writes = true
-            of "slot": s.params[idx].slotWritten = true
-            of "escapes": s.params[idx].escapes = true
-            else: discard
-            inc n
-          else:
-            skip n
-    while n.hasMore: skip n         # drain so `into` sees rem == 0
-
-proc readSummary(n: var Cursor; outSummary: var FunctionSummary) =
-  outSummary = FunctionSummary()
-  var sawResult = false
-  n.into:
-    while n.hasMore:
-      if n.kind == Ident:
-        case strVal(n)
-        of "writeGlobal": outSummary.writesGlobal = true; inc n
-        of "readGlobal": outSummary.readsGlobal = true; inc n
-        of "callsUnknown": outSummary.callsUnknown = true; inc n
-        of "raises": outSummary.raises = true; inc n
-        of "resultEscapes": outSummary.resultEscapes = true; inc n
-        of "result":
-          inc n
-          if n.hasMore and n.kind == IntLit:
-            outSummary.resultCls = uint32(intVal(n))
-            sawResult = true
-            inc n
-        else: inc n
-      elif n.kind == TagLit and n.substructureKind == ParamU:
-        readParamSummary(n, outSummary)
-      else:
-        skip n
-  if not sawResult:
-    outSummary.resultCls = uint32(outSummary.params.len)
-
-proc readSummaryPragma(pragmas: Cursor; outSummary: var FunctionSummary): bool =
-  if pragmas.kind != TagLit: return false
-  var found = false
-  var p = pragmas
-  p.loopInto:
-    if not found and p.kind == TagLit and p.pragmaKind == SmryP:
-      var q = p
-      readSummary(q, outSummary)
-      found = true
-    skip p
-  result = found
 
 proc collectFunctionSummaries*(buf: var TokenBuf): FunctionSummaryTable =
   ## Build the module-level summary table from each proc's `(smry …)` pragma.
@@ -918,50 +2151,73 @@ proc collectFunctionSummaries*(buf: var TokenBuf): FunctionSummaryTable =
 # ---- write-target pre-pass -----------------------------------------------
 
 proc collectWriteTargets(c: var Context; n: var Cursor) =
-  ## Record the hash of every memory lvalue that is an assignment target, so the
-  ## main walk knows to address-CSE (not value-CSE) such expressions.
+  ## Record the hash of every memory lvalue that should be ADDRESS-CSE'd rather
+  ## than value-CSE'd: an assignment target (its value can't be value-cached, but
+  ## its address is stable across the write) OR an lvalue whose address is taken
+  ## (`(addr L)`) — so a cached `addr L` unifies the `(addr L)` node with plain
+  ## loads/writes of `L` (which become `(deref t)`). Recurses into ALL children,
+  ## including assignment RHS, since `(addr L)` most often sits there.
   if not n.hasMore: return
   if n.kind != TagLit:
     inc n
     return
+  # `(addr L)` of a memory lvalue → `L` is address-CSE'd.
+  if n.exprKind in AddrKinds:
+    let inner = child0(n)
+    if inner.kind == TagLit and inner.exprKind in {DotC, AtC, DerefC, PatC}:
+      c.writeTargets.incl hashExpr(inner)
   case n.stmtKind
   of AsgnS:                        # (asgn dest src)
     let lhs = child0(n)
     if lhs.kind == TagLit and lhs.exprKind in {DotC, AtC, DerefC, PatC}:
       c.writeTargets.incl hashExpr(lhs)
-    skip n
-  of StoreS:                       # (store src dest) — dest is the 2nd child
-    var lhs = child0(n)
-    skip lhs
-    if lhs.kind == TagLit and lhs.exprKind in {DotC, AtC, DerefC, PatC}:
-      c.writeTargets.incl hashExpr(lhs)
-    skip n
+    n.loopInto:
+      collectWriteTargets(c, n)    # recurse (find `(addr L)` in the RHS / indices)
   else:
     n.loopInto:
       collectWriteTargets(c, n)
 
 # ---- public entry --------------------------------------------------------
 
-proc runCSE*(buf: var TokenBuf; moduleSuffix = "M";
+proc registerParams(c: var Context; params: Cursor) =
+  ## The proc's parameters, which the body alone does not show (the driver hands
+  ## CSE the body only). They matter to the path rules exactly as `bodyLocals`
+  ## does — see `Context.paramSyms`.
+  if not params.hasMore or params.kind != TagLit: return
+  var p = params
+  p.loopInto:
+    if p.kind == TagLit and p.substructureKind == ParamU:
+      let nameCur = child0(p)
+      if nameCur.kind == SymbolDef: c.paramSyms.incl symId(nameCur)
+    skip p
+
+proc runCSE*(buf: var TokenBuf;
              summaries: ptr FunctionSummaryTable = nil;
-             m: ptr MainModule = nil) =
+             m: ptr MainModule = nil;
+             params: Cursor = default(Cursor)): int {.discardable.} =
   ## Two-phase CSE for a single proc `buf` (a Leng body has no nested procs).
   ## `summaries` is the module-level table from `collectFunctionSummaries` run
   ## once on the whole module; nil ⇒ every call conservatively clears. `m` is the
   ## module type context (proc params already registered in the current scope) —
   ## nil falls back to the coarse, type-agnostic alias partition.
-  var ctx = createContext(addr buf, moduleSuffix, summaries)
-  ctx.m = m                          # type context: skip value-CSE of aggregates
+  # `m`: type context (skips value-CSE of aggregates); the resolver's
+  # foreign-summary fallback resolves through it too.
+  var ctx = createContext(addr buf, summaries, m)
   ctx.aa = computeAliasing(buf, m)   # alias pre-pass: drives precise invalidation
+  registerParams(ctx, params)
   block:
     var wn = beginRead(buf)
-    collectWriteTargets(ctx, wn)  # decide address- vs value-CSE per expression
+    collectWriteTargets(ctx, wn)  # identify write-target / addr-of'd lvalues
+  block:
+    let dn = beginRead(buf)
+    preScanDefs(ctx, dn)          # single-def map: the guard facts' key resolution
   var n = beginRead(buf)
   tr(ctx, n)
   flushPending(ctx)               # emit deferred temp decls at their final positions
   if not ctx.patchset.isEmpty:
     var newBuf = ctx.patchset.apply()
     buf = ensureMove(newBuf)
+  result = ctx.checksRemoved
 
 # ---- self-tests ----------------------------------------------------------
 
@@ -1009,9 +2265,13 @@ when isMainModule:
       "(stmts (asgn y.0.M (dot (deref (deref pp.0.M)) fld.0.M)) (call side.0.M) (asgn z.0.M (dot (deref (deref pp.0.M)) fld.0.M)))")
 
   block index_write_prevents_cse:
-    # `i = 5` reassigns the index the load mentions → no reuse → unchanged.
-    assertUnchanged(
-      "(stmts (asgn y.0.M (at (deref (deref pp.0.M)) i.0.M)) (asgn i.0.M 5) (asgn z.0.M (at (deref (deref pp.0.M)) i.0.M)))")
+    # `i = 5` reassigns the index the load mentions → the `at` is not reused.
+    # The base pointer `(deref (deref pp))` does not mention `i`, so it IS
+    # CSE'd (walking the base of a failed `at` candidate).
+    chk(
+      "(stmts (asgn y.0.M (at (deref (deref pp.0.M)) i.0.M)) (asgn i.0.M 5) (asgn z.0.M (at (deref (deref pp.0.M)) i.0.M)))",
+      "(stmts (var :`cse.1 . . (deref (deref pp.0.M))) " &
+      "(asgn y.0.M (at `cse.1 i.0.M)) (asgn i.0.M 5) (asgn z.0.M (at `cse.1 i.0.M)))")
 
   block unrelated_asgn_does_not_invalidate:
     chk(
@@ -1030,6 +2290,42 @@ when isMainModule:
       "(asgn y.0.M `cse.1) (asgn (dot (deref (deref qq.0.M)) g.0.M) v.0.M) " &
       "(asgn z.0.M `cse.1))")
 
+  when PathStoreInvalidation:
+    block sibling_field_store_survives:
+      # `x.other = v` cannot change `x.fld`: same root, but the selector lists
+      # diverge at the first step (`doc/cse.md`, rule 1). The alias partition
+      # knows only roots, so this is the case paths add.
+      chk(
+        "(stmts (asgn y.0.M (dot x.0.M fld.0.M)) " &
+        "(asgn (dot x.0.M other.0.M) v.0.M) " &
+        "(asgn z.0.M (dot x.0.M fld.0.M)))",
+        "(stmts (var :`cse.1 . . (dot x.0.M fld.0.M)) " &
+        "(asgn y.0.M `cse.1) (asgn (dot x.0.M other.0.M) v.0.M) " &
+        "(asgn z.0.M `cse.1))")
+  else:
+    block sibling_field_store_kills:
+      # Same input under `-d:cseTypeInvalidation`: the entry mentions `x`, whose
+      # class the store writes, so it dies and nothing is reused.
+      assertUnchanged(
+        "(stmts (asgn y.0.M (dot x.0.M fld.0.M)) " &
+        "(asgn (dot x.0.M other.0.M) v.0.M) " &
+        "(asgn z.0.M (dot x.0.M fld.0.M)))")
+
+  block prefix_store_kills:
+    # A write to `x.a` changes every read below it — `x.a.b` has it as a prefix.
+    assertUnchanged(
+      "(stmts (asgn y.0.M (dot (dot x.0.M a.0.M) b.0.M)) " &
+      "(asgn (dot x.0.M a.0.M) v.0.M) " &
+      "(asgn z.0.M (dot (dot x.0.M a.0.M) b.0.M)))")
+
+  block indices_collapse:
+    # `arr[j] = v` kills a cached `arr[i]`: indices are collapsed to one `Elem`
+    # step, so two elements of one array always overlap.
+    assertUnchanged(
+      "(stmts (asgn y.0.M (at arr.0.M i.0.M)) " &
+      "(asgn (at arr.0.M j.0.M) v.0.M) " &
+      "(asgn z.0.M (at arr.0.M i.0.M)))")
+
   block store_aliasing_prevents_cse:
     # Same shape as `store_disjoint_survives` but the store is through `pp` (same
     # alias class as the load) → it kills the cached load → no reuse → unchanged.
@@ -1038,20 +2334,57 @@ when isMainModule:
       "(asgn (dot (deref pp.0.M) g.0.M) v.0.M) " &
       "(asgn z.0.M (dot (deref (deref pp.0.M)) fld.0.M)))")
 
-  block lvalue_write_target_address_cse:
-    # `a.arr[i]` is read, written, read. Value CSE can't fold a write target, but
-    # its address is stable across the write, so it is address-CSE'd: one `addr`
-    # temp, `(deref t)` for both reads and the write. (Like `mat()` in alloc.nim.)
+  block pointer_field_store_aliases_source:
+    # `x.obj = y; x.obj.a = 3` mutates y when `obj` is a pointer. The store
+    # through `x.obj` must kill a cached load of `y.a` (same alias class).
+    assertUnchanged(
+      "(stmts (asgn r.0.M (dot (deref y.0.M) a.0.M)) " &
+      "(asgn (dot x.0.M obj.0.M) y.0.M) " &
+      "(asgn (dot (deref (dot x.0.M obj.0.M)) a.0.M) 3) " &
+      "(asgn s.0.M (dot (deref y.0.M) a.0.M)))")
+
+  block forging_cast_store_clears_reachable:
+    # `cast[ptr T](4000)` forges an untracked pointer. A store through it may
+    # hit anything a callee could, so a load through `pp` (not a body-local)
+    # must not CSE across it.
+    assertUnchanged(
+      "(stmts (asgn y.0.M (dot (deref (deref pp.0.M)) fld.0.M)) " &
+      "(asgn (dot (deref (cast (ptr (i +32)) 4000)) a.0.M) 3) " &
+      "(asgn z.0.M (dot (deref (deref pp.0.M)) fld.0.M)))")
+
+  block cast_byte_does_not_kill_cse:
+    # Narrowing `cast[byte]` is a value pun, not a forged pointer.
     chk(
-      "(stmts " &
-      "(asgn y.0.M (at (dot (deref a.0.M) arr.0.M) i.0.M)) " &
-      "(asgn (at (dot (deref a.0.M) arr.0.M) i.0.M) b.0.M) " &
-      "(asgn z.0.M (at (dot (deref a.0.M) arr.0.M) i.0.M)))",
-      "(stmts " &
-      "(var :`cse.1 . . (addr (at (dot (deref a.0.M) arr.0.M) i.0.M))) " &
-      "(asgn y.0.M (deref `cse.1)) " &
-      "(asgn (deref `cse.1) b.0.M) " &
-      "(asgn z.0.M (deref `cse.1)))")
+      "(stmts (asgn y.0.M (dot (deref (deref pp.0.M)) fld.0.M)) " &
+      "(asgn z.0.M (cast (u +8) v.0.M)) " &
+      "(asgn a.0.M (dot (deref (deref pp.0.M)) fld.0.M)))",
+      "(stmts (var :`cse.1 . . (dot (deref (deref pp.0.M)) fld.0.M)) " &
+      "(asgn y.0.M `cse.1) (asgn z.0.M (cast (u +8) v.0.M)) (asgn a.0.M `cse.1))")
+
+  when AddressCSE:
+    block lvalue_write_target_address_cse:
+      # `a.arr[i]` is read, written, read. Value CSE can't fold a write target, but
+      # its address is stable across the write, so it is address-CSE'd: one `addr`
+      # temp, `(deref t)` for both reads and the write. (Like `mat()` in alloc.nim.)
+      chk(
+        "(stmts " &
+        "(asgn y.0.M (at (dot (deref a.0.M) arr.0.M) i.0.M)) " &
+        "(asgn (at (dot (deref a.0.M) arr.0.M) i.0.M) b.0.M) " &
+        "(asgn z.0.M (at (dot (deref a.0.M) arr.0.M) i.0.M)))",
+        "(stmts " &
+        "(var :`cse.1 . . (addr (at (dot (deref a.0.M) arr.0.M) i.0.M))) " &
+        "(asgn y.0.M (deref `cse.1)) " &
+        "(asgn (deref `cse.1) b.0.M) " &
+        "(asgn z.0.M (deref `cse.1)))")
+  else:
+    block lvalue_write_target_left_inline:
+      # Address-CSE disabled: the read/write/read of one lvalue stays inline (arkham
+      # folds the address into each load/store's addressing mode) — no temp.
+      assertUnchanged(
+        "(stmts " &
+        "(asgn y.0.M (at (dot (deref a.0.M) arr.0.M) i.0.M)) " &
+        "(asgn (at (dot (deref a.0.M) arr.0.M) i.0.M) b.0.M) " &
+        "(asgn z.0.M (at (dot (deref a.0.M) arr.0.M) i.0.M)))")
 
   block dominance_into_both_branches:
     chk(
@@ -1060,11 +2393,137 @@ when isMainModule:
       "(asgn y.0.M `cse.1) " &
       "(if (elif c.0.M (asgn z.0.M `cse.1)) (else (asgn a.0.M `cse.1))))")
 
-  block loop_prevents_cse_across:
-    # A loop body may run any number of times, so the cache is cleared across it
-    # → the pre- and post-loop loads don't share → unchanged.
+  block loop_invariant_reused_across:
+    # Empty loop does not clobber `pp.fld`, so the pre- and post-loop loads
+    # share a temp (LICM keeps invariant cache entries across the loop).
+    chk(
+      "(stmts (asgn y.0.M (dot (deref (deref pp.0.M)) fld.0.M)) (while c.0.M (stmts)) (asgn z.0.M (dot (deref (deref pp.0.M)) fld.0.M)))",
+      "(stmts (var :`cse.1 . . (dot (deref (deref pp.0.M)) fld.0.M)) " &
+      "(asgn y.0.M `cse.1) (while c.0.M (stmts)) (asgn z.0.M `cse.1))")
+
+  block loop_store_prevents_cse_across:
+    # A store through `pp` in the body aliases the load → cache dropped at
+    # loop entry → pre- and post-loop loads do not share.
     assertUnchanged(
-      "(stmts (asgn y.0.M (dot (deref (deref pp.0.M)) fld.0.M)) (while c.0.M (stmts)) (asgn z.0.M (dot (deref (deref pp.0.M)) fld.0.M)))")
+      "(stmts (asgn y.0.M (dot (deref (deref pp.0.M)) fld.0.M)) " &
+      "(while c.0.M (stmts (asgn (dot (deref (deref pp.0.M)) g.0.M) v.0.M))) " &
+      "(asgn z.0.M (dot (deref (deref pp.0.M)) fld.0.M)))")
+
+  block loop_invariant_load_hoisted:
+    # Two identical loads in the body, nothing writes them → one temp before
+    # the `while` (pre-header), both uses rewritten.
+    chk(
+      "(stmts (while c.0.M (stmts " &
+      "(asgn y.0.M (dot (deref (deref pp.0.M)) fld.0.M)) " &
+      "(asgn z.0.M (dot (deref (deref pp.0.M)) fld.0.M)))))",
+      "(stmts (var :`cse.1 . . (dot (deref (deref pp.0.M)) fld.0.M)) " &
+      "(while c.0.M (stmts (asgn y.0.M `cse.1) (asgn z.0.M `cse.1))))")
+
+  block loop_invariant_single_load_hoisted:
+    # A single occurrence still hoists: the loop is the reuse.
+    chk(
+      "(stmts (while c.0.M (stmts " &
+      "(asgn y.0.M (dot (deref (deref pp.0.M)) fld.0.M)) " &
+      "(asgn i.0.M (add (i 64) i.0.M 1)))))",
+      "(stmts (var :`cse.1 . . (dot (deref (deref pp.0.M)) fld.0.M)) " &
+      "(while c.0.M (stmts (asgn y.0.M `cse.1) " &
+      "(asgn i.0.M (add (i 64) i.0.M 1)))))")
+
+  block loop_variant_index_base_hoisted:
+    # `a[i]` mentions `i`, which the body writes, so the indexed load stays in
+    # the loop. The base pointer does not mention `i` → hoisted to the pre-header.
+    chk(
+      "(stmts (while c.0.M (stmts " &
+      "(asgn y.0.M (at (deref (deref pp.0.M)) i.0.M)) " &
+      "(asgn z.0.M (at (deref (deref pp.0.M)) i.0.M)) " &
+      "(asgn i.0.M (add (i 64) i.0.M 1)))))",
+      "(stmts (var :`cse.1 . . (deref (deref pp.0.M))) " &
+      "(while c.0.M (stmts (asgn y.0.M (at `cse.1 i.0.M)) " &
+      "(asgn z.0.M (at `cse.1 i.0.M)) " &
+      "(asgn i.0.M (add (i 64) i.0.M 1)))))")
+
+  when PathStoreInvalidation:
+    block loop_sibling_field_store_hoists:
+      # The loop writes `o.b`; a load of `o.a` is still invariant, so it moves to
+      # the pre-header. At root granularity the store holds it in the loop.
+      chk(
+        "(stmts (while c.0.M (stmts " &
+        "(asgn y.0.M (dot o.0.M a.0.M)) " &
+        "(asgn (dot o.0.M b.0.M) 7))))",
+        "(stmts (var :`cse.1 . . (dot o.0.M a.0.M)) " &
+        "(while c.0.M (stmts (asgn y.0.M `cse.1) " &
+        "(asgn (dot o.0.M b.0.M) 7))))")
+  else:
+    block loop_sibling_field_store_blocks_hoist:
+      assertUnchanged(
+        "(stmts (while c.0.M (stmts " &
+        "(asgn y.0.M (dot o.0.M a.0.M)) " &
+        "(asgn (dot o.0.M b.0.M) 7))))")
+
+  block loop_prefix_store_not_hoisted:
+    # The loop writes `o.a` itself → the load of `o.a.f` is not invariant.
+    assertUnchanged(
+      "(stmts (while c.0.M (stmts " &
+      "(asgn y.0.M (dot (dot o.0.M a.0.M) f.0.M)) " &
+      "(asgn (dot o.0.M a.0.M) 7))))")
+
+  block loop_pointer_field_store_not_hoisted:
+    # The loop advances the POINTER `t.p` the load goes through — an inlined
+    # cursor `inc`. The load reads `t.p` itself, so it is not invariant even
+    # though `*(t.p)` and `t.p` never name the same storage (`collectReadPaths`
+    # must report the pointer operand of a `deref`). Measured: hoisting it
+    # miscompiled nimsem's `nominalRoot` once `inc` was inlined into it.
+    # `t` is a body local whose address is never taken — the case where no
+    # pointer can reach it and only the path rule can say the store matters.
+    assertUnchanged(
+      "(stmts (var :t.0.M . Cursor.0.M .) (while c.0.M (stmts " &
+      "(asgn y.0.M (deref (dot t.0.M p.0.M))) " &
+      "(asgn (dot t.0.M p.0.M) q.0.M))))")
+
+  block pointer_field_store_kills_deref_load:
+    # Straight-line twin: after `t.p = q`, `*(t.p)` is a different load.
+    assertUnchanged(
+      "(stmts (var :t.0.M . Cursor.0.M .) " &
+      "(asgn y.0.M (deref (dot t.0.M p.0.M))) " &
+      "(asgn (dot t.0.M p.0.M) q.0.M) " &
+      "(asgn z.0.M (deref (dot t.0.M p.0.M))))")
+
+  block loop_unknown_call_not_hoisted:
+    # Unknown callee in the body may clobber `pp` → not invariant.
+    assertUnchanged(
+      "(stmts (while c.0.M (stmts " &
+      "(asgn y.0.M (dot (deref (deref pp.0.M)) fld.0.M)) " &
+      "(call side.0.M) " &
+      "(asgn z.0.M (dot (deref (deref pp.0.M)) fld.0.M)))))")
+
+  block loop_guarded_load_not_hoisted:
+    # Behind `if`: the pointer may be nil when the guard is false. Must not
+    # move to the pre-header (intern of a short string vs `a.more.fullLen`).
+    assertUnchanged(
+      "(stmts (while c.0.M (stmts " &
+      "(if (elif g.0.M (asgn y.0.M (dot (deref (deref pp.0.M)) fld.0.M)))))))")
+
+  block loop_guarded_load_cse_in_branch:
+    # Two loads in the same arm still share a temp; the decl stays in the arm.
+    chk(
+      "(stmts (while c.0.M (stmts " &
+      "(if (elif g.0.M (stmts " &
+      "(asgn y.0.M (dot (deref (deref pp.0.M)) fld.0.M)) " &
+      "(asgn z.0.M (dot (deref (deref pp.0.M)) fld.0.M))))))))",
+      "(stmts (while c.0.M (stmts " &
+      "(if (elif g.0.M (stmts " &
+      "(var :`cse.1 . . (dot (deref (deref pp.0.M)) fld.0.M)) " &
+      "(asgn y.0.M `cse.1) (asgn z.0.M `cse.1)))))))")
+
+  block loop_nested_hoists_to_inner:
+    # Invariant in both loops, but the inner may run zero times → only the
+    # inner pre-header is a must-execute region relative to the load.
+    chk(
+      "(stmts (while c.0.M (stmts (while d.0.M (stmts " &
+      "(asgn y.0.M (dot (deref (deref pp.0.M)) fld.0.M)))))))",
+      "(stmts (while c.0.M (stmts " &
+      "(var :`cse.1 . . (dot (deref (deref pp.0.M)) fld.0.M)) " &
+      "(while d.0.M (stmts (asgn y.0.M `cse.1))))))")
 
   # ---- alias-aware call invalidation via partition summaries ----
   # Module-level: `f` writes only its parameter 0's graph (class 0). cse runs on
@@ -1081,7 +2540,7 @@ when isMainModule:
     # `SymId` keys line up; mirror that here via `sharedPool`.
     var body = parseFromBuffer(bodyIn, "M", 100,
                                sharedPool = mb.pool, sharedTags = createLengTagPool())
-    runCSE(body, "M", addr summaries)
+    runCSE(body, addr summaries)
     let got = toString(body)
     let want = canon(bodyExpected)
     doAssert got == want, "MISMATCH\n  got:  " & got & "\n  want: " & want
@@ -1092,7 +2551,7 @@ when isMainModule:
     var body = parseFromBuffer(bodyIn, "M", 100,
                                sharedPool = mb.pool, sharedTags = createLengTagPool())
     let before = toString(body)
-    runCSE(body, "M", addr summaries)
+    runCSE(body, addr summaries)
     doAssert toString(body) == before, "expected unchanged:\n  " & bodyIn
 
   block summary_disjoint_survives:
@@ -1111,5 +2570,76 @@ when isMainModule:
       "(stmts (asgn y.0.M (dot (deref (deref pp.0.M)) fld.0.M)) " &
       "(call f.0.M pp.0.M) " &
       "(asgn z.0.M (dot (deref (deref pp.0.M)) fld.0.M)))")
+
+  when AddressCSE:   # these validate address-CSE, which is disabled on the arkham path
+    block addr_and_load_shared:
+      # `a.arr[i]` is loaded, then its ADDRESS is taken (into a pointer local). The
+      # address arithmetic is shared: cache `addr(a.arr[i])` once; the load becomes
+      # `(deref t)`, the `(addr …)` becomes bare `t`. (The rawDealloc
+      # `freeSmallChunks[s div 16]` case — inlined `listAdd` takes the address.)
+      chk(
+        "(stmts " &
+        "(asgn y.0.M (at (dot (deref a.0.M) arr.0.M) i.0.M)) " &
+        "(asgn p.0.M (addr (at (dot (deref a.0.M) arr.0.M) i.0.M))))",
+        "(stmts " &
+        "(var :`cse.1 . . (addr (at (dot (deref a.0.M) arr.0.M) i.0.M))) " &
+        "(asgn y.0.M (deref `cse.1)) " &
+        "(asgn p.0.M `cse.1))")
+
+    block addr_first_then_load:
+      # Address taken first, then loaded — same unification, order-independent.
+      chk(
+        "(stmts " &
+        "(asgn p.0.M (addr (at (dot (deref a.0.M) arr.0.M) i.0.M))) " &
+        "(asgn y.0.M (at (dot (deref a.0.M) arr.0.M) i.0.M)))",
+        "(stmts " &
+        "(var :`cse.1 . . (addr (at (dot (deref a.0.M) arr.0.M) i.0.M))) " &
+        "(asgn p.0.M `cse.1) " &
+        "(asgn y.0.M (deref `cse.1)))")
+
+    block two_addrs_shared:
+      # Two `(addr L)` occurrences share the address temp.
+      chk(
+        "(stmts " &
+        "(asgn u.0.M (addr (at (dot (deref p.0.M) arr.0.M) i.0.M))) " &
+        "(asgn v.0.M (addr (at (dot (deref p.0.M) arr.0.M) i.0.M))))",
+        "(stmts " &
+        "(var :`cse.1 . . (addr (at (dot (deref p.0.M) arr.0.M) i.0.M))) " &
+        "(asgn u.0.M `cse.1) " &
+        "(asgn v.0.M `cse.1))")
+
+  when not AddressCSE:
+    block addr_load_not_shared_when_disabled:
+      # With address-CSE off, a load + a subsequent `(addr L)` of the same lvalue are
+      # left inline (arkham folds the address into the load/store) — no shared temp.
+      assertUnchanged(
+        "(stmts " &
+        "(asgn y.0.M (at (dot (deref a.0.M) arr.0.M) i.0.M)) " &
+        "(asgn p.0.M (addr (at (dot (deref a.0.M) arr.0.M) i.0.M))))")
+
+  block index_write_blocks_addr_load:
+    # The index `i` is reassigned between the load and the addr → the address
+    # changed → no reuse → unchanged.
+    assertUnchanged(
+      "(stmts " &
+      "(asgn y.0.M (at (dot (deref a.0.M) arr.0.M) i.0.M)) " &
+      "(asgn i.0.M 5) " &
+      "(asgn p.0.M (addr (at (dot (deref a.0.M) arr.0.M) i.0.M))))")
+
+  block arith_dead_after_is_csed:
+    # `a + b` computed twice; `a` and `b` appear NOWHERE else, so folding the
+    # duplicate into one temp kills their live ranges — the gate lets it through.
+    chk(
+      "(stmts (asgn y.0.M (add (i 64) a.0.M b.0.M)) (asgn z.0.M (add (i 64) a.0.M b.0.M)))",
+      "(stmts (var :`cse.1 . . (add (i 64) a.0.M b.0.M)) " &
+      "(asgn y.0.M `cse.1) (asgn z.0.M `cse.1))")
+
+  block arith_operand_used_elsewhere_not_csed:
+    # Same duplicate `a + b`, but `a` is ALSO read in `(asgn w a)` → it stays live
+    # regardless, so a temp would be pure register pressure. The gate rejects it
+    # (this is the `alignment - 1` rawAlloc regression, prevented) → unchanged.
+    assertUnchanged(
+      "(stmts (asgn y.0.M (add (i 64) a.0.M b.0.M)) (asgn w.0.M a.0.M) " &
+      "(asgn z.0.M (add (i 64) a.0.M b.0.M)))")
 
   echo "cse.nim: all self-tests passed"

@@ -7,42 +7,43 @@ when defined(nimNativeIo):
     # Windows stderr is a kernel32 `HANDLE`; write to it via `WriteFile`.
     type WinHandle = pointer
     const STD_ERROR_HANDLE = 0xFFFFFFF4'u32   # (DWORD)-12
+    # `dynlib` = static import library on every backend (see `system/exits`).
     proc cGetStdHandle(nStdHandle: uint32): WinHandle {.stdcall,
-      importc: "GetStdHandle", header: "<windows.h>".}
+      importc: "GetStdHandle", dynlib: "kernel32".}
     proc cWriteErrFile(h: WinHandle; buf: pointer; n: uint32;
                        written: ptr uint32; overlapped: pointer): int32 {.
-      stdcall, importc: "WriteFile", header: "<windows.h>".}
+      stdcall, importc: "WriteFile", dynlib: "kernel32".}
 
-    proc writeErr(s: string) =
+    proc writeErr*(s: string) =
       var written: uint32 = 0
       discard cWriteErrFile(cGetStdHandle(STD_ERROR_HANDLE), readRawData(s),
                             s.len.uint32, addr written, nil)
-    proc writeErr(s: cstring) =
+    proc writeErr*(s: cstring) =
       var n = 0
       let p = cast[ptr UncheckedArray[char]](s)
       while p[n] != '\0': inc n
       var written: uint32 = 0
       discard cWriteErrFile(cGetStdHandle(STD_ERROR_HANDLE), p, n.uint32,
                             addr written, nil)
-    proc writeErr(x: int64) = writeErr($x)
-    proc writeErr(x: uint64) = writeErr($x)
+    proc writeErr*(x: int64) = writeErr($x)
+    proc writeErr*(x: uint64) = writeErr($x)
   else:
     # POSIX: error text goes straight to fd 2 via the `write` syscall.
     proc cWriteErr(fd: cint; buf: pointer; n: uint): int {.importc: "write".}
 
-    proc writeErr(s: string) =
+    proc writeErr*(s: string) =
       discard cWriteErr(2'i32, readRawData(s), s.len.uint)
-    proc writeErr(s: cstring) =
+    proc writeErr*(s: cstring) =
       var n = 0
       let p = cast[ptr UncheckedArray[char]](s)
       while p[n] != '\0': inc n
       discard cWriteErr(2'i32, p, n.uint)
-    proc writeErr(x: int64) = writeErr($x)
-    proc writeErr(x: uint64) = writeErr($x)
+    proc writeErr*(x: int64) = writeErr($x)
+    proc writeErr*(x: uint64) = writeErr($x)
 
   proc die(value: int32) {.noreturn.} = cExit(value.int)
 else:
-  proc die(value: int32) {.importc: "exit", header: "<stdlib.h>".}
+  proc die(value: int32) {.importc: "exit", header: "<stdlib.h>", noreturn.}
 
   # Yes, that is a tiny bit of duplication from syncio.nim. Get over it.
   type
@@ -58,14 +59,24 @@ else:
     importc: "fwrite", header: "<stdio.h>".}
   proc fprintf(f: ptr RawCFile; fmt: cstring) {.varargs, importc: "fprintf", header: "<stdio.h>".}
 
-  proc writeErr(x: int64) = fprintf(cstderr, cstring"%lld", x)
-  proc writeErr(x: uint64) = fprintf(cstderr, cstring"%llu", x)
-  proc writeErr(s: string) = discard c_fwrite(readRawData(s), 1'u, s.len.uint, cstderr)
-  proc writeErr(s: cstring) = discard c_fwrite(s, 1'u, s.len.uint, cstderr)
+  proc writeErr*(x: int64) = fprintf(cstderr, cstring"%lld", x)
+  proc writeErr*(x: uint64) = fprintf(cstderr, cstring"%llu", x)
+  proc writeErr*(s: string) = discard c_fwrite(readRawData(s), 1'u, s.len.uint, cstderr)
+  proc writeErr*(s: cstring) = discard c_fwrite(s, 1'u, s.len.uint, cstderr)
 
 proc panic*(s: string) {.noinline, noreturn.} =
   writeErr s
   die 1'i32
+
+proc panicOutOfMem*() {.noinline, noreturn.} =
+  ## Allocation failure with no error channel in scope. `ref T` is not-nil, so a
+  ## failed `new` has no continuation value and termination is the only report
+  ## left; inside a `.raises` routine the duplifier raises `OutOfMemError`
+  ## instead, and a `nil T` destination is handed the `nil`. See
+  ## `doc/internals/failure_modes.md`.
+  ##
+  ## Not `inline`: `hexer` emits cross-module references to this symbol.
+  panic "out of memory\n"
 
 type
   HasWriteErr = concept

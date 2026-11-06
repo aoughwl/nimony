@@ -7,7 +7,7 @@
 ## Magics, somewhat compatible with Nim 2.0, but it's neither required nor desirable.
 
 import ".." / models / tags
-import ".." / lib / [nifcursors, nifstreams]
+import ".." / lib / [nifpools]
 import nimony_model
 
 when defined(nimony):
@@ -24,14 +24,20 @@ proc magicToTag*(m: string; bits: int): (string, int) =
   of "Declared": res DeclaredX
   of "AstToStr": res AstToStrX
   of "IsMainModule": res IsmainmoduleX
+  of "InstantiationInfo": res InstantiationinfoX
   of "Compiles": res CompilesX
+  of "Static": res StaticX
   of "ArrGet": res AtX
   of "ArrAt": res ArratX
   of "Pat": res PatX
   of "TupAt": res TupatX
   of "Asgn": res AsgnS
-  of "AddI", "AddU", "AddF64", "Succ": res AddX, TypedMagic
-  of "SubI", "SubU", "SubF64", "Pred": res SubX, TypedMagic
+  of "AddI", "AddU", "AddF64": res AddX, TypedMagic
+  of "SubI", "SubU", "SubF64": res SubX, TypedMagic
+  of "Succ": res SuccX, TypedMagic
+  of "Pred": res PredX, TypedMagic
+  of "Inc": res IncS, TypedMagic
+  of "Dec": res DecS, TypedMagic
   of "MulI", "MulU", "MulF64": res MulX, TypedMagic
   of "DivI", "DivU", "DivF64": res DivX, TypedMagic
   of "ModI", "ModU": res ModX, TypedMagic
@@ -50,10 +56,12 @@ proc magicToTag*(m: string; bits: int): (string, int) =
   of "Not": res NotX
   of "Xor": res XorX
   of "SizeOf": res SizeofX
+  of "CanFormCycles": res CanFormCyclesX
+  of "SupportsCopyMem": res SupportsCopyMemX
   of "Type", "TypeOf": res TypeofX
   of "Addr": res AddrX
   of "Deref": res DerefX
-  of "EqI", "EqB", "EqCh", "EqF64", "EqRef", "EqEnum": res EqX, TypedMagic
+  of "EqI", "EqB", "EqCh", "EqF64", "EqRef", "EqEnum", "EqProc": res EqX, TypedMagic
   of "LeI", "LeU", "LeB", "LeCh", "LeF64", "LePtr", "LeEnum": res LeX, TypedMagic
   of "LtI", "LtU", "LtB", "LtCh", "LtF64", "LtPtr", "LtEnum": res LtX, TypedMagic
   of "Low": res LowX
@@ -111,6 +119,7 @@ proc magicToTag*(m: string; bits: int): (string, int) =
   of "EnsureMove": res EmoveX
   of "UncheckedArray": res UarrayT
   of "Sink": res SinkT
+  of "Owned": res OwnedT
   of "Lent": res LentT
   of "Destroy": res DestroyX
   of "SinkHook": res SinkhX

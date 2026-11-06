@@ -35,6 +35,10 @@ are copy-on-write internally.
   `beginStore` also handles copy-on-write (ensures the heap buffer is
   unique before returning a mutable pointer).
 
+  When the storage cannot be allocated, `beginStore` returns `nil` and
+  `s` becomes the OOM marker (see `isOom`). Test the pointer before
+  writing through it.
+
   ```nim
   var s = newString(100)
   let p = beginStore(s, 5)  # get pointer, ensure unique
@@ -71,8 +75,130 @@ are copy-on-write internally.
 - `swap` exchanges bits directly. It does **not** call `=sink`,
   `=copy`, or `=dup` hooks. This is by design — it's faster this way and Nim's lifetime tracking hooks do not support "self-pointers" (pointers inside the same object, `obj.field = addr(obj)`).
 - `allocFixed` / `deallocFixed`: Low-level fixed-size allocation.
-- `setOomHandler`: By default the runtime tries to continue after
-  out-of-memory. For many applications, just quitting is the more robust solution — set a handler that calls `quit`.
+- `setOomHandler`: governs `alloc`, which reports failure by returning `nil`. By
+  default the runtime tries to continue after out-of-memory, accumulating the
+  missing bytes for `threadOutOfMem()` to report. For many applications, just
+  quitting is the more robust solution — set a handler that calls `quit`.
+- `new` is not covered by that policy and cannot be: `ref T` is not-nil, so
+  there is no value to hand back. A failed allocation raises `OutOfMemError`
+  inside a `{.raises.}` routine and panics anywhere else — unless the destination
+  asks for the `nil` by declaring itself `nil T`, which is then narrowed like any
+  other nilable reference. See `doc/internals/failure_modes.md` for why the two
+  allocators differ.
+- `-d:nimMaxHeap=N` caps the heap at `N` megabytes, with Nim's name, unit and
+  default, and Nim's consequence: exceeding it is **unrecoverable**, and
+  `raiseOutOfMem` aborts.
+- `-d:nimHardenOutOfMem` turns that cap into a refusal instead: allocation
+  answers `nil` and the out-of-memory paths in seqs, strings, tables and `new`
+  run for real. It is how those paths are reached on purpose rather than only
+  under genuine memory pressure -- see `doc/internals/failure_modes.md` and
+  `tests/nimony/oom`. Without `nimMaxHeap` it does nothing.
+- Both live in the ported allocator, so they apply to the default
+  (`nimNativeAlloc`) configuration and a `-d:useMimalloc` build ignores them.
+  That keeps them free: the check rides on occupancy the allocator already
+  tracks, with no second layer of accounting per allocation.
+
+#### Strategies (`--mm:`)
+
+`--mm:NAME` selects the strategy. `system.nim` says `include "$MM"` and the
+compiler expands `$MM` to `system/<name>`, lowercased — so `--mm:atomicArc`
+includes `lib/std/system/atomicarc.nim`. Adding a strategy is adding a file
+under `lib/std/system/`; nothing in `system.nim` enumerates them.
+
+| `--mm:` | file | notes |
+| --- | --- | --- |
+| `atomicArc` | `system/atomicarc.nim` | default; the reference count is updated atomically, so a `ref` may be shared between threads |
+| `arc` | `system/arc.nim` | the same, minus the atomics: cheaper counters, but a `ref` must stay on one thread |
+| `orc` | `system/orc.nim` | `arc` plus a cycle collector: cyclic garbage is freed too; a `ref` must stay on one thread |
+| `yrc` | `system/yrc.nim` | thread-safe `orc`: refs may be shared between threads, and threads collect cycles concurrently with each other and with the mutators |
+
+A strategy module defines exactly three primitives — `arcInc`, `arcDec` (true
+when the count reached zero) and `arcIsUnique`. What is built on top of them
+(`GC_ref` / `GC_unref`) is strategy independent and lives in `system/refops`.
+
+Cycle collection needs more than three primitives, so a strategy opts into it:
+`orc`'s `nimTraceRef` says `{.enableTrace.}` in its body, and a runtime of your
+own that does the same gets the same compiler support. A cell carries a second
+header word
+(`rootIdx`), and for a `ref T` whose `T` can form a cycle (it can reach a
+`ref T` again through owned fields, or is a class, or holds a closure) the
+compiler generates a *cell operation* — `proc (cell, env: pointer)` that traces
+the payload or, with `env == nil`, destroys it and frees the cell — and hands it
+to `nimDecRefCyclic` (`=destroy`) and `nimTraceRef` (`=trace`). `=trace` visits
+the owned refs that can be part of a cycle and nothing else: never a `.cursor`
+field, never a raw pointer — unless the type has a hand-written `=trace`, as
+`seq` has. `{.acyclic.}` on a type exempts it. The collector itself is Nim's
+(trial deletion after Bacon & Rajan); `GC_fullCollect`, `GC_runOrc`,
+`GC_enableOrc` and `GC_disableOrc` control it, and it also runs on its own once
+enough candidate roots piled up.
+
+`yrc` is Nim's concurrent cycle collector on the same protocol. A decrement of
+a cell that can be part of a cycle is deferred into a lock-free queue, so such
+a cell is only ever freed by a collection -- its destructor runs then, not on
+the last decrement; cells that cannot be part of a cycle are freed promptly as
+with `arc`. Collections capture the graph without writing to it, decide what
+is dead on the captured data and validate against what mutators did in the
+meantime before freeing anything, so they run concurrently with the mutators
+and with each other. `seq` fences structural changes of buffers the collector
+traces (`typetraits.canFormCycles(T)`, answered by the compiler; a runtime that declares
+`nimSeqFenceEnter`/`nimSeqFenceExit` gets the fence), and a thread that exits
+hands its queued decrements and candidates over (`nimThreadTeardown`).
+
+`--mm:NAME` also defines `gcName`, so `--mm:arc` makes `defined(gcArc)` true and
+`--mm:atomicArc` makes `defined(gcAtomicArc)` true. Switching strategies changes
+the cached build configuration and therefore forces a rebuild.
+
+#### A runtime of your own
+
+The file does not have to be one of ours: `--mm` also takes a **path**, and then
+`$MM` expands to exactly what was passed. That is the whole mechanism — write
+the three primitives into a file and point `--mm` at it:
+
+```
+nimony c --mm:rt/mygc myprogram.nim       # relative to the current directory
+nimony c --mm:/opt/rt/mygc.nim myprogram.nim
+nimony c '--mm:$MYRT/mygc' myprogram.nim  # $VAR: the compiler reads the
+                                          # environment, hence the quotes
+```
+
+A value is a path as soon as it is not a bare name (letters, digits and `_`):
+`--mm:mygc` is a *strategy* and looks for `lib/std/system/mygc.nim`, while
+`--mm:./mygc` and `--mm:mygc.nim` are paths. A relative path is read against the
+current directory; one that is not there is looked up on the `--path` search
+path, like any other `include`. Whitespace is the one thing the path may not
+contain, because the switch is forwarded to the other tools through a single
+string that is split on spaces again. Naming a file that is not there stops the
+compiler with one error instead of a wall of `undeclared identifier: arcInc`.
+
+`defined(gc<Name>)` works for these too: the name of a runtime given by path is
+its file's basename, so `--mm:rt/myGc.nim` makes `defined(gcMyGc)` true.
+
+#### The uniquely-referenced fast path
+
+`atomicArc`'s `arcDec` reads the count first and skips the atomic
+read-modify-write when it is already zero. A zero count means the caller holds
+the only reference, so there is nothing to adjudicate against another thread and
+nothing to write back into a cell that is about to be freed. See the comment on
+`arcDec` for why that is sound, and why a strategy that ever gains a collector
+must not inherit it.
+
+That makes the caller's contract load-bearing: **free the cell when `arcDec`
+returns true, or already know the count is non-zero.** A caller that discards a
+`true` leaves the count untouched rather than at -1.
+
+On `bench/gcbench.nim` (`-d:danger`, median of 31 pinned runs) the fast path is
+worth -36%, which puts atomicArc level with non-atomic `arc`:
+
+| | |
+| --- | --- |
+| `--mm:atomicArc`, `-d:nimNoAtomicArcFastPath` | 0.1334 s |
+| `--mm:atomicArc` | 0.0847 s |
+| `--mm:arc` | 0.0881 s |
+
+The worst case -- a decRef that always sees a non-zero count, so the load never
+pays off -- measures +0.1%. `-d:nimNoAtomicArcFastPath` restores the previous
+code path. The same trick does *not* belong in `arc`: measured there it is a
+2--4% loss, because a non-atomic store is cheaper than the branch that avoids it.
 
 ### Iterators
 
@@ -97,11 +223,16 @@ available.
 
 - `open` returns bool**, not a File — check it. The `File` is an
   out-parameter.
-- `readLine` returns `false` at EOF. Use it in a `while` loop.
+- `readLine(f, s)` returns `false` at EOF. Use it in a `while` loop.
+- `readLine(f)` returns the line without its line ending and raises
+  `EndOfStreamError` at EOF.
 - `writeLine` appends the platform line ending.
 - `tryWriteFile` is a convenience that opens, writes, and closes
   in one call.
 - `quit(msg)` writes to stderr and exits — useful for fatal errors.
+- `FileMode`, `FileSeekPos` and `FilePermission` live in
+  [`std/commonio`](../lib/std/commonio.nim), which `syncio` and the ring-based
+  `std/asyncio` both export, so importing both is not ambiguous.
 
 [Examples: file I/O](../examples/io_basics.nim)
 
@@ -184,7 +315,9 @@ a rune index to a byte index.
 Hash values are prerequisites for `Table` and `HashSet` keys.
 
 - Combine hashes with `!&`, finalize with `!$`.
-- The `Hashable` concept describes what a type needs to be hashable.
+- The `Hashable` concept describes what a type needs to be hashable. The
+  `hash` overloads live next to it, which is why a `Hashable` (or
+  `tables.Keyable`) check succeeds without importing this module.
 - `hashIgnoreStyle` matches `cmpIgnoreStyle` — use them together
   for Nim-style identifier tables.
 
@@ -194,9 +327,12 @@ Hash values are prerequisites for `Table` and `HashSet` keys.
 [Source](../lib/std/tables.nim) ·
 [Examples](../examples/tables_basics.nim)
 
-Generic hash tables. Keys must satisfy `Keyable` (have `==` and `hash`).
-You must `import std/hashes` alongside `std/tables` to make the `hash`
-procs visible — tables does not re-export them.
+Generic hash tables. Keys must satisfy `Keyable`, which is `Hashable`
+(from `std/hashes`) plus `==`. The builtin key types need no import of
+their own: a concept requirement is resolved in the module that declares
+it, so `hash` is found in `std/hashes` even where it is not imported.
+Import `std/hashes` when you write a `hash` for your own key type, or
+need `Hash`, `!&` and `!$` by name.
 
 The table uses a hybrid strategy: **linear scan for ≤ 4 entries**,
 hash table with open addressing for larger sizes. This means small
@@ -215,8 +351,8 @@ tables have no hashing overhead at all.
 [Source](../lib/std/sets.nim) ·
 [Examples](../examples/sets_basics.nim)
 
-Hash-based sets for any hashable type. Built on top of `Table[T, bool]`.
-Like `tables`, you must also `import std/hashes`.
+Hash-based sets for any hashable type. Built on top of `Table[T, bool]`,
+so element types must satisfy `Keyable` under the same rules as table keys.
 
 - `containsOrIncl` is the deduplication primitive — returns whether
   the element was already present, and adds it if not.
@@ -312,6 +448,30 @@ Windows.
   breaking them mid-word.
 
 
+## logging
+
+[Source](../lib/std/logging.nim)
+
+A port of Nim's `std/logging` whose log entries are lines of NIF in the
+line-based syntax, so a log file can be read back with
+`nifreader.open(file, lineBased = true)`:
+
+```nif
+info 2026-09-29T09:14:03Z "myapp" "server started on port 8080"
+```
+
+- The tag is the level (`debug`, `info`, `notice`, `warn`, `error`,
+  `fatal`); the message comes last as a string literal, escaped so that
+  an entry never spans more than one line.
+- `fmtStr` is not Nim's free-form prefix but a whitespace separated list of
+  fields between the tag and the message: `$date`, `$time`, `$datetime`,
+  `$app`, `$appname`, `$appdir`, `$levelid`, `$levelname`, or literal
+  words, which are written as strings. The default is `""`: no fields.
+- Times are UTC, like the rest of `std/times`, and `$datetime` says so
+  with a `Z`.
+- Handlers are thread-local, as in Nim.
+
+
 ## rawthreads
 
 [Source](../lib/std/rawthreads.nim)
@@ -323,3 +483,224 @@ Low-level thread creation.
 - `pinnedToCpu` is best-effort — some platforms (macOS) do not
   support CPU pinning.
 - Always `join` threads before the program exits.
+
+
+## stacktraces
+
+[Source](../lib/std/stacktraces.nim)
+
+`getStackTrace()` returns the call stack as one proc name per line,
+innermost frame first. `getStackTrace` itself is never listed; pass
+`skip = n` to drop that many further frames, which is what a panic
+handler wants so its own frame does not head the trace.
+
+- **Native backend only.** `stackTracesAvailable` is a `const`: true for
+  `nimony n` on amd64, false everywhere else, where `getStackTrace`
+  returns `""`. On the C backend the frames belong to the C compiler and
+  are described by its unwind tables; reading those is a different
+  implementation rather than a missing branch of this one. Branch on the
+  const rather than on the result, so the difference is visible at
+  compile time.
+- **Names, not source positions.** There is no line-number table yet, and
+  the disambiguator and module suffix a NIF symbol carries
+  (`leaf.3.stagd0hts`) are dropped — the frame *sequence* is what
+  distinguishes two procs of the same name.
+- **Inlined frames do not appear.** A proc the inliner spliced into its
+  caller has no frame to find, so the caller is what the trace names.
+  Mark a proc `{.noinline.}` if you need to see it.
+- It allocates the result string like any other proc; there is no
+  allocation-free variant yet.
+
+How it works — nifasm lays a per-proc table (code range, frame size, name)
+at the end of `.text`, and the walk is a binary search per frame. See
+`nativenif/doc/tracetable.md`.
+
+## streamio
+
+[Source](../lib/std/streamio.nim)
+
+Streams as in nim-lang/nimony#2635: one `Reader`, one `Writer`, the same
+interface for files, strings, memory and connections.
+
+```nim
+var r = openReader(path"log.gz")
+r.setAdapter gzipAdapter(fmtDetect)
+echo r.readLine()
+
+let (r, w) = connect("cache.local:6379", "PING\r\n")   # written AND flushed
+echo r.readLine()
+
+var w = openWriter()                 # in memory
+w.write data
+let bytes = extract(w)
+```
+
+- `Reader`/`Writer` are move-only values; a pair from one constructor shares
+  a core (descriptor, TLS engine, atomic end counts).
+- `read` returning `0` is the end of the data; everything else raises.
+- One adapter slot per end (`setAdapter`, an `Adapter` subclass: `gzipAdapter`,
+  HTTP framing, your own). TLS is not a adapter: a `TlsEngine` lives in the
+  core, so compression can only sit above encryption.
+- A writer's destructor finishes it (adapter trailer, `close_notify`, end of
+  data for the peer) and swallows errors; call `close` to see them, `abort` on
+  error paths to avoid a complete-looking truncated stream.
+- `deadline` reads a stream's standing I/O deadline; `renew(deadline)` replaces
+  it, and `renew(never)` clears it. Paired ends share the same deadline. These
+  operations raise `BadOperation` for closed or default-constructed streams.
+  Deadlines bound descriptor I/O; buffered and in-memory work does not wait.
+- `connect`, `connectReader` and `connectWriter` accept `dl = never`. One
+  absolute deadline covers DNS, TCP, TLS and, for the request overload, the
+  initial request flush. Expiry raises `TimeoutError`. Returned streams start
+  with `never`; use `renew` for the next exchange. Renewing does not make a
+  failed partial write resumable.
+- `pipe(capacity)` is an in-process `Reader`/`Writer` pair over a ring; a
+  full or empty pipe parks the task instead of blocking a thread.
+  `recordPipe` is its fixed-size-record form, on which `std/channels` builds.
+- Not yet: `openReadWrite`, `startTls`, the `sendfile`/`splice`/kTLS paths of
+  `copy`.
+
+For incremental parsing, a `Reader` exposes `buffered`, `peek`, `consume` and
+`fill`, like `Socket`. `peek` views unread decoded bytes without copying, and
+`consume(n)` advances past bytes the parser used. `fill()` preserves the unread
+tail and returns the number of decoded bytes added. Zero means source or
+adapter end; already buffered bytes remain available. Reader mutations
+invalidate views. Callers must consume data or bound its accumulation.
+
+## channels
+
+[Source](../lib/std/channels.nim)
+
+Typed channels with copyable `Sender[T]`/`Receiver[T]` ends; waiting parks
+the task, it does not block a thread.
+
+```nim
+let (r, s) = channel[Job](16)       # in-process; any `T`, values move as bytes
+discard s.send Job(id: 1)           # false once no receiver is left
+var j: Job
+while r.recv(j): process j          # false once no sender is left and drained
+
+let pts = sender[Point](openWriter(path"points.bin"))   # over any stream
+```
+
+- `sender[T]`/`receiver[T]` wrap any `Writer`/`Reader` and require
+  `supportsCopyMem(T)`: the bytes of a pointer mean nothing outside the
+  process. Over such a stream `send` does not flush; see `flush`.
+- All copies of an end share one stream; the last copy gone ends it. Over a
+  channel's own ring copies need no extra lock; over any other stream they
+  take turns under a lock that parks its waiters.
+
+## tls
+
+[Source](../lib/std/tls.nim)
+
+A TLS 1.3 client as a `TlsEngine`: a state machine over buffers, no I/O of
+its own. X25519 key exchange, `TLS_CHACHA20_POLY1305_SHA256`, server
+authentication by `std/crypto/x509` (ECDSA P-256/P-384 and RSA-PSS
+`CertificateVerify`, a chain to a root, the host name). No TLS 1.2, no
+session resumption, no client certificates.
+
+```nim
+let e = newTlsEngine()                         # system roots
+let (r, w) = connect("example.com:443", request, tls = e)
+```
+
+- There is no "insecure" switch. A caller that must talk to a self-signed
+  server passes `newTlsEngine(store)` with that certificate in the store.
+- On a failure the engine keeps the reason: `e.failure`, `e.certError`,
+  `e.alert`.
+- A connection that ends WITHOUT `close_notify` raises `EndOfStreamError`
+  from `read`: that is a truncation an attacker can cause. Framed protocols
+  (HTTP) know where their data ends and never get there.
+- A server that offers neither X25519 nor ChaCha20-Poly1305 (some FIPS-mode
+  servers) fails with `tfUnsupported`.
+
+## http/httpheaders
+
+[Source](../lib/std/http/httpheaders.nim)
+
+`HttpHeaders` stores HTTP/1.1 header lines in wire order. Import this module
+directly for header construction and lookup without a client dependency;
+`std/httpclient` also re-exports its helpers.
+
+```nim
+import std/[http/httpheaders, assertions]
+
+proc example() {.raises.} =
+  var h = headers"Accept: application/json\r\n"
+  h.add "X-Trace", "1"
+  assert h.has("accept")
+  assert h.get("X-Trace") == "1"
+  for name, value in h.pairs:
+    discard name
+    discard value
+```
+
+`pairs` preserves duplicate fields and name spelling; `values(name)` returns
+all matching values in wire order. Lookup is case-insensitive. `get` returns
+the first match or `""`; `has` distinguishes an empty value from an absent
+field. The `headers"..."` literal is checked at compile time, and `add` rejects
+invalid field names and CR/LF in values with `BadOperation`.
+
+## httpclient
+
+[Source](../lib/std/httpclient.nim)
+
+`httpGet`, `httpPost`, `httpPut`: the constructor sends the request, reads the
+status and headers, and returns the BODY as a `Reader`. `httpRequest` returns
+a response of any status and follows redirects.
+
+```nim
+var page = httpGet("https://example.com/")
+var r = httpPost(url, openReader(path"big.bin"))     # streamed, chunked
+var resp = HttpHeaders("")
+var r2 = httpGet(url, headers"Accept: application/json\r\n", resp)
+var res = httpRequest("GET", url, dl = afterMs(10_000))
+if res.code == 404: echo "not there"
+```
+
+- A status outside 2xx raises `httpToErrorCode(status)` (404 is
+  `NameNotFound`), so a returned `Reader` always carries a successful body.
+- Bodies are de-framed (length, chunked, until close) and decoded (gzip,
+  deflate) by an adapter in the adapter slot.
+- `HttpHeaders` is the wire format itself. `add` raises `BadOperation` on a
+  CR/LF in a value (header injection); `Host`, `Content-Length`,
+  `Transfer-Encoding` and `Connection` are the library's and raise as user
+  headers. `headers"..."` is a compiler plugin (`lib/std/deps/httpheaders.nim`):
+  a malformed literal — a missing `\r\n`, a bad name, a lone line break —
+  is a compile-time error at the literal, judged by the same rules
+  (`std/http/httpheaders`) that `add` applies at run time.
+- One request per connection. `httpGet`, `httpPost` and `httpPut` do not
+  follow redirects: a 3xx raises its `httpToErrorCode`.
+- `httpRequest(meth, url, body, headers, maxRedirects, dl)` returns an
+  `HttpResponse` (`code`, `reason`, `headers`, final `url`, `body` as a
+  `Reader`) for every status and follows up to `DefaultMaxRedirects` (5)
+  redirects by RFC 9110 §15.4: 301/302/303 become `GET` without the body,
+  307/308 resend method and body, and `Authorization` and `Cookie` are
+  dropped once a redirect leaves the origin. It raises only when there is no
+  response (network, TLS, a malformed reply, `TimeoutError`) or for a bad
+  request (`BadOperation`).
+- Every call takes a deadline `dl` (`afterMs(10_000)`) that bounds connecting,
+  sending, any redirects and reading the response head. The returned body
+  `Reader` starts with `never`, as `streamio`'s connection constructors' streams
+  do; `renew` sets a deadline for reading it.
+
+## crypto
+
+[Sources](../lib/std/crypto/)
+
+`sha2` (SHA-256/384/512), `hmac` (HMAC and HKDF), `chacha20poly1305`
+(RFC 8439), `x25519` (RFC 7748), `ecdsa` and `rsa` (signature
+*verification*), `x509` (certificates, chains, host names, PEM trust stores),
+`sysrand` (OS randomness). Every module is compiled under
+`{.feature: "staticContracts".}`: each index and contract in them is proven,
+not checked.
+
+- `bignum`, `ecdsa` and `rsa` are variable time and only ever see public
+  values (signatures, keys, digests). Do not hand them a secret.
+- `x25519` and `chacha20poly1305` handle secrets and are constant time. On
+  the native backend (x86-64) their arithmetic is `{.assembler.}` code in
+  `crypto/private/`, so the instructions that run cannot depend on a key; the
+  portable versions avoid secret-dependent branches and indices by
+  construction. See [assembler.md](assembler.md).
+- Compare MACs with `hmac.constantTimeEquals`, never `==`.
+- Key material comes from `sysrand.urandom`, never `std/random`.

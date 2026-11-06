@@ -9,11 +9,16 @@
 ## uses for CTFE), and exec the resulting binary at every call site.
 
 import std/[syncio, os, osproc, tables, hashes, assertions, strutils]
+import std/[dirs, paths]
+include ".." / lib / compat2
 
-import ".." / lib / [nifstreams, nifcursors, lineinfos, bitabs, nifindexes, symparser]
+import ".." / lib / [nifpools, bitabs, nifindexes, symparser]
+import ".." / lib / nifreader
+from ".." / lib / nifcoreparse import parse
 import ".." / models / [tags]
 import nimony_model, decls, programs
 from ".." / lib / tooldirs import findDriver
+from semos import shellArgs
 
 type
   MacroPlugin* = object
@@ -42,13 +47,37 @@ proc spliceBodyWithoutResult(dest: var TokenBuf; body: Cursor) =
   ## return type.
   var n = body
   assert n.stmtKind == StmtsS, "macro body should be a stmts block"
-  dest.takeToken n
-  if n.kind == ParLe and n.stmtKind == ResultS:
-    # Skip the leading result declaration.
-    skip n
-  while n.hasMore:
-    dest.takeTree n
-  dest.addParRi()  # the closing ParRi of stmts
+  copyInto dest, n:
+    if n.hasMore and n.isTagLit and n.stmtKind == ResultS:
+      # Skip the leading result declaration.
+      skip n
+    while n.hasMore:
+      dest.takeTree n
+
+proc rewriteSymsToIdentsImpl(newBuf: var TokenBuf; n: var Cursor) =
+  ## Rewrites the single tree/token at `n` into `newBuf` and advances past it.
+  if not n.hasMore: return
+  case n.kind
+  of Symbol, SymbolDef:
+    newBuf.addIdent(pool.symNameId(n.symId), n.info)
+    inc n
+  of TagLit:
+    let ek = n.exprKind
+    var firstChild = n
+    inc firstChild
+    if (ek == OchoiceX or ek == CchoiceX) and firstChild.isSymbol:
+      # unwrap the choice to a single ident:
+      n.into:
+        newBuf.addIdent(pool.symNameId(n.symId), n.info)
+        while n.hasMore: skip n
+    else:
+      newBuf.addParLe(n.cursorTagId, n.info)
+      n.into:
+        while n.hasMore:
+          rewriteSymsToIdentsImpl(newBuf, n)
+        newBuf.addParRi(n.endInfo)
+  else:
+    newBuf.takeTree n
 
 proc rewriteSymsToIdents(buf: var TokenBuf) =
   ## Convert every Symbol / SymbolDef in `buf` to an Ident bearing the symbol's
@@ -57,64 +86,31 @@ proc rewriteSymsToIdents(buf: var TokenBuf) =
   ## every name against the plugin module's own scope.
   var newBuf = createTokenBuf(buf.len)
   var n = beginRead(buf)
-  var nested = 0
-  while true:
-    case n.kind
-    of Symbol, SymbolDef:
-      var name = pool.syms[n.symId]
-      extractBasename name
-      newBuf.add identToken(pool.strings.getOrIncl(name), n.info)
-      inc n
-    of ParLe:
-      let ek = n.exprKind
-      if ek == OchoiceX or ek == CchoiceX:
-        inc n
-        if n.kind == Symbol:
-          var name = pool.syms[n.symId]
-          extractBasename name
-          newBuf.add identToken(pool.strings.getOrIncl(name), n.info)
-          while n.hasMore: skip n
-          skipParRi n  # consume ParRi
-        else:
-          newBuf.takeToken n
-          inc nested
-      else:
-        newBuf.takeToken n
-        inc nested
-    of ParRi:
-      newBuf.add n.load
-      dec nested
-      if nested == 0: break
-      inc n
-    of EofToken:
-      break
-    else:
-      newBuf.takeToken n
-  endRead(buf)
+  rewriteSymsToIdentsImpl(newBuf, n)
   buf = ensureMove newBuf
 
 # ----------------------------------------------------------------------------
 # Plugin module generator
 # ----------------------------------------------------------------------------
 
-proc emitImportStdMacros(dest: var TokenBuf; info: PackedLineInfo) =
+proc emitImportStdMacros(dest: var TokenBuf; info: NifLineInfo) =
   ## Emit `(import (infix / std (bracket syncio macros)))` — the same shape
   ## nifler emits for `import std/[syncio, macros]`.
-  dest.copyInto(pool.tags.getOrIncl("import"), info):
-    dest.copyInto(pool.tags.getOrIncl("infix"), info):
+  dest.copyInto(globalTags.registerTag("import"), info):
+    dest.copyInto(globalTags.registerTag("infix"), info):
       dest.addIdent "/", info
       dest.addIdent "std", info
-      dest.copyInto(pool.tags.getOrIncl("bracket"), info):
+      dest.copyInto(globalTags.registerTag("bracket"), info):
         dest.addIdent "syncio", info
         dest.addIdent "macros", info
 
-proc emitNimNodeRetType(dest: var TokenBuf; info: PackedLineInfo) =
+proc emitNimNodeRetType(dest: var TokenBuf; info: NifLineInfo) =
   ## Pre-sem the return type is just the ident `NimNode`. Sem resolves it
   ## against `lib/std/macros.nim`'s `NimNode*` type.
   dest.addIdent "NimNode", info
 
 proc copyParamsRewritingMetatypes(dest: var TokenBuf; params: Cursor;
-                                  info: PackedLineInfo) =
+                                  info: NifLineInfo) =
   ## Copy a `(params (param ...)*)` subtree but rewrite each param's TYPE slot
   ## from `(untyped)` / `(typed)` to the ident `NimNode`. The user's macro
   ## signature uses `untyped` (for "any AST, don't sem-check") which is
@@ -125,48 +121,44 @@ proc copyParamsRewritingMetatypes(dest: var TokenBuf; params: Cursor;
   ## Param shape per `(param :name pragmas TYPE default)`. We pass through
   ## name/pragmas/default verbatim and only swap the TYPE slot.
   assert params.substructureKind == ParamsU
-  dest.add params.load
   var n = params
-  inc n
-  while n.hasMore:
-    if n.substructureKind == ParamU:
-      dest.takeToken n
-      # Slot 0: name (SymbolDef or Ident)
-      dest.takeTree n
-      # Slot 1: exported marker (DotToken)
-      dest.takeTree n
-      # Slot 2: pragmas
-      dest.takeTree n
-      # Slot 3: type — rewrite (untyped) / (typed) → NimNode
-      let isMetatype = n.kind == ParLe and
-        (n.typeKind == UntypedT or n.typeKind == TypedT)
-      if isMetatype:
-        dest.addIdent "NimNode", info
-        skip n
+  copyInto dest, n:
+    while n.hasMore:
+      if isParamLike(n.substructureKind):
+        copyInto dest, n:
+          # Slot 0: name (SymbolDef or Ident)
+          dest.takeTree n
+          # Slot 1: exported marker (DotToken)
+          dest.takeTree n
+          # Slot 2: pragmas
+          dest.takeTree n
+          # Slot 3: type — rewrite (untyped) / (typed) → NimNode
+          let isMetatype = n.isTagLit and
+            (n.typeKind == UntypedT or n.typeKind == TypedT)
+          if isMetatype:
+            dest.addIdent "NimNode", info
+            skip n
+          else:
+            dest.takeTree n
+          # Slot 4: default value
+          dest.takeTree n
       else:
+        # Non-param entry (e.g. return-type-of-routine slot at end). Copy verbatim.
         dest.takeTree n
-      # Slot 4: default value
-      dest.takeTree n
-      # Closing ParRi of (param ...)
-      dest.takeParRi n
-    else:
-      # Non-param entry (e.g. return-type-of-routine slot at end). Copy verbatim.
-      dest.takeTree n
-  dest.takeParRi n  # closing ParRi of params
 
 proc emitImplProc(dest: var TokenBuf; implName: string; macroDecl: Cursor;
-                  info: PackedLineInfo) =
+                  info: NifLineInfo) =
   ## Emit `(proc <implName> . . . (params <copied-and-rewritten>) NimNode . . <body>)`.
   let r = asRoutine(macroDecl, SkipInclBody)
-  dest.copyInto(pool.tags.getOrIncl("proc"), info):
+  dest.copyInto(globalTags.registerTag("proc"), info):
     dest.addIdent implName, info
     dest.addEmpty3 info                       # exported, pattern, typevars
     # params: copy verbatim, but swap (untyped)/(typed) types for NimNode so
     # the body can call NimNode methods on them without losing the call-site
     # "don't sem-check the arg" semantics (which the user's macro signature
     # already provides via the untyped/typed metatype).
-    if r.params.kind == DotToken:
-      dest.copyInto(pool.tags.getOrIncl("params"), info):
+    if r.params.isDotToken:
+      dest.copyInto(globalTags.registerTag("params"), info):
         discard
     else:
       copyParamsRewritingMetatypes(dest, r.params, info)
@@ -175,19 +167,19 @@ proc emitImplProc(dest: var TokenBuf; implName: string; macroDecl: Cursor;
     spliceBodyWithoutResult(dest, r.body)
 
 proc emitMainProc(dest: var TokenBuf; implName: string; paramCount: int;
-                  info: PackedLineInfo) =
+                  info: NifLineInfo) =
   ## Emit:
   ##   proc main =
   ##     let input = loadInput()
   ##     let arg0 = input[0]; let arg1 = input[1]; ...
   ##     let output = <implName>(arg0, arg1, ...)
   ##     saveOutput(output)
-  let procTag = pool.tags.getOrIncl("proc")
-  let letTag = pool.tags.getOrIncl("let")
-  let callTag = pool.tags.getOrIncl("call")
-  let stmtsTag = pool.tags.getOrIncl("stmts")
-  let paramsTag = pool.tags.getOrIncl("params")
-  let bracketExprTag = pool.tags.getOrIncl("at")
+  let procTag = globalTags.registerTag("proc")
+  let letTag = globalTags.registerTag("let")
+  let callTag = globalTags.registerTag("call")
+  let stmtsTag = globalTags.registerTag("stmts")
+  let paramsTag = globalTags.registerTag("params")
+  let bracketExprTag = globalTags.registerTag("at")
 
   dest.copyInto(procTag, info):
     dest.addIdent "main", info
@@ -230,16 +222,16 @@ proc emitMainProc(dest: var TokenBuf; implName: string; paramCount: int;
 proc countParams(macroDecl: Cursor): int =
   result = 0
   let r = asRoutine(macroDecl, SkipInclBody)
-  if r.params.kind == DotToken or r.params.substructureKind != ParamsU:
+  if r.params.isDotToken or r.params.substructureKind != ParamsU:
     return 0
   var p = r.params
   p.loopInto:
-    if p.substructureKind == ParamU:
+    if isParamLike(p.substructureKind):
       inc result
     skip p
 
 proc buildPluginNif*(macroDecl: Cursor; macroSym: SymId;
-                     info: PackedLineInfo): TokenBuf =
+                     info: NifLineInfo): TokenBuf =
   ## Build a `.p.nif`-shaped TokenBuf for a macro plugin module.
   ##
   ## Shape:
@@ -252,16 +244,16 @@ proc buildPluginNif*(macroDecl: Cursor; macroSym: SymId;
   ## Symbols from the post-sem macro decl are rewritten to idents at the end
   ## so the plugin module re-runs through sem with its own scope.
   result = createTokenBuf(128)
-  let macroName = cleanSymbolName(pool.syms[macroSym])
+  let macroName = cleanSymbolName(pool.symString(macroSym))
   let implName = macroName & "Impl"
   let paramCount = countParams(macroDecl)
 
-  result.copyInto(pool.tags.getOrIncl("stmts"), info):
+  result.copyInto(globalTags.registerTag("stmts"), info):
     emitImportStdMacros(result, info)
     emitImplProc(result, implName, macroDecl, info)
     emitMainProc(result, implName, paramCount, info)
     # call main()
-    result.copyInto(pool.tags.getOrIncl("call"), info):
+    result.copyInto(globalTags.registerTag("call"), info):
       result.addIdent "main", info
 
   rewriteSymsToIdents(result)
@@ -270,34 +262,25 @@ proc buildPluginNif*(macroDecl: Cursor; macroSym: SymId;
 # Driver: write the NIF, build with Nimony, exec at call sites
 # ----------------------------------------------------------------------------
 
-proc getMacroPluginPath*(nifcachePath: string; macroSym: SymId): string =
-  let symName = pool.syms[macroSym]
-  var cleanName = ""
+proc macroFileStem(macroSym: SymId): string =
+  ## `macro_<sym>` with the symbol's full NIF name (module suffix included),
+  ## made file-name safe. The name, not the `SymId` number: that is an index
+  ## into one process's pool, so two nimsem processes of the same build (one
+  ## per module, run side by side by `nifmake -j`) hand out the same numbers,
+  ## and every file named after one was shared between unrelated macros —
+  ## their plugin builds clobbered each other's host caches.
+  let symName = pool.symString(macroSym)
+  result = "macro_"
   for ch in symName:
     if ch in {'a'..'z', 'A'..'Z', '0'..'9', '_'}:
-      cleanName.add ch
+      result.add ch
     else:
-      cleanName.add '_'
-  result = nifcachePath / "macro_" & cleanName
+      result.add '_'
+
+proc getMacroPluginPath*(nifcachePath: string; macroSym: SymId): string =
+  result = nifcachePath / macroFileStem(macroSym)
   when defined(windows):
     result.add ".exe"
-
-proc hostifyPluginArgs(args: string): string =
-  ## A macro plugin is always a HOST-native executable (it is exec'd at compile
-  ## time), so it must be built with the host word size. Strip any `--bits:NN`
-  ## the outer compile carries — e.g. the JS test harness forces `--bits:32` to
-  ## short-circuit its own native link, but forwarding that to the plugin build
-  ## makes its C backend fail a pointer-size static assert. All other args
-  ## (notably `--cc`, for nifmake signature matching) are preserved.
-  result = args
-  var i = result.find("--bits:")
-  while i >= 0:
-    var j = i + "--bits:".len
-    while j < result.len and result[j] notin {' ', '\t'}: inc j
-    var start = i
-    if start > 0 and result[start-1] == ' ': dec start   # swallow the leading space too
-    result = result[0 ..< start] & result[j .. ^1]
-    i = result.find("--bits:")
 
 proc macroPluginExists*(nifcachePath: string; macroSym: SymId): bool =
   ## True when a compiled plugin binary for `macroSym` already sits in the
@@ -308,13 +291,13 @@ proc macroPluginExists*(nifcachePath: string; macroSym: SymId): bool =
   fileExists(getMacroPluginPath(nifcachePath, macroSym))
 
 proc compileMacroPlugin*(nifcachePath: string; macroDecl: Cursor; macroSym: SymId;
-                         info: lineinfos.PackedLineInfo;
-                         commandLineArgs: string): string =
+                         info: NifLineInfo;
+                         hostCommandLineArgs: string): string =
   ## Build the plugin module straight from NIF (no Nim text round-trip), write
   ## it as a `.p.nif`, and have Nimony compile it through `s` (the NIF-input
   ## entry point — same one CTFE uses in `semos.runEval`).
   let exePath = getMacroPluginPath(nifcachePath, macroSym)
-  let pluginBaseName = "macro_" & $macroSym.int
+  let pluginBaseName = macroFileStem(macroSym)
 
   # A macro plugin is a HOST-native executable, so it must be built with a
   # host-consistent toolchain config (host word size, host stdlib layouts). The
@@ -324,11 +307,13 @@ proc compileMacroPlugin*(nifcachePath: string; macroDecl: Cursor; macroSym: SymI
   # in the nifcache it is pointed at. Sharing the outer nifcache would hand the
   # 64-bit plugin a 32-bit stdlib (mismatched type sizes) → a plugin that builds
   # but SEGFAULTS at run. So give the plugin its OWN nifcache subdir, built fresh
-  # at host bits (see `hostifyPluginArgs`). The `macro_*` prefix keeps it out of
-  # any target-side artifact collection.
+  # at host bits: `hostCommandLineArgs` is the outer command line minus its
+  # target triple (`parseCommonOption` decides what a compile-time-eval
+  # process may see). The `macro_*` prefix keeps it out of any target-side
+  # artifact collection.
   let pluginCache = nifcachePath / pluginBaseName & ".host"
   try:
-    createDir pluginCache
+    createDir path(pluginCache)
   except:
     echo "Macro plugin: failed to create ", pluginCache
     return ""
@@ -349,7 +334,7 @@ proc compileMacroPlugin*(nifcachePath: string; macroDecl: Cursor; macroSym: SymI
   deps.addParLe StmtsS, info
   deps.addParRi()
   try:
-    writeFile(deps, depsFile)
+    writeFile(depsFile, toString(deps, true))
   except:
     echo "Macro plugin: failed to write ", depsFile
     return ""
@@ -361,24 +346,24 @@ proc compileMacroPlugin*(nifcachePath: string; macroDecl: Cursor; macroSym: SymI
   # only READS its imports' `.s.nif` — it does not build them — so in a fresh
   # per-plugin cache we must first materialise the stdlib the plugin imports.
   # The plugin scaffold imports exactly `std/[syncio, macros]` (see
-  # `emitImportStdMacros`); seeding those pulls in the whole host-bits stdlib
+  # `emitImportStdMacros`); compiling those pulls in the whole host-bits stdlib
   # closure the plugin needs (incl. the NimNode/NIF-reader machinery). The
-  # native link of this seed may fail (harmless — we only need the `.s.nif`/
+  # native link of this setup may fail (harmless — we only need the `.s.nif`/
   # `.c.nif`), and `nimony c` is incremental so repeat calls are cheap.
-  let seedFile = pluginCache / "macro_seed.nim"
+  let setupFile = pluginCache / "macro_setup.nim"
   try:
-    writeFile(seedFile, "import std/[syncio, macros]\n")
+    writeFile(setupFile, "import std/[syncio, macros]\n")
   except:
-    echo "Macro plugin: failed to write ", seedFile
+    echo "Macro plugin: failed to write ", setupFile
     return ""
-  let seedCmd = quoteShell(nimonyExe) & hostifyPluginArgs(commandLineArgs) &
-                " --path:" & quoteShell(srcLibPath) &
-                " --nimcache:" & quoteShell(pluginCache) &
-                " c " & quoteShell(seedFile)
+  let setupCmd = quoteShell(nimonyExe) & shellArgs(hostCommandLineArgs) &
+                 " --path:" & quoteShell(srcLibPath) &
+                 " --nimcache:" & quoteShell(pluginCache) &
+                 " c " & quoteShell(setupFile)
   try:
-    discard execCmdEx(seedCmd)   # ignore exit: a failed native link still leaves the .s.nif/.c.nif
+    discard execCmdEx(setupCmd)   # ignore exit: a failed native link still leaves the .s.nif/.c.nif
   except:
-    echo "Macro plugin: failed to seed host stdlib: ", seedCmd
+    echo "Macro plugin: failed to setup host stdlib: ", setupCmd
     return ""
 
   # Forward `--nimcache:` so the sub-compile reads the `.p.deps.nif` from the
@@ -393,7 +378,7 @@ proc compileMacroPlugin*(nifcachePath: string; macroDecl: Cursor; macroSym: SymI
   # and tries to overwrite it — which on Windows fails because the outer
   # nimsem (currently paused waiting on this exec) still has it mmap'd.
   # Same rationale as `semos.runProgram` / `semos.prepareEval`.
-  let cmd = quoteShell(nimonyExe) & hostifyPluginArgs(commandLineArgs) &
+  let cmd = quoteShell(nimonyExe) & shellArgs(hostCommandLineArgs) &
             " --path:" & quoteShell(srcLibPath) &
             " --nimcache:" & quoteShell(pluginCache) &
             " -o:" & quoteShell(exePath) &
@@ -409,22 +394,23 @@ proc compileMacroPlugin*(nifcachePath: string; macroDecl: Cursor; macroSym: SymI
     echo "Macro plugin: failed to invoke ", cmd
     return ""
   if exitCode != 0:
-    echo "Error compiling macro plugin for '", cleanSymbolName(pool.syms[macroSym]), "':"
+    echo "Error compiling macro plugin for '", cleanSymbolName(pool.symString(macroSym)), "':"
     echo output
     return ""
 
   result = exePath
 
 proc runMacroPlugin*(nifcachePath: string; dest: var TokenBuf;
-                     info: lineinfos.PackedLineInfo;
+                     info: NifLineInfo;
                      macroSym: SymId; args: TokenBuf): bool =
   let exePath = getMacroPluginPath(nifcachePath, macroSym)
   if not fileExists(exePath):
     echo "Macro plugin not found: ", exePath
     return false
 
-  let inputPath = nifcachePath / "macro_in_" & $macroSym.int & ".nif"
-  let outputPath = nifcachePath / "macro_out_" & $macroSym.int & ".nif"
+  let stem = macroFileStem(macroSym)
+  let inputPath = nifcachePath / stem & ".in.nif"
+  let outputPath = nifcachePath / stem & ".out.nif"
   try:
     writeFile(inputPath, toString(args))
   except:
@@ -446,9 +432,9 @@ proc runMacroPlugin*(nifcachePath: string; dest: var TokenBuf;
     echo output
     return false
 
-  var s = nifstreams.open(outputPath)
-  try:
-    parse s, dest, lineinfos.NoLineInfo
-  finally:
-    close s
+  var r = nifreader.open(outputPath)
+  # A `NimNode` has no position, so the output has none of its own: every
+  # node is the macro call's, which is where Nim reports an error in it too.
+  parse(r, dest, parentSeed = info, denseLineInfo = true)
+  r.close()
   return true

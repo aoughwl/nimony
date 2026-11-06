@@ -43,7 +43,7 @@
 # included from sem.nim
 
 proc compatOpenArrayInstance(c: var SemContext; elemType: Cursor;
-                             info: PackedLineInfo): TypeCursor =
+                             info: NifLineInfo): TypeCursor =
   ## Build `(invoke openArray elemType)` and instantiate it. Returns the
   ## resolved Symbol cursor for `openArray[T]`. Idempotent for repeated
   ## calls with the same `elemType` — `semLocalType` consults the type
@@ -51,7 +51,7 @@ proc compatOpenArrayInstance(c: var SemContext; elemType: Cursor;
   ## hand back the same instance Symbol.
   var invokeBuf = createTokenBuf(8)
   invokeBuf.addParLe(InvokeT, info)
-  invokeBuf.add symToken(pool.syms.getOrIncl(OpenArrayHeadName), info)
+  invokeBuf.addSymUse(pool.symId(OpenArrayHeadName), info)
   invokeBuf.addSubtree elemType
   invokeBuf.addParRi()
   var scratch = createTokenBuf(16)
@@ -66,8 +66,8 @@ proc compatVarargsElem(paramType: Cursor): Cursor =
     result = default(Cursor)
   else:
     var elem = paramType
-    inc elem
-    if elem.kind == ParRi:
+    elem = sub(elem)
+    if not elem.hasMore:
       result = default(Cursor)
     else:
       result = elem
@@ -82,7 +82,7 @@ proc compatVarargsParamElem*(fn: FnCandidate): Cursor =
     skipToParams f
   if f.substructureKind == ParamsU:
     loopInto f:
-      if f.symKind == ParamY:
+      if isParamLike(f.symKind):
         let p = asLocal(f)
         let elem = compatVarargsElem(p.typ)
         if not cursorIsNil(elem):
@@ -97,26 +97,26 @@ proc compatVarargsHasHint(paramType: Cursor): bool =
   if paramType.typeKind == VarargsT:
     var c = paramType
     loopInto c:
-      if c.kind == StringLit: result = true
+      if c.isStringLit: result = true
       skip c
 
 proc compatToOpenArrayTypevars(): (SymId, SymId) =
   ## Return the SymIds of `toOpenArray.0[I, T]`'s typevars in declaration
   ## order. Mirrors `openarrays.nim`'s `converter toOpenArray*[I, T]…`.
   result = (SymId(0), SymId(0))
-  let origin = pool.syms.getOrIncl("toOpenArray.0." & SystemModuleSuffix)
+  let origin = pool.symId("toOpenArray.0." & SystemModuleSuffix)
   let res = tryLoadSym(origin)
   if res.status == LacksNothing:
     let routine = asRoutine(res.decl)
     var tv = routine.typevars
     if tv.substructureKind == TypevarsU:
-      inc tv
-      if tv.kind == ParLe and tv.symKind == TypevarY:
+      tv = sub(tv)
+      if tv.hasMore and tv.isTagLit and tv.symKind == TypevarY:
         var inner = tv
         inc inner
         result[0] = inner.symId
         skip tv
-      if tv.kind == ParLe and tv.symKind == TypevarY:
+      if tv.hasMore and tv.isTagLit and tv.symKind == TypevarY:
         var inner = tv
         inc inner
         result[1] = inner.symId
@@ -131,12 +131,25 @@ proc compatAnnotateVarargsParam*(c: var SemContext; dest: var TokenBuf;
   if typeStart >= dest.len: return
   let typeCursor = cursorAt(dest, typeStart)
   if typeCursor.typeKind != VarargsT or compatVarargsHasHint(typeCursor):
-    endRead(dest)
+    discard
   else:
     let info = typeCursor.info
     var elem = typeCursor
-    inc elem
-    if elem.hasMore:
+    elem = sub(elem)
+    if elem.hasMore and elem.typeKind in {UntypedT, TypedT}:
+      # `varargs[untyped]` / `varargs[typed]` are METAPROGRAMMING slots: the
+      # arguments reach a template or plugin as trees and never become a
+      # runtime container. Instantiating `openArray[untyped]` for them puts a
+      # `(uarray (untyped))` object into the module, which is not a type any
+      # backend can lower — hexer rejects it with "type expected but got:
+      # (untyped)". Nothing bundles these slots either (`varargsMatch`
+      # short-circuits on both), so the hint has no reader.
+      discard
+    elif elem.hasMore and containsGenericParams(elem):
+      # generic `varargs[T]`: the openArray instance is only known once T
+      # is; the instance's params come through here again, substituted
+      discard
+    elif elem.hasMore:
       # Capture children of the original `(varargs …)` into a fresh buffer so
       # the in-place `replace` can read its source without aliasing `dest`.
       # `loopInto` is required: under `-d:virtualParRi` the closing `)` is
@@ -147,14 +160,12 @@ proc compatAnnotateVarargsParam*(c: var SemContext; dest: var TokenBuf;
       var inner = typeCursor
       loopInto inner:
         takeTree rebuilt, inner
-      endRead(dest)
 
       var elemCursor = cursorAt(rebuilt, 0)
       inc elemCursor    # past `(varargs` to the element type
       let inst = compatOpenArrayInstance(c, elemCursor, info)
-      endRead(rebuilt)
       let hintStr =
-        if inst.kind == Symbol: pool.syms[inst.symId]
+        if inst.isSymbol: pool.symString(inst.symId)
         else: ""
       rebuilt.addStrLit hintStr, info
       rebuilt.addParRi()
@@ -162,7 +173,7 @@ proc compatAnnotateVarargsParam*(c: var SemContext; dest: var TokenBuf;
       dest.replace beginRead(rebuilt), typeStart
     else:
       # bare `(varargs)` — nothing to instantiate
-      endRead(dest)
+      discard
 
 proc compatVarargsSlotIsBundled(m: Match; start: int): bool =
   ## True if the tail at `start` starts with an
@@ -172,11 +183,12 @@ proc compatVarargsSlotIsBundled(m: Match; start: int): bool =
   result = false
   if start < m.args.len:
     if m.args[start].exprKind == HcallX:
-      if start + 1 < m.args.len and m.args[start + 1].kind == Symbol:
-        result = pool.syms[m.args[start + 1].symId].startsWith("toOpenArray.")
+      let callee = childCursor(readonlyCursorAt(m.args, start))
+      if callee.hasMore and callee.kind == Symbol:
+        result = pool.symString(callee.symId).startsWith("toOpenArray.")
 
 proc compatBundleVarargsInMatch*(c: var SemContext; m: var Match;
-                                 elemType: Cursor; info: PackedLineInfo) =
+                                 elemType: Cursor; info: NifLineInfo) =
   ## Replace the flat varargs args at the tail of `m.args` (from
   ## `m.firstVarargPosition`) with the openArray bundle. Called from
   ## `resolveOverloads` after the best candidate is picked, so
@@ -205,6 +217,8 @@ proc compatBundleVarargsInMatch*(c: var SemContext; m: var Match;
     var flat = createTokenBuf(max(8, endPos - start + 2))
     flat.addParLe(StmtsS, info)
     for i in start ..< endPos:
+      # balanced span: raw copy keeps its seals and leaves the pending
+      # StmtsS as the only open tag for the close below
       flat.add m.args[i]
     flat.addParRi()
     m.args.shrink start
@@ -230,7 +244,7 @@ proc compatBundleVarargsInMatch*(c: var SemContext; m: var Match;
     let elemTypeC = typeToCursor(c, elemBuf, 0)
 
     let (iSym, tSym) = compatToOpenArrayTypevars()
-    let origin = pool.syms.getOrIncl("toOpenArray.0." & SystemModuleSuffix)
+    let origin = pool.symId("toOpenArray.0." & SystemModuleSuffix)
     var inferred = initTable[SymId, Cursor]()
     inferred[iSym] = rangeType
     inferred[tSym] = elemTypeC
@@ -240,7 +254,7 @@ proc compatBundleVarargsInMatch*(c: var SemContext; m: var Match;
     let inst = c.requestRoutineInstance(origin, typeArgs, inferred, info)
 
     m.args.addParLe(HcallX, info)
-    m.args.add symToken(inst.targetSym, info)
+    m.args.addSymUse(inst.targetSym, info)
     m.args.addParLe(AconstrX, info)
     m.args.addParLe(ArrayT, info)
     m.args.addSubtree elemTypeC

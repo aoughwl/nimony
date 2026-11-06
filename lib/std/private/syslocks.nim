@@ -17,56 +17,60 @@ when defined(windows):
   type
     Handle = int
 
-    SysLock* {.importc: "CRITICAL_SECTION",
-              header: "<windows.h>", final, pure, byref.} = object # CRITICAL_SECTION in WinApi
-      DebugInfo {.exportc.} : nil pointer
-      LockCount {.exportc.} : int32
-      RecursionCount {.exportc.} : int32
-      OwningThread {.exportc.} : int
-      LockSemaphore {.exportc.} : int
-      SpinCount {.exportc.} : int
+    # Bare kernel32 imports throughout (no `header: "<windows.h>"`), like the
+    # rest of the stdlib's Windows bindings: mixing header-form and bare decls
+    # in one translation unit makes the emitted prototypes clash with the SDK's.
+    # `SysLock` mirrors winnt.h's RTL_CRITICAL_SECTION layout field by field,
+    # so no header is needed for the type either.
+    SysLock* {.final, pure, byref.} = object # CRITICAL_SECTION in WinApi
+      DebugInfo: nil pointer
+      LockCount: int32
+      RecursionCount: int32
+      OwningThread: int
+      LockSemaphore: int
+      SpinCount: int
 
-    SysCond* {.importc: "RTL_CONDITION_VARIABLE", header: "<windows.h>", byref.} = object
-      thePtr {.importc: "Ptr".} : Handle
+    SysCond* {.byref.} = object # RTL_CONDITION_VARIABLE: a single pointer
+      thePtr: Handle
 
   func initSysLock*(L: var SysLock) {.importc: "InitializeCriticalSection",
-                                     header: "<windows.h>".}
+                                     stdcall, dynlib: "kernel32".}
     ## Initializes the lock `L`.
 
   func tryAcquireSysAux(L: var SysLock): int32 {.importc: "TryEnterCriticalSection",
-                                                 header: "<windows.h>".}
+                                                 stdcall, dynlib: "kernel32".}
     ## Tries to acquire the lock `L`.
 
   func tryAcquireSys*(L: var SysLock): bool {.inline.} =
     result = tryAcquireSysAux(L) != 0'i32
 
   func acquireSys*(L: var SysLock) {.importc: "EnterCriticalSection",
-                                    header: "<windows.h>".}
+                                    stdcall, dynlib: "kernel32".}
     ## Acquires the lock `L`.
 
   func releaseSys*(L: var SysLock) {.importc: "LeaveCriticalSection",
-                                    header: "<windows.h>".}
+                                    stdcall, dynlib: "kernel32".}
     ## Releases the lock `L`.
 
   func deinitSys*(L: SysLock) {.importc: "DeleteCriticalSection",
-                                   header: "<windows.h>".}
+                                   stdcall, dynlib: "kernel32".}
 
   func initializeConditionVariable(
     conditionVariable: var SysCond
-  ) {.stdcall, noSideEffect, header: "<windows.h>", importc: "InitializeConditionVariable".}
+  ) {.stdcall, noSideEffect, importc: "InitializeConditionVariable", dynlib: "kernel32".}
 
   func sleepConditionVariableCS(
     conditionVariable: var SysCond,
     PCRITICAL_SECTION: var SysLock,
     dwMilliseconds: int
-  ): int32 {.stdcall, noSideEffect, header: "<windows.h>", importc: "SleepConditionVariableCS".}
+  ): int32 {.stdcall, noSideEffect, importc: "SleepConditionVariableCS", dynlib: "kernel32".}
 
 
   func signalSysCond*(hEvent: var SysCond) {.stdcall, noSideEffect,
-    header: "<windows.h>", importc: "WakeConditionVariable".}
+    importc: "WakeConditionVariable", dynlib: "kernel32".}
 
   func broadcastSysCond*(hEvent: var SysCond) {.stdcall, noSideEffect,
-    header: "<windows.h>", importc: "WakeAllConditionVariable".}
+    importc: "WakeAllConditionVariable", dynlib: "kernel32".}
 
   func initSysCond*(cond: var SysCond) {.inline.} =
     initializeConditionVariable(cond)
@@ -99,7 +103,7 @@ elif defined(genode):
   func broadcastSysCond*(cond: var SysCond) {.
     noSideEffect, importcpp.}
 
-elif defined(nimNativeIo):
+elif defined(nimNativeIo) and not defined(illumos):
   # Freestanding, libc-header-free locks built directly on the kernel futex
   # primitive instead of pthread. `SysLock`/`SysCond` are plain 32-bit words, so
   # there is no opaque libc struct to `importc` and no fixed ABI layout to track.
@@ -132,23 +136,42 @@ elif defined(nimNativeIo):
   var tlsSelf {.threadvar.}: byte
   proc selfToken(): int {.inline.} = cast[int](addr tlsSelf)
 
-  when defined(linux):
+  when defined(wasm32) and defined(standalone):
+    # Single-threaded wasm: there is exactly one thread, so a contended lock
+    # is a self-deadlock bug, not a wait condition. futexWait returning
+    # immediately preserves the callers' re-check loops (they'll spin on the
+    # bug rather than silently corrupt), and wake has no one to wake.
+    proc futexWait(p: var uint32; expected: uint32) {.inline.} =
+      discard
+    proc futexWake(p: var uint32; all: bool) {.inline.} =
+      discard
+  elif defined(linux):
     const
       FUTEX_WAIT_PRIVATE = clong(128)  # FUTEX_WAIT or FUTEX_PRIVATE_FLAG
       FUTEX_WAKE_PRIVATE = clong(129)  # FUTEX_WAKE or FUTEX_PRIVATE_FLAG
 
-    # We can't go through the generic libc `syscall(number, …)` wrapper here: that
-    # number-as-first-argument form is a calling convention arkham's raw-syscall
-    # path doesn't model (its path is the named-importc → syscall-number-table
-    # mechanism, which bakes the number in and maps args straight to the kernel ABI
-    # registers — uaddr→rdi/x0, op→rsi/x1, val→rdx/x2, timeout→r10/x3). The futex
-    # arguments line up with that ABI exactly, so we declare a *named* `futex` proc
-    # for arkham to recognize. There is no libc `futex` symbol, but arkham doesn't
-    # link libc — the name only has to match the table row arkham adds for it. (This
-    # branch is `nimNativeIo`-only, i.e. the arkham backend; the C/libc build uses
-    # the pthread branch below, so no real `futex` symbol is ever needed.)
-    proc futex(uaddr: ptr uint32; op, val: clong; timeout: pointer): clong {.
-      importc: "futex", sideEffect.}
+    # There is no libc function literally named `futex`; the two backends reach the
+    # kernel primitive differently:
+    when defined(nimNoLibc):
+      # Native (arkham) backend: no libc. arkham can't model the generic
+      # `syscall(number, …)` form (number-as-first-arg), so we declare a *named*
+      # `futex` proc it recognizes via its syscall-number table — args map straight
+      # to the kernel ABI registers (uaddr→rdi/x0, op→rsi/x1, val→rdx/x2,
+      # timeout→r10/x3, which the futex arguments line up with exactly).
+      proc futex(uaddr: ptr uint32; op, val: clong; timeout: pointer): clong {.
+        importc: "futex", sideEffect.}
+    else:
+      # C backend: libc is linked (even though the rest of the stdlib is raw-syscall
+      # based), so go through glibc's generic `syscall()` wrapper with the baked-in
+      # `SYS_futex` number — no libc `futex` symbol required.
+      const SYS_futex = when defined(amd64): clong(202)
+                        elif defined(arm64): clong(98)
+                        elif defined(i386): clong(240)
+                        else: clong(202)
+      proc syscall(number: clong): clong {.
+        importc: "syscall", varargs, sideEffect.}
+      proc futex(uaddr: ptr uint32; op, val: clong; timeout: pointer): clong {.inline.} =
+        syscall(SYS_futex, uaddr, op, val, timeout)
 
     proc futexWait(p: var uint32; expected: uint32) {.inline.} =
       # Blocks while `p == expected`; returns spuriously, callers re-check.
@@ -178,6 +201,22 @@ elif defined(nimNativeIo):
       let op = if all: UL_COMPARE_AND_WAIT or ULF_WAKE_ALL or ULF_NO_ERRNO
                else: UL_COMPARE_AND_WAIT or ULF_NO_ERRNO
       discard ulock_wake(op, addr p, 0'u64)
+
+  elif defined(freebsd):
+    # FreeBSD's `_umtx_op(2)` — the primitive its own libthr builds on, and an
+    # exported libc symbol, so it binds header-free. The `_PRIVATE` ops are the
+    # process-local variants, like Linux's FUTEX_*_PRIVATE.
+    const
+      UMTX_OP_WAIT_UINT_PRIVATE = cint(15)
+      UMTX_OP_WAKE_PRIVATE = cint(16)
+    proc umtx_op(obj: pointer; op: cint; val: culong;
+                 uaddr, uaddr2: nil pointer): cint {.importc: "_umtx_op", sideEffect.}
+
+    proc futexWait(p: var uint32; expected: uint32) {.inline.} =
+      discard umtx_op(addr p, UMTX_OP_WAIT_UINT_PRIVATE, culong(expected), nil, nil)
+    proc futexWake(p: var uint32; all: bool) {.inline.} =
+      let count = if all: culong(high(int32)) else: culong(1)
+      discard umtx_op(addr p, UMTX_OP_WAKE_PRIVATE, count, nil, nil)
 
   # ---- mutex3 core (non-reentrant) ----
   proc lockSlow(L: var SysLock; c: var uint32) {.inline.} =
@@ -276,45 +315,64 @@ elif defined(nimNativeIo):
     futexWake(cond.gen, true)
 
 else:
+  # pthread structures as fixed-size opaque blobs. The sizes are frozen ABI
+  # (glibc's __SIZEOF_PTHREAD_MUTEX_T family; Darwin's _PTHREAD_MUTEX_SIZE
+  # plus the long signature field): pthread_*_init only ever writes within
+  # them and every other call takes a pointer. int64 elements give the
+  # alignment both ABIs require.
+  when defined(osx):
+    type
+      SysLockObj {.pure, final, byref.} = object ## pthread_mutex_t (64 B)
+        abi: array[8, int64]
+      SysCondObj {.pure, final, byref.} = object ## pthread_cond_t (48 B)
+        abi: array[6, int64]
+  elif defined(illumos):
+    type
+      SysLockObj {.pure, final, byref.} = object # pthread_mutex_t: 24 B
+        abi: array[3, int64]
+      SysCondObj {.pure, final, byref.} = object # pthread_cond_t: 16 B
+        abi: array[2, int64]
+  elif defined(arm64):
+    type
+      SysLockObj {.pure, final, byref.} = object ## pthread_mutex_t: 48 B on
+        abi: array[6, int64]                     ## aarch64 glibc (NOT x86_64's
+                                                 ## 40; musl's 40 fits inside)
+      SysCondObj {.pure, final, byref.} = object ## pthread_cond_t (48 B)
+        abi: array[6, int64]
+  elif defined(amd64):
+    type
+      SysLockObj {.pure, final, byref.} = object ## pthread_mutex_t (40 B)
+        abi: array[5, int64]
+      SysCondObj {.pure, final, byref.} = object ## pthread_cond_t (48 B)
+        abi: array[6, int64]
+  else: # Linux 32-bit (i386)
+    type
+      SysLockObj {.pure, final, byref.} = object ## pthread_mutex_t (24 B)
+        abi: array[3, int64]
+      SysCondObj {.pure, final, byref.} = object ## pthread_cond_t (48 B)
+        abi: array[6, int64]
   type
-    SysLockObj {.importc: "pthread_mutex_t", pure, final,
-               header: """#include <sys/types.h>
-                          #include <pthread.h>""", byref.} = object
-      # when defined(linux) and defined(amd64):
-      #   abi: array[40 div sizeof(clong), clong]
-
-    SysLockAttr* {.importc: "pthread_mutexattr_t", pure, final
-               header: """#include <sys/types.h>
-                          #include <pthread.h>""".} = object
-      # when defined(linux) and defined(amd64):
-      #   abi: array[4 div sizeof(cint), cint]  # actually a cint
-
-    SysCondObj {.importc: "pthread_cond_t", pure, final,
-               header: """#include <sys/types.h>
-                          #include <pthread.h>""", byref.} = object
-      # when defined(linux) and defined(amd64):
-      #   abi: array[48 div sizeof(clonglong), clonglong]
-
-    SysCondAttr {.importc: "pthread_condattr_t", pure, final
-               header: """#include <sys/types.h>
-                          #include <pthread.h>""".} = object
-      # when defined(linux) and defined(amd64):
-      #   abi: array[4 div sizeof(cint), cint]  # actually a cint
+    SysLockAttr* {.pure, final.} = object ## pthread_mutexattr_t: 4 B on
+      abi: array[2, int64]                ## glibc, 16 B on Darwin; oversized
+                                          ## + 8-aligned covers both (init
+                                          ## writes at most its own size)
+    SysCondAttr {.pure, final.} = object ## pthread_condattr_t: same deal
+      abi: array[2, int64]
 
     SysLockType = distinct cint
 
   func initSysLockAux(L: var SysLockObj, attr: ptr SysLockAttr) {.
-    importc: "pthread_mutex_init", header: "<pthread.h>", noSideEffect.}
+    importc: "pthread_mutex_init", noSideEffect.}
   func deinitSysAux(L: SysLockObj) {.noSideEffect,
-    importc: "pthread_mutex_destroy", header: "<pthread.h>".}
+    importc: "pthread_mutex_destroy".}
 
   func acquireSysAux(L: var SysLockObj) {.noSideEffect,
-    importc: "pthread_mutex_lock", header: "<pthread.h>".}
+    importc: "pthread_mutex_lock".}
   func tryAcquireSysAux(L: var SysLockObj): cint {.noSideEffect,
-    importc: "pthread_mutex_trylock", header: "<pthread.h>".}
+    importc: "pthread_mutex_trylock".}
 
   func releaseSysAux(L: var SysLockObj) {.noSideEffect,
-    importc: "pthread_mutex_unlock", header: "<pthread.h>".}
+    importc: "pthread_mutex_unlock".}
 
   when defined(ios):
     # iOS will behave badly if sync primitives are moved in memory. In order
@@ -361,25 +419,25 @@ else:
       releaseSysAux(L)
 
   # rlocks
-  var SysLockType_Reentrant* {.importc: "PTHREAD_MUTEX_RECURSIVE",
-    header: "<pthread.h>".}: SysLockType
+  const SysLockType_Reentrant* = SysLockType(
+    when defined(osx) or defined(freebsd): 2 elif defined(illumos): 4 else: 1)  ## PTHREAD_MUTEX_RECURSIVE
   func initSysLockAttr*(a: var SysLockAttr) {.
-    importc: "pthread_mutexattr_init", header: "<pthread.h>", noSideEffect.}
+    importc: "pthread_mutexattr_init", noSideEffect.}
   func setSysLockType*(a: var SysLockAttr, t: SysLockType) {.
-    importc: "pthread_mutexattr_settype", header: "<pthread.h>", noSideEffect.}
+    importc: "pthread_mutexattr_settype", noSideEffect.}
 
   # locks
   func initSysCondAux(cond: var SysCondObj, cond_attr: ptr SysCondAttr = nil) {.
-    importc: "pthread_cond_init", header: "<pthread.h>", noSideEffect.}
+    importc: "pthread_cond_init", noSideEffect.}
   func deinitSysCondAux(cond: SysCondObj) {.noSideEffect,
-    importc: "pthread_cond_destroy", header: "<pthread.h>".}
+    importc: "pthread_cond_destroy".}
 
   func waitSysCondAux(cond: var SysCondObj, lock: var SysLockObj): cint {.
-    importc: "pthread_cond_wait", header: "<pthread.h>", noSideEffect.}
+    importc: "pthread_cond_wait", noSideEffect.}
   func signalSysCondAux(cond: var SysCondObj) {.
-    importc: "pthread_cond_signal", header: "<pthread.h>", noSideEffect.}
+    importc: "pthread_cond_signal", noSideEffect.}
   func broadcastSysCondAux(cond: var SysCondObj) {.
-    importc: "pthread_cond_broadcast", header: "<pthread.h>", noSideEffect.}
+    importc: "pthread_cond_broadcast", noSideEffect.}
 
   when defined(ios):
     func initSysCond*(cond: var SysCond, cond_attr: ptr SysCondAttr = nil) =

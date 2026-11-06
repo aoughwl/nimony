@@ -10,6 +10,10 @@
 ## Routines for converting between different character encodings. On UNIX, this uses
 ## the `iconv`:idx: library, on Windows the Windows API.
 ##
+## On Android, `iconv` comes from Bionic's `libc.so` and is available from API
+## 28. It only supports the UTF encodings, US-ASCII and WCHAR_T, so the default
+## `CP1252` source of `open` is not available there.
+##
 ## The following example shows how to change character encodings.
 runnableExamples:
   when defined(windows):
@@ -307,6 +311,10 @@ else:
     const iconvDll = "libiconv.so"
   elif defined(macosx):
     const iconvDll = "libiconv.dylib"
+  elif defined(illumos):
+    const iconvDll = "libc.so.1"
+  elif defined(android):
+    const iconvDll = "libc.so"
   else:
     const iconvDll = "(libc.so.6|libiconv.so)"
 
@@ -319,12 +327,12 @@ else:
     const EILSEQ = 92.cint
   elif defined(bsd):
     const EILSEQ = 86.cint
-  elif defined(solaris):
+  elif defined(sunos):
     const EILSEQ = 88.cint
   elif defined(haiku):
     const EILSEQ = -2147454938.cint
 
-  var errno {.importc, header: "<errno.h>".}: cint
+  var errno {.importc, header: "<errno.h>", threadvar.}: cint # per thread in C
 
   when defined(bsd):
     {.pragma: importIconv, cdecl, header: "<iconv.h>".}
@@ -499,9 +507,10 @@ else:
           dec(outLen)
         elif lerr == E2BIG:
           var offset = cast[int](dst) - cast[int](cast[cstring](readRawData(result)))
-          setLen(result, len(result) + inLen.int * 2 + 5)
           # 5 is minimally one utf-8 char
-          dst = cast[cstring](cast[int](cast[cstring](beginStore(result, len(result)))) + offset)
+          let p = beginStore(result, len(result) + inLen.int * 2 + 5)
+          if p == nil: raise OutOfMemError
+          dst = cast[cstring](cast[int](cast[cstring](p)) + offset)
           outLen = csize_t(len(result) - offset)
         else:
           raiseOSError(lerr.OSErrorCode)
@@ -510,9 +519,10 @@ else:
     discard iconv(c, nil, nil, addr dst, addr outLen)
     if iconvres == high(csize_t) and errno == E2BIG:
       var offset = cast[int](dst) - cast[int](cast[cstring](readRawData(result)))
-      setLen(result, len(result) + inLen.int * 2 + 5)
       # 5 is minimally one utf-8 char
-      dst = cast[cstring](cast[int](cast[cstring](beginStore(result, len(result)))) + offset)
+      let p = beginStore(result, len(result) + inLen.int * 2 + 5)
+      if p == nil: raise OutOfMemError
+      dst = cast[cstring](cast[int](cast[cstring](p)) + offset)
       outLen = csize_t(len(result) - offset)
       discard iconv(c, nil, nil, addr dst, addr outLen)
     endStore(result)

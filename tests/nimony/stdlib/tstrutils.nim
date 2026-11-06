@@ -120,6 +120,13 @@ block: # split funcs
   assert split("empty sep returns unsplit s", "") == @["empty sep returns unsplit s"]
   assert splitWhitespace("  foo \t bar  baz  ") == @["foo", "bar", "baz"]
 
+block: # join
+  assert join(["a", "b", "c"], ", ") == "a, b, c"
+  assert join(["a", "b", "c"]) == "abc"
+  assert join(["only"], "--") == "only"
+  assert join(@[], ", ") == ""
+  assert join(split("a,b,c", ','), ";") == "a;b;c"
+
 block: # splitLines
   assert splitLines("\nthis\nis\nan\n\nexample\n") ==
     @["", "this", "is", "an", "", "example", ""]
@@ -722,6 +729,42 @@ block: # formatBiggestFloat
 block: # formatFloat
   assert formatFloat(1234.567, ffDecimal, 1) == "1234.6"
 
+block: # formatBiggestFloat without snprintf
+  # The C library's `%#.*g`, `%#.*f` and `%#.*e` are reproduced from the exact
+  # decimal expansion of the double; every expectation here is what glibc and
+  # macOS libc print for the same call.
+  assert formatBiggestFloat(123.456) == "123.4560000000000"    # ffDefault keeps
+  assert formatBiggestFloat(0.5, ffDefault, 3) == "0.500"      # the trailing zeros
+  assert formatBiggestFloat(1e-5, ffDefault, 3) == "1.00e-05"  # of `%#g`
+  assert formatBiggestFloat(123.456, ffDefault, 0) == "1.e+02" # precision 0 means 1
+  # Without a precision C uses its default of 6, and `%g` DROPS trailing zeros.
+  assert formatBiggestFloat(1234.567, ffDefault, -1) == "1234.57"
+  assert formatBiggestFloat(0.0001, ffDefault, -1) == "0.0001"
+  assert formatBiggestFloat(0.00001, ffDefault, -1) == "1e-05"
+  assert formatBiggestFloat(1e20, ffDefault, -1) == "1e+20"
+  assert formatBiggestFloat(1234.567, ffScientific, -1) == "1.234567e+03"
+  # Exact ties round half-to-even, as the hardware's rounding mode does.
+  assert formatBiggestFloat(0.5, ffDecimal, 0) == "0."
+  assert formatBiggestFloat(1.5, ffDecimal, 0) == "2."
+  assert formatBiggestFloat(2.5, ffDecimal, 0) == "2."
+  assert formatBiggestFloat(3.5, ffDecimal, 0) == "4."
+  assert formatBiggestFloat(0.125, ffDecimal, 2) == "0.12"
+  assert formatBiggestFloat(0.375, ffDecimal, 2) == "0.38"
+  # 9.995 is NOT a tie: the double is 9.99499999999999957, so it rounds down.
+  assert formatBiggestFloat(9.995, ffDecimal, 2) == "9.99"
+  assert formatBiggestFloat(9.995, ffScientific, 2) == "9.99e+00"
+  # Beyond the shortest round-tripping form the true expansion continues.
+  assert formatBiggestFloat(0.1, ffDecimal, 20) == "0.10000000000000000555"
+  # Rounding that overflows into a new leading digit.
+  assert formatBiggestFloat(9.99, ffDecimal, 1) == "10.0"
+  assert formatBiggestFloat(999.9, ffDecimal, 0) == "1000."
+  assert formatBiggestFloat(1e20, ffDecimal, 2) == "100000000000000000000.00"
+  assert formatBiggestFloat(1e300, ffScientific, 2) == "1.00e+300"
+  assert formatBiggestFloat(-0.0, ffDecimal, 2) == "-0.00"
+  assert formatBiggestFloat(Inf) == "inf"
+  assert formatBiggestFloat(-Inf, ffDecimal, 3) == "-inf"
+  assert formatBiggestFloat(NaN, ffScientific, 3) == "nan"
+
 block: # `%`
   try:
     assert "" % ["a"] == ""
@@ -983,3 +1026,82 @@ block: # formatSize
   assert formatSize(4096, includeSpace = true) == "4 KiB"
   # (5378934).float / (1024 * 1024) = 5.12975...
   assert formatSize(5_378_934, prefix = bpColloquial, decimalSep = ',') == "5,129MB"
+
+block: # toHex
+  # explicit width, uppercase, no prefix
+  assert toHex(BiggestInt(1984), 4) == "07C0"
+  assert toHex(BiggestInt(0), 2) == "00"
+  # a value needing more than `len` digits keeps its least-significant nibbles
+  assert toHex(BiggestInt(0xABCD), 2) == "CD"
+  # negatives render in two's complement, filling `len`
+  assert toHex(BiggestInt(-1), 2) == "FF"
+  assert toHex(BiggestInt(-100), 4) == "FF9C"
+  # generic shortcut: exactly 2 * sizeof(T) digits
+  assert toHex(0'u8) == "00"
+  assert toHex(255'u8) == "FF"
+  assert toHex(-1'i8) == "FF"
+  assert toHex(127'i8) == "7F"
+  assert toHex(0'u16) == "0000"
+  assert toHex(0xBEEF'u16) == "BEEF"
+  assert toHex(0'u32) == "00000000"
+  assert toHex(0xDEADBEEF'u32) == "DEADBEEF"
+
+block rfindTests:
+  let s = "foo.bar.baz"
+  assert s.rfind('.') == 7
+  assert s.rfind('x') == -1
+  assert s.rfind('.', last = 6) == 3
+  assert s.rfind('f', start = 1) == -1
+  assert s.rfind({'a', 'r'}) == 9
+  assert s.rfind({'q'}) == -1
+  assert s.rfind("ba") == 8
+  assert s.rfind("ba", last = 7) == 4
+  assert s.rfind("zz") == -1
+  assert s.rfind("") == 11
+  assert s.rfind("foo.bar.baz!") == -1
+  assert s[0 ..< s.rfind('.')] == "foo.bar"
+
+block alignTests:
+  assert align("abc", 4) == " abc"
+  assert align("a", 0) == "a"
+  assert align("", 3) == "   "
+  assert align("1232", 6) == "  1232"
+  assert align("1232", 6, '#') == "##1232"
+  assert align("toolong", 3) == "toolong"
+  assert alignLeft("abc", 4) == "abc "
+  assert alignLeft("a", 0) == "a"
+  assert alignLeft("", 2) == "  "
+  assert alignLeft("1232", 6) == "1232  "
+  assert alignLeft("1232", 6, '#') == "1232##"
+  assert alignLeft("toolong", 3) == "toolong"
+
+block centerTests:
+  let a = "foo"
+  assert a.center(2) == "foo"
+  assert a.center(3) == "foo"
+  assert a.center(5) == " foo "
+  assert a.center(6) == " foo  "
+  assert a.center(7, '*') == "**foo**"
+  assert "".center(2) == "  "
+
+block indentTests:
+  assert indent("First line\c\l and second line.", 2) ==
+         "  First line\l   and second line."
+  assert indent("a\nb", 1, "--") == "--a\n--b"
+  assert indent("", 2) == "  "
+  assert indent("x", 0) == "x"
+
+  let block1 = "    Hello\n      There\n"
+  assert block1.unindent() == "Hello\nThere\n"
+  assert block1.unindent(2) == "  Hello\n    There\n"
+  assert unindent("--a\n----b\nc", 1, "--") == "a\n--b\nc"
+  assert unindent("--a\n----b", padding = "--") == "a\nb"
+
+  assert indentation(block1) == 4
+  assert indentation("no indent\n  some") == 0
+  assert indentation("   \n  x\n    y") == 2
+  assert indentation("") == 0
+
+  assert block1.dedent() == "Hello\n  There\n"
+  assert block1.dedent(1) == "   Hello\n     There\n"
+  assert "  a\n    b".dedent() == "a\n  b"

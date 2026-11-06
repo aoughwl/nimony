@@ -31,7 +31,7 @@ proc createLengTagPool*(): TagPool =
   ## `TagEnum` ordinal. Pass to `parseFromFile`/`parseFromBuffer` as
   ## `sharedTags` so `tagEnum`/`stmtKind`/… can decode by ordinal.
   result = newTagPool()
-  for e in TagEnum:
+  for e in low(TagEnum)..high(TagEnum):
     if e == InvalidTagId: continue
     let id = result.registerTag(TagData[e][0])
     assert uint32(id) == uint32(TagData[e][1]),
@@ -87,6 +87,15 @@ proc elementType*(n: Cursor): Cursor {.inline.} =
   result = n
   inc result
 
+const AddrKinds* = {AddrC, HaddrC}
+  ## `(addr x)` and `(haddr x)` both denote x's address and lower identically:
+  ## every consumer that only needs "this is an address-of" should match on this
+  ## set. They are separate tags because a consumer that cares about *why* the
+  ## address was taken can then tell them apart without a second channel —
+  ## `(haddr x)` is the compiler binding a location for a `var`/`out` parameter,
+  ## `(addr x)` is the user turning a location into a value. Matching one tag
+  ## alone is almost always a bug; matching this set says "either" out loud.
+
 # NB: `leng_model.tracebackTypeC` is intentionally not ported — it walks
 # *backwards* via `unsafeDec`, which `nifcore` has no primitive for, and no
 # current consumer needs it. Add a backward primitive to `nifcore` first if a
@@ -129,6 +138,41 @@ proc takeFieldDecl*(n: var Cursor): FieldDecl =
     skip n
     result.typ = n
     skip n
+
+type
+  UnionBranch* = object
+    ranges*: Cursor  ## the `(ranges ...)` selecting this branch; `.` for `else`
+    body*: Cursor    ## the branch's anonymous `(object ...)`, or `.` if it
+                     ## declares no fields (`of x: nil`)
+
+proc isUnionBranch*(n: Cursor): bool {.inline.} =
+  ## True if `n` is a discriminated-union branch, i.e. a case object lowered by
+  ## hexer rather than the untagged `{.union.}` form. The two shapes never mix,
+  ## so testing the child tag is enough - see `doc/leng-spec.md`, UnionBranch.
+  n.substructureKind in {OfU, ElseU}
+
+proc takeUnionBranch*(n: var Cursor): UnionBranch =
+  ## Read a `(of RANGES BODY)` / `(else BODY)` branch and advance past it.
+  ## Callers that only need the fields use `result.body`; debug info also reads
+  ## `result.ranges` to name the branch after its discriminant values.
+  ##
+  ## Start from the nil-cursor default: an `else` branch has no ranges, so
+  ## without this `result.ranges` is whatever the stack held — and
+  ## `cursorIsNil(branch.ranges)` is exactly how `contracts_fir` and
+  ## `llvmdebug` tell the two shapes apart. `strictdefs` rejects the field
+  ## write into an uninitialized `result` for that reason.
+  let isOf = n.substructureKind == OfU
+  result = default(UnionBranch)
+  n.into:
+    if isOf:
+      result.ranges = n
+      skip n
+    result.body = n
+    skip n
+
+proc asUnionBranch*(n: Cursor): UnionBranch =
+  var n = n
+  takeUnionBranch(n)  # local cursor is dropped on return
 
 type
   ParamDecl* = object

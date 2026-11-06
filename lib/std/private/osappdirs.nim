@@ -111,10 +111,18 @@ when defined(windows):
 
   import ../widestrs
 
+  # Retrieves the path of the directory designated for temporary files.
+  #
+  # Declared with no body, and with the same bare `dynlib: "kernel32"` every
+  # other Windows import here uses. It had a body — just the doc comment — and
+  # `dynlib: "kernel32.dll"`, and in that shape the import library never
+  # reached the native backend: arkham rejected the extern outright
+  # ("`GetTempPathW` names no import library"), taking `tos`, `tdirs` and
+  # `tappdirs` with it. The C backend never noticed because gcc links
+  # kernel32 whether or not anyone asks.
   proc getTempPath(
     nBufferLength: DWORD, lpBuffer: WideCString
-  ): DWORD {.stdcall, dynlib: "kernel32.dll", importc: "GetTempPathW".} =
-    ## Retrieves the path of the directory designated for temporary files.
+  ): DWORD {.stdcall, dynlib: "kernel32", importc: "GetTempPathW".}
 
 template getEnvImpl(result: var string, tempDirList: openArray[string]) =
   for dir in tempDirList:
@@ -161,7 +169,12 @@ proc getTempDir*(): string {.tags: [ReadEnvEffect, ReadIOEffect].} =
         let buffer = newWideCString(size.int).toWideCString()
         if getTempPath(size, buffer) > 0:
           result = $buffer
-    elif defined(android): result = "/data/local/tmp"
+    elif defined(android):
+      # Apps cannot write `/data/local/tmp` under SELinux, so honour the
+      # environment (Termux sets `TMPDIR`) and only then use the old default.
+      getTempDirImpl(result)
+      if result.len == 0:
+        result = "/data/local/tmp"
     else:
       getTempDirImpl(result)
 

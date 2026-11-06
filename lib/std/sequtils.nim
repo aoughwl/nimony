@@ -43,17 +43,23 @@ func count*[T: Equatable](s: openArray[T]; x: T): int =
 # `find` and `contains` for `openArray[T: Equatable]` already live in
 # `system` (openarrays); they are intentionally not redefined here.
 
-func deduplicate*[T: Equatable](s: openArray[T]): seq[T] =
+func deduplicate*[T: Equatable](s: openArray[T]; isSorted = false): seq[T] =
   ## Returns `s` with consecutive and non-consecutive duplicates removed,
-  ## preserving first-seen order.
+  ## preserving first-seen order. With `isSorted` the caller promises equal
+  ## elements are adjacent, which makes this O(n) instead of O(n²).
   runnableExamples:
     assert deduplicate(@[1, 2, 2, 3, 1]) == @[1, 2, 3]
+    assert deduplicate(@[1, 1, 2, 3, 3], isSorted = true) == @[1, 2, 3]
   result = @[]
-  for i in 0 ..< s.len:
-    var seen = false
-    for j in 0 ..< result.len:
-      if result[j] == s[i]: seen = true
-    if not seen: result.add s[i]
+  if isSorted:
+    for i in 0 ..< s.len:
+      if i == 0 or not (s[i] == s[i-1]): result.add s[i]
+  else:
+    for i in 0 ..< s.len:
+      var seen = false
+      for j in 0 ..< result.len:
+        if result[j] == s[i]: seen = true
+      if not seen: result.add s[i]
 
 func minIndex*[T: Comparable](s: openArray[T]): int =
   ## Returns the index of the minimum element of `s` (0 for an empty `s`).
@@ -214,18 +220,22 @@ func insert*[T](dest: var seq[T]; src: openArray[T]; pos: Natural = 0) {.nodestr
   let oldLen = dest.len
   let at = min(pos.int, oldLen)
   growUnsafe(dest, oldLen + n)
+  # A refused growth keeps the old buffer and length (see `grow`), so the
+  # refusal shows in the length, not in a nil buffer.
+  if dest.len != oldLen + n: return
   let p = rawData(dest)
-  if p == nil: return
   # Shift the tail `[at ..< oldLen]` up by `n`, back to front to avoid clobber.
-  var i = oldLen
-  while i > at:
-    dec i
-    (p[i + n]) = p[i]
-  # Fill the gap `[at ..< at+n]` with owned copies of `src`.
-  var j = 0
-  while j < n:
-    (p[at + j]) = `=dup`(src[j])
-    inc j
+  # `p` points into `dest`'s own buffer:
+  {.cast(noSideEffect).}:
+    var i = oldLen
+    while i > at:
+      dec i
+      (p[i + n]) = p[i]
+    # Fill the gap `[at ..< at+n]` with owned copies of `src`.
+    var j = 0
+    while j < n:
+      (p[at + j]) = `=dup`(src[j])
+      inc j
 
 # ── `it` / fold templates ────────────────────────────────────────────────────
 #

@@ -36,7 +36,8 @@ proc getVirtualGuardLLVM(c: var LLVMCode; n: Cursor): (SymId, bool) =
 proc genOnErrorLLVM(c: var LLVMCode; n: var Cursor) =
   let onErrInfo = n.info
   let errPtr = llGlobalRef("LENGC_ERR_", c.prim.ptrT)
-  let errVal = c.emitLoad(errPtr, c.prim.i8)
+  let i8 = c.prim.i8
+  let errVal = c.emitLoad(errPtr, i8)
   let cond = c.nextTemp()
   let condRes = llReg(cond, c.prim.i1)
   c.setLoc(onErrInfo)
@@ -102,7 +103,7 @@ proc genIteLLVM(c: var LLVMCode; n: var Cursor) =
       skip n
       genStmtLLVM c, n
       if isLast:
-        let labelName = mangleToC(c.m.pool.syms[vflag])
+        let labelName = mangleToC(c.m.pool.symString(vflag))
         c.setLoc(iteInfo)
         c.emit LLInstr(kind: llBr, brTarget: labelName)
         discard c.startBlock(labelName)
@@ -170,23 +171,16 @@ proc genWhileLLVM(c: var LLVMCode; n: var Cursor) =
     while n.hasMore: skip n
 
 proc genLoopLLVM(c: var LLVMCode; n: var Cursor) =
+  ## `(loop body)`: infinite, left only by a `break`/`jmp` inside the body.
   let loopInfo = n.info
   n.into:
     let headerLabel = c.nextLabel()
-    let bodyLabel = c.nextLabel()
     let endLabel = c.nextLabel()
 
     c.setLoc(loopInfo)
     c.emit LLInstr(kind: llBr, brTarget: headerLabel)
     discard c.startBlock(headerLabel)
 
-    genStmtLLVM c, n
-    var cond = LLValue(); genCondLLVM(c, n, cond)
-    c.setLoc(loopInfo)
-    c.emit LLInstr(kind: llCondBr, condBrCond: cond,
-                   condBrTrue: bodyLabel, condBrFalse: endLabel)
-
-    discard c.startBlock(bodyLabel)
     c.currentProc.breakStack.add endLabel
     genStmtLLVM c, n
     discard c.currentProc.breakStack.pop()
@@ -212,7 +206,7 @@ proc emitRangeCheck(c: var LLVMCode; info: NifLineInfo; switchVal, lo, hi: LLVal
   c.emit LLInstr(kind: llIcmp, result: hiOk, icmpPred: predHi,
                  icmpLhs: switchVal, icmpRhs: hi)
   let inRange = llReg(c.nextTemp(), c.prim.i1)
-  c.emit LLInstr(kind: llAnd, result: inRange, binOp: "and",
+  c.emit LLInstr(kind: llBinOp, result: inRange, binOp: "and",
                  binLhs: loOk, binRhs: hiOk)
   let nextChk = c.nextLabel()
   c.emit LLInstr(kind: llCondBr, condBrCond: inRange,
@@ -246,8 +240,8 @@ proc genSwitchLLVM(c: var LLVMCode; n: var Cursor) =
                     var lo = LLValue(); genExprLLVM(c, n, lo)
                     var hi = LLValue(); genExprLLVM(c, n, hi)
                     if lo.kind == llvInt and hi.kind == llvInt:
-                      let loN = parseInt(lo.intText)
-                      let hiN = parseInt(hi.intText)
+                      let loN = parseIntOrQuit(lo.intText)
+                      let hiN = parseIntOrQuit(hi.intText)
                       let span = hiN - loN + 1
                       if span >= 0 and span <= RangeExpandThreshold:
                         # small dense literal range: expand per value to keep switch jump-table
@@ -326,7 +320,7 @@ proc genLabelLLVM(c: var LLVMCode; n: var Cursor) =
   let labelInfo = n.info
   n.into:
     if n.kind == SymbolDef:
-      let name = mangleToC(c.m.pool.syms[n.symId])
+      let name = mangleToC(c.m.pool.symString(n.symId))
       if not c.currentProc.needsTerminator:
         c.setLoc(labelInfo)
         c.emit LLInstr(kind: llBr, brTarget: name)
@@ -340,7 +334,7 @@ proc genGotoLLVM(c: var LLVMCode; n: var Cursor) =
   let gotoInfo = n.info
   n.into:
     if n.kind == Symbol:
-      let name = mangleToC(c.m.pool.syms[n.symId])
+      let name = mangleToC(c.m.pool.symString(n.symId))
       c.setLoc(gotoInfo)
       c.emit LLInstr(kind: llBr, brTarget: name)
       c.currentProc.needsTerminator = true
@@ -354,6 +348,8 @@ proc genScopeLLVM(c: var LLVMCode; n: var Cursor) =
     c.m.openScope()
     while n.hasMore:
       genStmtLLVM c, n
+      if c.currentProc.needsTerminator:
+        while n.hasMore and n.stmtKind != LabS: skip n
     c.m.closeScope()
 
 proc genMflagDeclLLVM(c: var LLVMCode; n: var Cursor) =
@@ -361,8 +357,9 @@ proc genMflagDeclLLVM(c: var LLVMCode; n: var Cursor) =
     if n.kind == SymbolDef:
       let s = n.symId
       c.m.registerLocal(s, createIntegralType(c.m, "(bool)"))
-      let name = mangleToC(c.m.pool.syms[s])
-      c.emitAlloca(name, c.prim.i8)
+      let name = mangleToC(c.m.pool.symString(s))
+      let i8 = c.prim.i8
+      c.emitAlloca(name, i8)
       c.emitStore(llIntTextC("0", c.prim.i8), llReg(name, c.prim.ptrT))
       inc n
     else:
@@ -389,23 +386,12 @@ proc genJtrueLLVM(c: var LLVMCode; n: var Cursor) =
         error c.m, "virtual flag not declared: ", n
       inc n
       if not n.hasMore:
-        let name = mangleToC(c.m.pool.syms[s])
+        let name = mangleToC(c.m.pool.symString(s))
         c.setLoc(jtrueInfo)
         c.emit LLInstr(kind: llBr, brTarget: name)
         c.currentProc.needsTerminator = true
     else:
       error c.m, "expected Symbol but got: ", n
-
-proc genStoreLLVM(c: var LLVMCode; n: var Cursor) =
-  let storeInfo = n.info
-  n.into:
-    var rhs = n
-    skip n
-    var target = LLValue(); genLvalueLLVM(c, n, target)
-    var val = LLValue(); genExprLLVM(c, rhs, val)
-    c.setLoc(storeInfo)
-    c.emitStore(val, target)
-    while n.hasMore: skip n
 
 proc genKeepOverflowLLVM(c: var LLVMCode; n: var Cursor) =
   let ovfInfo = n.info
@@ -424,7 +410,14 @@ proc genKeepOverflowLLVM(c: var LLVMCode; n: var Cursor) =
     of SubC: intrinsic.add "ssub"
     of MulC: intrinsic.add "smul"
     else:
+      # A rewrite left a value that cannot overflow (see the C backend's
+      # `genKeepOverflow`): store it and clear the flag.
+      var value = LLValue()
+      genExprLLVM(c, n, value)
+      genLvalueLLVM(c, n, target)
       while n.hasMore: skip n
+      c.emitStore(value, target)
+      c.emitStore(llIntTextC("0", c.prim.i8), llGlobalRef("LENGC_OVF_", c.prim.ptrT))
       return
 
     n.into:
@@ -441,7 +434,7 @@ proc genKeepOverflowLLVM(c: var LLVMCode; n: var Cursor) =
           inc n
         while n.hasMore: skip n
 
-      typ = c.llIntBits(parseInt(bitsStr))
+      typ = c.llIntBits(parseIntOrQuit(bitsStr))
       intrinsic.add ".with.overflow."
       serialize(typ, intrinsic)
 
@@ -468,19 +461,11 @@ proc genKeepOverflowLLVM(c: var LLVMCode; n: var Cursor) =
   let ovfRes = llReg(ovfFlag, c.prim.i1)
   c.emit LLInstr(kind: llExtractValue, result: ovfRes, evAggregate: rsRes,
                  evAggType: aggTyp, evIndex: 1)
-  let currentOvf = c.emitLoad(llGlobalRef("LENGC_OVF_", c.prim.ptrT), c.prim.i8)
-  let currentOvfBool = c.nextTemp()
-  let cobRes = llReg(currentOvfBool, c.prim.i1)
-  c.setLoc(ovfInfo)
-  c.emit LLInstr(kind: llIcmp, result: cobRes, icmpPred: "ne",
-                 icmpLhs: currentOvf, icmpRhs: llIntTextC("0", c.prim.i8))
-  let combinedOvf = c.nextTemp()
-  let coRes = llReg(combinedOvf, c.prim.i1)
-  c.emit LLInstr(kind: llOr, result: coRes, binOp: "or", binLhs: cobRes,
-      binRhs: ovfRes)
+  # Not sticky: the flag is this operation's verdict alone.
   let newOvfByte = c.nextTemp()
   let nobRes = llReg(newOvfByte, c.prim.i8)
-  c.emit LLInstr(kind: llZext, result: nobRes, castOp: "zext", castSrc: coRes,
+  c.setLoc(ovfInfo)
+  c.emit LLInstr(kind: llZext, result: nobRes, castOp: "zext", castSrc: ovfRes,
                  castDstType: c.prim.i8)
   c.emitStore(nobRes, llGlobalRef("LENGC_OVF_", c.prim.ptrT))
 
@@ -499,19 +484,29 @@ proc genEmitStmtLLVM(c: var LLVMCode; n: var Cursor) =
     c.emitRaw comment
 
 proc genStmtLLVM(c: var LLVMCode; n: var Cursor) =
+  # A statement whose head carries a forged filename opens a template
+  # expansion; everything lowered from inside it belongs to that frame, so the
+  # push spans the whole subtree rather than a single `setLoc` (#1987).
+  withExpansionFrames(c, n.info):
+    genStmtBodyLLVM(c, n)
+
+proc genStmtBodyLLVM(c: var LLVMCode; n: var Cursor) =
   case n.stmtKind
   of NoStmt:
     if n.kind == DotToken:
       inc n
     else:
       error c.m, "expected statement but got: ", n
-  of StmtsS:
+  of StmtsS, AlwaysS:
     n.loopInto:
       genStmtLLVM(c, n)
       if c.currentProc.needsTerminator:
         while n.hasMore and n.stmtKind != LabS: skip n
   of ScopeS:
     genScopeLLVM c, n
+  of InstrS:
+    var instrResult = LLValue()
+    genInstrLLVM(c, n, instrResult)
   of CallS:
     var saved = n
     inc saved
@@ -544,13 +539,14 @@ proc genStmtLLVM(c: var LLVMCode; n: var Cursor) =
   of AsgnS:
     let asgnInfo = n.info
     n.into:
+      let slotType = getType(c.m, n)
       var lval = LLValue(); genLvalueLLVM(c, n, lval)
+      let srcType = getType(c.m, n)
       var rval = LLValue(); genExprLLVM(c, n, rval)
+      coerceInPlace(c, rval, srcType, slotType)
       c.setLoc(asgnInfo)
       c.emitStore(rval, lval)
       while n.hasMore: skip n
-  of StoreS:
-    genStoreLLVM c, n
   of IfS:
     genIfLLVM c, n
   of IteS, ItecS:
@@ -586,7 +582,8 @@ proc genStmtLLVM(c: var LLVMCode; n: var Cursor) =
         let valueType = getType(c.m, valueExpr)
         var val = LLValue(); genExprLLVM(c, n, val)
         var coerced = LLValue()
-        coerceValueLLVM(c, val, valueType, c.currentProc.retTypeCursor, false, coerced)
+        let retType = c.currentProc.retTypeCursor
+        coerceValueLLVM(c, val, valueType, retType, coerced)
         c.setLoc(retInfo)
         c.emit LLInstr(kind: llRet, retVal: coerced)
       else:

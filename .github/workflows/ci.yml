@@ -5,281 +5,285 @@ on:
     - 'master'
   pull_request:
 
+# One in-flight run per branch/PR. The Windows job alone is ~40 minutes, so
+# without this every follow-up push to an open PR leaves the superseded run
+# burning a full matrix to produce results nobody will look at. `master` is
+# excluded from cancellation (github.sha makes its group unique per commit)
+# so the history of green builds there stays complete.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.ref == 'refs/heads/master' && github.sha || '' }}
+  cancel-in-progress: true
+
+# The suite runs as TWO jobs per platform, in parallel:
+#
+#   build — the tree walk minus `tests/boot`
+#   boot  — `tests/boot` (the deterministic 3-stage self-host) on its own
+#
+# They are independent: `boot` reads `bin/` and writes `bin0..bin3` +
+# `nimcache/boot`, the tree walk writes `nimcache/.par`. Serially the bootstrap
+# was 601s of the 1917s Windows run (measured 2026-08-02) with everything else
+# waiting on it, so splitting takes that platform's wall time down by roughly a
+# third. The cost is a second runner per platform, which re-does the ~1 minute
+# of setup and the toolchain build.
+#
+# Both jobs share the `.github/actions/setup` preamble; each adds one step.
+
 jobs:
+  # Routes the windows `build` row to the self-hosted runner (16 cores vs the
+  # hosted 4) when it is online and idle, and to `windows-2025` otherwise. A
+  # plain `runs-on: [self-hosted, windows]` would queue for up to 24h whenever
+  # that machine is off; GitHub has no fallback of its own.
+  #
+  # Listing runners needs Administration: read, which `GITHUB_TOKEN` lacks, so
+  # this reads RUNNER_STATUS_TOKEN (a fine-grained PAT scoped to that one
+  # permission). Secrets are not passed to PRs from forks: there the token is
+  # empty and the row stays hosted, so fork code never runs on the self-hosted
+  # machine. An expired token degrades the same way.
+  #
+  # `grep -i`: GitHub folds the runner's `windows` label into its built-in
+  # `Windows`. Two runs picking at the same moment may both see it idle; the
+  # loser then queues behind the winner rather than failing.
+  pick:
+    runs-on: ubuntu-26.04
+    outputs:
+      windows: ${{ steps.p.outputs.windows }}
+    steps:
+      - id: p
+        env:
+          GH_TOKEN: ${{ secrets.RUNNER_STATUS_TOKEN }}
+        run: |
+          windows='"windows-2025"'
+          if [ -n "$GH_TOKEN" ]; then
+            idle=$(gh api repos/${{ github.repository }}/actions/runners \
+              --jq '.runners[] | select(.status=="online" and (.busy|not)) | .labels[].name' || true)
+            if grep -qix windows <<<"$idle"; then windows='["self-hosted","windows"]'; fi
+          fi
+          echo "windows=$windows" >> "$GITHUB_OUTPUT"
+
   build:
+    needs: pick
     strategy:
       fail-fast: false
       max-parallel: 20
       matrix:
         branch: [master]
         target:
+          # `builder` lives on the target (not a keyed `include`) because the
+          # two linux rows need different runners: amd64 on ubuntu-26.04,
+          # arm64 on the arm-hosted image. An os-keyed include can't express
+          # that split.
+          #
+          # `skip` is this row's HASTUR_SKIP: the suites its tree walk leaves
+          # out, `;`-separated. Every row hands `tests/boot` to the `boot` job;
+          # the windows row drops more (see its comment).
           - os: linux
             cpu: amd64
             nim_branch: devel
+            builder: ubuntu-26.04
+            skip: tests/boot
           - os: linux
             cpu: i386
             nim_branch: devel
+            builder: ubuntu-26.04
+            skip: tests/boot
+          # linux/arm64 exercises the asm-generic `struct stat` layout and the
+          # arm64-divergent fcntl constants (O_DIRECTORY et al) that no other
+          # job reaches; tposixabi static_asserts the whole transcription
+          # against this platform's real headers — see nim-lang/nimony#2155.
+          - os: linux
+            cpu: arm64
+            nim_branch: devel
+            builder: ubuntu-26.04-arm
+            skip: tests/boot
           - os: macos
             cpu: arm64
             nim_branch: devel
+            builder: macos-15
+            skip: tests/boot
+          # Windows is the slow runner (4 cores, and a process creation costs
+          # what a dozen do elsewhere), so it is the one job where a suite has
+          # to earn its place by asserting something the OTHER four do not.
+          # These seven do not — each is dropped with its own reason:
+          #
+          #   tests/nimony/macros   ~40% of the whole suite's cost, measured, on
+          #     BOTH hosts. Every test here is a compile-time macro, and a macro
+          #     is a plugin nimony builds and runs mid-compile — a second full
+          #     toolchain pass per test, which on Windows is where 9 tests turn
+          #     into ~250-370s each. What they assert (bindSym scoping,
+          #     parseStmt, NimNode construction) is nimsem's, identical on every
+          #     host.
+          #   tests/nimony/plugins  Same mechanism, same reason, another ~12%.
+          #
+          # Dropping those two does NOT stop Windows building and running a
+          # compile-time plugin: `std/smartcli` IS one (`{.plugin: "deps/
+          # smartcli".}`), so tests/nimony/stdlib/tsmartcli_* exercises the
+          # build-and-spawn path four times over, and tests/nimony/pluginpaths
+          # — kept deliberately — is the test written for that machinery.
+          #
+          #   tests/nimony/valgrind  `hasValgrind` is false here, so
+          #     `testValgrind` returns before asserting anything. The directory
+          #     still compiles and runs 9 tests, one process each (the category
+          #     is neither joinable nor native), to check nothing the category
+          #     exists for.
+          #   tests/ithaqua         The wasm backend. Its artifact is a .wasm
+          #     run under node; nothing in it is host-dependent.
+          #   bench                 `-d:benchSmoke` build-and-compare. The
+          #     question is "does it still build and still compute the same
+          #     numbers" — host-independent by construction.
+          #   tests/importjs        `nimony j` output run under node; nothing in
+          #     it is host-dependent.
+          #   tests/nimony/opt      `--opt:speed`, i.e. the shoggoth passes.
+          #     The windows `boot` job below already builds every stage
+          #     `-d:release`, which is shoggoth on this host at full size.
+          #
+          # All seven keep running on linux-amd64, linux-arm64 and macos-arm64, so
+          # a regression in them is still caught the same day — just not four
+          # times. Measured on run 35283728131: the tree walk's parallel phase
+          # was 1593s of a 2003s step, and macros+plugins alone owned the
+          # t=404..1216s stretch of it.
           - os: windows
             cpu: amd64
             nim_branch: devel
-        include:
-          - target:
-              os: linux
-            builder: ubuntu-24.04
-          - target:
-              os: macos
-            builder: macos-15
-          - target:
-              os: windows
             builder: windows-2025
+            skip: >-
+              tests/boot;tests/nimony/macros;tests/nimony/plugins;tests/nimony/valgrind;tests/ithaqua;tests/importjs;bench;tests/nimony/opt
 
     name: '${{ matrix.target.os }}-${{ matrix.target.cpu }}-nim-${{ matrix.target.nim_branch }} (${{ matrix.branch }})'
-    runs-on: ${{ matrix.builder }}
+    # The windows row only; `boot` stays hosted, since the one self-hosted
+    # runner takes one job at a time. See `pick`.
+    runs-on: ${{ matrix.target.os == 'windows' && fromJSON(needs.pick.outputs.windows) || matrix.target.builder }}
     env:
       NIM_DIR: nim-${{ matrix.target.nim_branch }}-${{ matrix.target.cpu }}
       NIM_BRANCH: ${{ matrix.target.nim_branch }}
       NIM_ARCH: ${{ matrix.target.cpu }}
     steps:
-      - name: set `core.autocrlf` to false
-        run: |
-          git config --global core.autocrlf false
-          git config --global init.defaultBranch master
-
-      - name: Disable Defender real-time scan for workspace (Windows)
-        if: runner.os == 'Windows'
-        shell: powershell
-        run: |
-          # Defender scanning every file the Nim/MinGW toolchain touches is the
-          # single biggest reason Windows CI runs ~3x slower than Linux/macOS
-          # for this workload. Excluding the workspace and the compiler
-          # processes brings I/O-bound build/test phases close to parity.
-          $ErrorActionPreference = 'Continue'
-          Add-MpPreference -ExclusionPath "${{ github.workspace }}" -ErrorAction SilentlyContinue
-          Add-MpPreference -ExclusionPath "$env:USERPROFILE\nimcache" -ErrorAction SilentlyContinue
-          Add-MpPreference -ExclusionPath "$env:TEMP" -ErrorAction SilentlyContinue
-          foreach ($p in @('nim.exe','nimony.exe','nimsem.exe','hexer.exe','lengc.exe','nifler.exe','nifmake.exe','nj.exe','vl.exe','validator.exe','dagon.exe','controlflow.exe','contracts.exe','hastur.exe','tester.exe','gcc.exe','g++.exe','ld.exe','as.exe','ar.exe','make.exe')) {
-            Add-MpPreference -ExclusionProcess $p -ErrorAction SilentlyContinue
-          }
-
-      - name: Checkout nimony
-        # Check out into `nimony/` (NOT `nif/`): the native backend's arkham/nifasm
-        # `nim.cfg` reuse nimony's NIF libraries via `../../../nimony/src/lib`, so the
-        # repo's working-tree directory MUST be named `nimony` for that sibling-relative
-        # path to resolve — the same layout developer machines use.
-        uses: actions/checkout@v7
+      # A local `uses:` needs the action's file on disk first, and the setup
+      # action itself owns the real checkout (it has to configure `core.autocrlf`
+      # before git touches any source). So fetch just `.github/actions` into a
+      # path of its own — `nimony/` must stay untouched here, or this sparse
+      # config would be what the real checkout inherits.
+      - uses: actions/checkout@v7
         with:
-          path: nimony
-          submodules: false
+          path: ci-actions
+          sparse-checkout: .github/actions
+          sparse-checkout-cone-mode: false
 
-      - name: Checkout nativenif (sibling of nimony)
-        uses: actions/checkout@v7
+      - uses: ./ci-actions/.github/actions/setup
         with:
-          repository: nim-lang/nativenif
-          path: nativenif
-          submodules: false
+          cpu: ${{ matrix.target.cpu }}
+          nim_branch: ${{ matrix.target.nim_branch }}
 
-      - name: Install Linux dependency (Linux)
-        if: runner.os == 'Linux' && matrix.target.cpu == 'amd64'
-        shell: bash
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y valgrind gcc-14 g++-14
-          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-14 60 --slave /usr/bin/g++ g++ /usr/bin/g++-14
-
-      - name: Install dependencies (Linux i386)
-        if: runner.os == 'Linux' && matrix.target.cpu == 'i386'
-        working-directory: ${{ github.workspace }}
-        run: |
-          sudo dpkg --add-architecture i386
-          sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND='noninteractive' apt-get install \
-            --no-install-recommends -yq gcc-multilib g++-multilib \
-            libssl-dev:i386
-
-          mkdir -p external/bin
-          cat << EOF > external/bin/gcc
-          #!/bin/bash
-
-          exec $(which gcc) -m32 "\$@"
-          EOF
-
-          cat << EOF > external/bin/g++
-          #!/bin/bash
-
-          exec $(which g++) -m32 "\$@"
-          EOF
-
-          chmod 755 external/bin/gcc external/bin/g++
-
-          echo "$PWD/external/bin" >> "${GITHUB_PATH}"
-
-
-      - name: Restore MinGW-W64 (Windows) from cache
-        if: runner.os == 'Windows'
-        id: windows-mingw-cache
-        uses: actions/cache@v5
-        with:
-          path: external/mingw-${{ matrix.target.cpu }}
-          # Bump the suffix when changing MINGW_URL below — the old cache
-          # would otherwise keep delivering the previous bundle even though
-          # the archive name and contents changed.
-          key: 'mingw-${{ matrix.target.cpu }}-gcc14-llvm19'
-
-      - name: Restore Nim DLLs dependencies (Windows) from cache
-        if: runner.os == 'Windows'
-        id: windows-dlls-cache
-        uses: actions/cache@v5
-        with:
-          path: external/dlls-${{ matrix.target.cpu }}
-          key: 'dlls-${{ matrix.target.cpu }}'
-
-      - name: Install MinGW64 dependency (Windows)
-        if: >
-          steps.windows-mingw-cache.outputs.cache-hit != 'true' &&
-          runner.os == 'Windows'
-        shell: bash
-        run: |
-          mkdir -p external
-          # winlibs gcc 14.2.0 + LLVM 19.1.7 bundled. We pull the GCC+LLVM
-          # variant (rather than gcc-only) so `clang` and `ld.lld` ship
-          # alongside `gcc`. The LLD that lands here lays out PE `.tls$`
-          # the way the Windows loader expects — needed for clang's native
-          # TLS code-gen to actually run; ld.bfd in older bundles got this
-          # wrong and produced binaries that segfaulted on first TLS access.
-          # Sticking with msvcrt (matches the older bundle's runtime) so
-          # we don't churn the runtime ABI in this same change.
-          if [[ '${{ matrix.target.cpu }}' == 'amd64' ]]; then
-            MINGW_URL="https://github.com/brechtsanders/winlibs_mingw/releases/download/14.2.0posix-19.1.7-12.0.0-msvcrt-r3/winlibs-x86_64-posix-seh-gcc-14.2.0-llvm-19.1.7-mingw-w64msvcrt-12.0.0-r3.7z"
-            ARCH=64
-          else
-            MINGW_URL="https://github.com/brechtsanders/winlibs_mingw/releases/download/14.2.0posix-19.1.7-12.0.0-msvcrt-r3/winlibs-i686-posix-dwarf-gcc-14.2.0-llvm-19.1.7-mingw-w64msvcrt-12.0.0-r3.7z"
-            ARCH=32
-          fi
-          curl -L "$MINGW_URL" -o "external/mingw-${{ matrix.target.cpu }}.7z"
-          7z x -y "external/mingw-${{ matrix.target.cpu }}.7z" -oexternal/
-          mv external/mingw$ARCH external/mingw-${{ matrix.target.cpu }}
-
-      - name: Install DLLs dependencies (Windows)
-        if: >
-          steps.windows-dlls-cache.outputs.cache-hit != 'true' &&
-          runner.os == 'Windows'
-        shell: bash
-        run: |
-          mkdir -p external
-          curl -L "https://nim-lang.org/download/windeps.zip" -o external/windeps.zip
-          7z x -y external/windeps.zip -oexternal/dlls-${{ matrix.target.cpu }}
-
-      - name: Path to cached dependencies (Windows)
-        if: >
-          runner.os == 'Windows'
-        shell: bash
-        run: |
-          echo '${{ github.workspace }}'"/external/mingw-${{ matrix.target.cpu }}/bin" >> $GITHUB_PATH
-          echo '${{ github.workspace }}'"/external/dlls-${{ matrix.target.cpu }}" >> $GITHUB_PATH
-
-      #- name: Install winget
-      #  if: runner.os == 'Windows'
-      #  continue-on-error: true # for some reason errors if latest version already installed
-      #  # winget included in windows-2025 and above:
-      #  run: winget upgrade winget --accept-package-agreements --accept-source-agreements --disable-interactivity
-
-      #- name: Install make dependencies with winget (Windows)
-      #  if: runner.os == 'Windows'
-      #  run: winget install ezwinports.make --disable-interactivity --accept-source-agreements
-
-      - name: Install make dependencies with chocolatey (Windows)
-        if: runner.os == 'Windows'
-        uses: crazy-max/ghaction-chocolatey@v4
-        with:
-          args: install make
-
-      - name: System Info (Windows)
-        if: runner.os == 'Windows'
-        run: "gcc -v"
-
-      # - name: Restore Nim from cache
-      #   if: >
-      #     steps.nim-compiler-cache.outputs.cache-hit != 'true' &&
-      #     matrix.target.nim_branch != 'devel'
-      #   id: nim-compiler-cache
-      #   uses: actions/cache@v2
-      #   with:
-      #     path: '${{ github.workspace }}/nim-${{ matrix.target.nim_branch }}-${{ matrix.target.cpu }}'
-      #     key: 'nim-${{ matrix.target.cpu }}-${{ matrix.target.nim_branch }}'
-
-      - name: Setup Nim
-        uses: alaviss/setup-nim@0.1.1
-        with:
-          path: 'nim'
-          version: ${{ matrix.target.nim_branch }}
-          architecture: ${{ matrix.target.cpu }}
-
-      - name: Overlay current Nim compiler source (devel parser fixes)
-        shell: bash
-        run: |
-          # setup-nim installs a *prebuilt nightly binary* from nim-lang/nightlies,
-          # not the live `devel` tree. That nightly can lag real `devel` by weeks
-          # (it has been frozen since 2026-05-06). Nifler compiles Nim's own
-          # `compiler/parser.nim` (resolved through `--path:$nim`, see
-          # src/nifler/nim.cfg), so a stale nightly cannot parse newer syntax such
-          # as `type C = concept of D`. The nightly's `bin/nim` is fine as the
-          # bootstrap compiler; we only need fresh *compiler sources* overlaid on
-          # top so parser fixes land when Nifler is (re)built.
-          git clone --depth 1 --branch ${{ matrix.target.nim_branch }} \
-            https://github.com/nim-lang/Nim nim-src
-          cp -a nim-src/compiler/. nim/compiler/
-
-      - name: Cache host-Nim build artifacts
-        uses: actions/cache@v5
-        with:
-          # `nimony/bin/` holds the built tools. The two `nim` paths are Nim's
-          # default per-project cache locations: `~/.cache/nim/<name>_d/` on
-          # POSIX and `~/nimcache/<name>_d/` on Windows (see compiler/options.nim
-          # `getOsCacheDir`). Caching both lets `hastur build all` short-circuit
-          # to a near-no-op when source hasn't changed; on partial hits the
-          # incremental rebuild still benefits from the prior cache.
-          path: |
-            nimony/bin
-            ~/.cache/nim
-            ~/nimcache
-          key: hastur-release-${{ runner.os }}-${{ matrix.target.cpu }}-${{ matrix.target.nim_branch }}-${{ hashFiles('nimony/src/**/*.nim', 'nimony/src/**/*.cfg', 'nimony/src/**/*.nims') }}
-          restore-keys: |
-            hastur-release-${{ runner.os }}-${{ matrix.target.cpu }}-${{ matrix.target.nim_branch }}-
-
-      - name: Create dist/nimony symlink for Nim compiler
-        shell: bash
-        run: |
-          rm -rf nim/dist/nimony
-          mkdir -p nim/dist
-          ln -sf "${{ github.workspace }}/nimony" nim/dist/nimony
-
-      - name: Test Building nimony
+      - name: Test building nimony (Linux i386)
+        # i386 runs no tests yet (see the tester step below), so without this it
+        # would assert nothing at all. `build all` is the coverage it does have:
+        # that the toolchain still compiles for a 32-bit target.
+        if: matrix.target.cpu == 'i386'
         run: |
           cd nimony
-          nim c -r src/hastur --release build all
+          nim c -r src/hastur/hastur --release build all
 
       - name: Run tester
         if: matrix.target.cpu != 'i386' # TODO: enables i386
+        # Every platform tests with its default C toolchain. Windows forced
+        # clang from #1846 on ("faster cc step"), but an A/B of this exact
+        # step on identical runners measured gcc 1568s vs clang 1912s, and
+        # local 3x3 reps at 4 cores agree (gcc 683-830s, clang 854-933s).
+        # Export NIMONY_CC=clang here to exercise the clang-on-MinGW path
+        # again; tools/tester.nim then also adds the -fuse-ld=lld that
+        # clang's native PE TLS needs (ld.bfd lays out `.tls$` wrong).
+        #
+        # HASTUR_SKIP hands `tests/boot` to the `boot` job below, and on Windows
+        # also drops the suites whose assertion is host-independent (the matrix
+        # row spells out which, and why). Unset — as it is for anyone running
+        # `nim c -r tools/tester.nim` locally — the tester still walks the whole
+        # tree, bootstrap included.
         env:
-          # Read by tests/tester.nim, which forwards `--cc:clang` to nimony.
-          # On Windows the tester additionally forwards `--passL:-fuse-ld=lld`
-          # because clang emits native PE TLS by default and ld.bfd lays out
-          # `.tls$` incorrectly — only LLD produces a binary that runs.
-          # Empty on Linux/macOS so the existing default toolchains kick in.
-          NIMONY_CC: ${{ runner.os == 'Windows' && 'clang' || '' }}
+          HASTUR_SKIP: ${{ matrix.target.skip }}
         run: |
           cd nimony
           nim c -r tools/tester.nim
 
+  boot:
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        branch: [master]
+        # No i386 row: that target runs no tests yet, so there is no bootstrap
+        # to run either. Otherwise this mirrors `build`'s matrix.
+        target:
+          - os: linux
+            cpu: amd64
+            nim_branch: devel
+            builder: ubuntu-26.04
+          - os: linux
+            cpu: arm64
+            nim_branch: devel
+            builder: ubuntu-26.04-arm
+          - os: macos
+            cpu: arm64
+            nim_branch: devel
+            builder: macos-15
+          - os: windows
+            cpu: amd64
+            nim_branch: devel
+            builder: windows-2025
+
+    name: 'boot ${{ matrix.target.os }}-${{ matrix.target.cpu }}-nim-${{ matrix.target.nim_branch }} (${{ matrix.branch }})'
+    runs-on: ${{ matrix.target.builder }}
+    env:
+      NIM_DIR: nim-${{ matrix.target.nim_branch }}-${{ matrix.target.cpu }}
+      NIM_BRANCH: ${{ matrix.target.nim_branch }}
+      NIM_ARCH: ${{ matrix.target.cpu }}
+    steps:
+      # A local `uses:` needs the action's file on disk first, and the setup
+      # action itself owns the real checkout (it has to configure `core.autocrlf`
+      # before git touches any source). So fetch just `.github/actions` into a
+      # path of its own — `nimony/` must stay untouched here, or this sparse
+      # config would be what the real checkout inherits.
+      - uses: actions/checkout@v7
+        with:
+          path: ci-actions
+          sparse-checkout: .github/actions
+          sparse-checkout-cone-mode: false
+
+      - uses: ./ci-actions/.github/actions/setup
+        with:
+          cpu: ${{ matrix.target.cpu }}
+          nim_branch: ${{ matrix.target.nim_branch }}
+
+      - name: Build the toolchain
+        # `tests/boot/setup.nim` requires a fully populated `bin/`, and a directly
+        # named suite does not run `tests/setup.hastur` (which is what builds it
+        # during a tree walk) — so the build is its own command here.
+        #
+        # `build all` includes arkham + nifasm (from the sibling `../nativenif`
+        # checked out by the setup action), which is what a native boot needs in
+        # `bin/`. WHICH backend the bootstrap then takes is `useNativeBoot`'s
+        # call, in Nim, per host — nothing here selects it. It matters that this
+        # step runs at all, though: the artifact cache is restored through a
+        # `restore-keys:` prefix, so a commit touching `src/**` gets the PREVIOUS
+        # commit's `bin/` handed to it and would otherwise boot stale tools.
+        run: |
+          cd nimony
+          nim c -r src/hastur/hastur --release build all
+
       - name: Run native backend tests (Linux amd64)
-        # The native path emits a static, libc-free x86-64 ELF — only meaningful on
-        # Linux amd64. `hastur native` builds the front end + arkham/nifasm (from the
-        # sibling `../nativenif` checked out above) and runs the curated regression
-        # set (full ARC suite + closures + cps) through `nimony n`.
+        # The curated native regression set (full ARC suite + closures + cps)
+        # through `nimony n`. Only Linux amd64 runs it as a step of its own:
+        # Windows reaches the same corpus from inside the tree walk instead,
+        # which compiles every whitelisted test with `nimony n` rather than
+        # `nimony c` (see `walkUsesNative` in src/hastur/nativelist.nim) — there, skipping
+        # gcc and the linker is what the step is FOR, so the coverage costs no
+        # extra runner time. `NativeTestDirsWindows` is the list it reads.
         if: runner.os == 'Linux' && matrix.target.cpu == 'amd64'
         run: |
           cd nimony
-          nim c -r src/hastur --release native
+          nim c -r src/hastur/hastur --release native
+
+      - name: Run bootstrap
+        # `hastur tests/boot` is the same suite the tree walk would have reached;
+        # naming it directly is what lets the other job skip it.
+        run: |
+          cd nimony
+          nim c -r src/hastur/hastur --release tests/boot

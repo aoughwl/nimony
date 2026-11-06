@@ -9,7 +9,6 @@ type
   Feature* = enum ## A feature is a language mode that is purely frontend-related.
                   ## A `CheckMode` is something Hexer needs to know about too.
     InvalidFeature
-    ResemChoiceFeature
     UntypedFeature
     CanRaiseFeature
     LenientConvertersFeature
@@ -31,6 +30,42 @@ type
       ## e.g. passing a `float64` constant where a `float32` is expected. Off by
       ## default because the narrowing can silently lose precision; opt in with
       ## `.feature: "lenientFloats".` (v2 implies it).
+    LenientAliasingFeature
+    RuntimeContractsFeature
+      ## Check `.requires` contracts at run time only: the `if not cond: panic`
+      ## guard hexer emits into the callee becomes the sole check, and no call
+      ## site in this module is judged statically. The opt-out for code the
+      ## prover gets *wrong* — or that simply wants no compile-time diagnostics
+      ## about contracts at all.
+    StaticContractsFeature
+      ## Every `.requires` a call site in this module carries must be *proven*,
+      ## not merely not-disproven. This is where contracts are headed. It is not
+      ## the default yet for one measured reason: the prover cannot track a
+      ## container's length through its construction, so `var s = newSeq[int](4)`
+      ## followed by `s[0]` is undecided and demanding proof everywhere still
+      ## rejects a seventh of the test suite. Loops are no longer the obstacle.
+      ## `runtimeContracts` wins over it if both are given.
+    AnonBlockBreaksFeature
+      ## Nim-2-style `break`: without a label it leaves the innermost loop *or*
+      ## `block`. Without the feature an unlabeled `break` only ever leaves a
+      ## loop; a `block` is left via `break <blockname>` (RFC #576), which is
+      ## what makes a `block` usable as a plain scope inside a loop.
+    StaticOverloadsFeature
+      ## Nim-2-style preference for `static` parameters: when two candidates
+      ## differ only in whether a parameter is `x: static[T]` or `x: T`, prefer
+      ## the one taking more constant arguments. Applied as the very last
+      ## tiebreaker; without it such candidates are ambiguous.
+    AssumeSyncFeature
+      ## Turn off the shared-global check for the whole module, as if every
+      ## routine body sat in `{.cast(assumeSync).}:`. Without it a mutable
+      ## global may only be passed to a `var`/`ptr` parameter of a `.sync`
+      ## routine (an atomic operation, `acquire` and the like).
+    OwnedRefsFeature
+      ## RFC #575: object constructors yield `owned`, so that the creator of
+      ## a cell is its owner. `owned ref T` / `owned proc` themselves are
+      ## always a statically checked unique ownership annotation; this only
+      ## opts a module into the discipline for values it never wrote `owned`
+      ## for.
 
 proc normalizeFeatureName(s: string): string =
   result = newStringOfCap(s.len)
@@ -41,7 +76,8 @@ proc normalizeFeatureName(s: string): string =
 
 proc parseFeatures*(s: string): set[Feature] =
   case normalizeFeatureName(s)
-  of "resemchoice": {ResemChoiceFeature}
+  # No "resemchoice": re-resolving an `ochoice` against the expansion site is
+  # what makes an open symbol open, so it is unconditional now, not a mode.
   of "untyped": {UntypedFeature}
   of "canraise": {CanRaiseFeature}
   of "lenientconverters": {LenientConvertersFeature}
@@ -51,7 +87,16 @@ proc parseFeatures*(s: string): set[Feature] =
   of "ignorestyle": {IgnoreStyleFeature}
   of "vartoverloads": {VarToverloadsFeature}
   of "lenientfloats": {LenientFloatsFeature}
+  of "lenientaliasing": {LenientAliasingFeature}
+  of "runtimecontracts": {RuntimeContractsFeature}
+  of "staticcontracts": {StaticContractsFeature}
+  of "anonblockbreaks": {AnonBlockBreaksFeature}
+  of "assumesync": {AssumeSyncFeature}
+  of "staticoverloads": {StaticOverloadsFeature}
+  of "ownedrefs": {OwnedRefsFeature}
   of "v2": {UntypedFeature, LenientConvertersFeature, EarlyMagicsFeature,
             AutoClosuresFeature, LenientNilsFeature, IgnoreStyleFeature,
-            VarToverloadsFeature, LenientFloatsFeature}
+            VarToverloadsFeature, LenientFloatsFeature, LenientAliasingFeature,
+            RuntimeContractsFeature, AnonBlockBreaksFeature, AssumeSyncFeature,
+            StaticOverloadsFeature}
   else: {}

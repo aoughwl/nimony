@@ -33,3 +33,13 @@ proc findDriver*(): string =
   result = findTool("aowlmony")
   if not fileExists(result):
     result = findTool("nimony")
+
+proc parserTool*(): string =
+  ## The Nim-to-NIF parser: `nifler2` once it is built, `nifler` before. The
+  ## fallback is the bootstrap -- nifler2 is itself compiled by nimony, which
+  ## must parse it with something. Both write byte-identical `.p.nif` and deps
+  ## files; nifler stays the tool for `config` and `--docs`, which nifler2
+  ## does not implement.
+  result = findTool("nifler2")
+  if not fileExists(result):
+    result = findTool("nifler")

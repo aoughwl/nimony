@@ -1,0 +1,4 @@
+# Imported into the joined program (rather than compiled as the main module),
+# the `identity` macro is reported as "not compiled" and `greet` is then
+# undeclared. A compiler bug, not a test bug; this keeps a run of its own
+# until it is fixed.

@@ -30,7 +30,26 @@
 ## rule set). Kleene/variadic patterns are future work.
 
 import std / [assertions, tables, algorithm]
+when defined(nimony):
+  import std / syncio   # `quit` lives here under Nimony; host Nim has it in `system`
+  {.feature: "lenientnils".}   # `Engine` is a `ref` the driver passes as nil, and
+                               # an unregistered `PredProc` is a nil closure
 import ".." / ".." / "lib" / nifcoreparse  # re-exports nifcore
+# For `getOrQuit`: Nimony's `Table.[]` raises `KeyError`, and every lookup
+# below is already guarded by an `in` test or an `assert`. `getOrQuit` is the
+# non-raising spelling of "the key is there"; the shim provides it under Nim.
+include ".." / ".." / "lib" / compat2
+
+proc fail(msg: string) {.noreturn.} =
+  ## Every rejection below is a defect in the *rule file* or a pattern shape the
+  ## engine does not implement — decided while compiling a `staticRead` rule set,
+  ## i.e. the same for every run of the binary. Nothing has ever caught them: the
+  ## `ValueError` these used to raise walked straight out of `main`, so the
+  ## observable behaviour was already "print and die with a non-zero status".
+  ## Spelling that as `quit` says so, and keeps the engine out of Nimony's
+  ## `{.raises.}` model, which would otherwise go viral from `newEngine` through
+  ## every caller for a diagnostic that never returns.
+  quit "vmrewriter: " & msg
 
 type
   RuleTok = enum
@@ -168,26 +187,29 @@ type
     numRegs: int
     dispatch: Table[TagId, int]  # root tag -> dfa index
     preds: Table[TagId, PredProc]
-    dslBase: uint32              # TagId of the first RuleTok (`rules`)
+    dslIds: array[rtRules..rtSame, TagId]  # DSL vocabulary tag ids (see ruleTok)
     # meta-tag vocabulary for compiled patterns (in `tags`)
     metaWild, metaAnyInt, metaAnySym, metaAnyLit, metaPure, metaSame: TagId
     tagVar, tagParam: TagId      # NIFC local-var / parameter decl tags
 
 proc ruleTok(e: Engine; c: Cursor): RuleTok =
-  ## Map a cursor's tag to the DSL enum via the contiguous-id range — one
-  ## subtraction + cast, no string compare. `rtOther` for anything else.
+  ## Map a cursor's tag to the DSL enum. An 11-entry scan instead of the old
+  ## contiguous-id cast: with a SHARED tag pool (the production pipeline hands
+  ## the module's Leng pool in, see `newEngine`) a DSL name that already exists
+  ## as a Leng tag — `pure` is one — gets its pre-existing id, so the DSL ids
+  ## are not contiguous. Only consulted on RULE-file cursors (parse + DO
+  ## templates), never in the hot matching path.
   if c.kind != TagLit: return rtOther
-  let t = uint32(cursorTagId(c))
-  if t >= e.dslBase and t < e.dslBase + uint32(RuleTokNames.len):
-    cast[RuleTok](t - e.dslBase)
-  else:
-    rtOther
+  let t = cursorTagId(c)
+  for rt in rtRules..rtSame:
+    if e.dslIds[rt] == t: return rt
+  rtOther
 
 # ---- compiling LHS patterns ----------------------------------------------
 
 proc allocReg(e: Engine; rule: var Rule; name: string): int =
-  let s = e.pool.syms.getOrIncl(name)
-  if s in rule.capIndex: return rule.capIndex[s]
+  let s = e.pool.symId(name)
+  if s in rule.capIndex: return getOrQuit(rule.capIndex, s)
   result = e.numRegs
   inc e.numRegs
   rule.capIndex[s] = result
@@ -216,9 +238,9 @@ proc compilePat(e: Engine; rule: var Rule; c: var Cursor; pat: var TokenBuf) =
     of rtPure: emitMeta(pat, e.metaPure,   allocReg(e, rule, metaChildName(c))); skip c
     of rtSame:
       let childName = metaChildName(c)
-      let s = e.pool.syms.getOrIncl(childName)
+      let s = e.pool.symId(childName)
       assert s in rule.capIndex, "(same " & childName & "): not bound"
-      emitMeta(pat, e.metaSame, rule.capIndex[s])
+      emitMeta(pat, e.metaSame, getOrQuit(rule.capIndex, s))
       skip c
     else:                                  # concrete tag -> Open
       pat.openTag cursorTagId(c)
@@ -228,8 +250,8 @@ proc compilePat(e: Engine; rule: var Rule; c: var Cursor; pat: var TokenBuf) =
       pat.closeTag()
   of Ident:
     let nm = strVal(c)
-    let s = e.pool.syms.getOrIncl(nm)
-    if s in rule.capIndex: emitMeta(pat, e.metaSame, rule.capIndex[s])
+    let s = e.pool.symId(nm)
+    if s in rule.capIndex: emitMeta(pat, e.metaSame, getOrQuit(rule.capIndex, s))
     else:                  emitMeta(pat, e.metaWild, allocReg(e, rule, nm))
     inc c
   of IntLit:
@@ -239,7 +261,7 @@ proc compilePat(e: Engine; rule: var Rule; c: var Cursor; pat: var TokenBuf) =
   of Symbol:
     pat.addSymUse symName(c); inc c
   else:
-    raise newException(ValueError, "unsupported pattern token: " & $c.kind)
+    fail "unsupported pattern token: " & $c.kind
 
 # ---- reading a compiled pattern node off a cursor -------------------------
 
@@ -258,7 +280,7 @@ proc patKindOf(e: Engine; c: Cursor): PatKind =
     elif t == e.metaSame:   pkSame
     else:                   pkOpen
   else:
-    raise newException(ValueError, "bad pattern node: " & $c.kind)
+    fail "bad pattern node: " & $c.kind
 
 proc patReg(c: Cursor): int =
   ## The register stored as the `IntLit` child of a meta node.
@@ -285,6 +307,18 @@ proc childCursors(node: Cursor): seq[Cursor] =
 # ---- subset construction --------------------------------------------------
 
 type Item = tuple[entry, idx: int]
+
+proc cmpItem(x, y: Item): int =
+  ## The canonical order on an item set. `buildScopeDFA` keys its state table on
+  ## the *sorted* item seq, so this is what makes two orderings of the same set
+  ## one state. Written out because Nimony's `algorithm.sort` has no
+  ## `system.cmp` default overload — the comparator is always explicit there.
+  ## `entry`/`idx` are small array indices, so the subtraction cannot overflow.
+  result = x.entry - y.entry
+  if result == 0: result = x.idx - y.idx
+
+proc cmpRuleId(x, y: int): int = x - y
+  ## Likewise for the accept list, whose elements are rule ids.
 
 proc patMatchesDisc(e: Engine; p: Cursor; d: Disc):
     tuple[m, descend: bool; g: GuardKind; greg: int] =
@@ -317,28 +351,39 @@ proc patMatchesDisc(e: Engine; p: Cursor; d: Disc):
   of pkSame:
     (true, false, gkSame, patReg(p))    # runtime subtreeEqual
 
-proc buildScopeDFA(e: Engine; entries: seq[ScopeEntry]): int =
-  var dfa = Dfa()
-  var ids = initTable[seq[Item], int]()
-  var worklist: seq[seq[Item]] = @[]
+type ScopeBuild = object
+  ## The three pieces of subset-construction state, in one object so `getState`
+  ## can be a plain proc. It used to be a nested proc closing over three locals;
+  ## Nimony wants such a capture spelled `{.closure.}`, and an explicit `var`
+  ## parameter is both cheaper and clearer about what it mutates.
+  dfa: Dfa
+  ids: Table[seq[Item], int]     ## canonical (sorted) item set -> state id
+  worklist: seq[seq[Item]]
 
-  proc getState(items0: seq[Item]): int =
-    var items = items0
-    sort items
-    if items in ids: return ids[items]
-    result = dfa.states.len
-    ids[items] = result
-    dfa.states.add DState()
-    worklist.add items
+proc getState(b: var ScopeBuild; items0: seq[Item]): int =
+  ## The state for this item set, minting one on first sight. Sorting is what
+  ## makes the set canonical, so two orderings map to the same state.
+  var items = items0
+  sort(items, cmpItem)
+  result = b.ids.getOrDefault(items, -1)
+  if result >= 0: return
+  result = b.dfa.states.len
+  b.ids[items] = result
+  b.dfa.states.add DState()
+  b.worklist.add items
+
+proc buildScopeDFA(e: Engine; entries: seq[ScopeEntry]): int =
+  var b = ScopeBuild(dfa: Dfa(), ids: initTable[seq[Item], int](), worklist: @[])
 
   var startItems: seq[Item] = @[]
-  for i in 0 ..< entries.len: startItems.add (i, 0)
-  discard getState(startItems)
+  for i in 0 ..< entries.len: startItems.add (entry: i, idx: 0)
+  discard getState(b, startItems)
 
   var wi = 0
-  while wi < worklist.len:
-    let items = worklist[wi]
-    let sid = ids[items]
+  while wi < b.worklist.len:
+    let items = b.worklist[wi]
+    let sid = b.ids.getOrDefault(items, -1)
+    assert sid >= 0, "worklist item without a state"
     var st = DState()
 
     # accepts (items past their last sibling) + collect live (non-end) items
@@ -348,7 +393,7 @@ proc buildScopeDFA(e: Engine; entries: seq[ScopeEntry]): int =
         st.accepts.add entries[it.entry].ruleId
       else:
         live.add it
-    sort st.accepts
+    sort(st.accepts, cmpRuleId)
 
     # gather discriminators present among live items' next patterns
     var intVals: seq[int64] = @[]
@@ -394,19 +439,17 @@ proc buildScopeDFA(e: Engine; entries: seq[ScopeEntry]): int =
         else: dyns.add (it, Guard(kind: r.g, reg: r.greg))
 
       if opens.len > 0 and (statics.len > 0 or dyns.len > 0):
-        raise newException(ValueError,
-          "merge not supported: Open competes with Wild/Pure/Same at one position")
+        fail "merge not supported: Open competes with Wild/Pure/Same at one position"
 
       var bucket = Bucket(disc: d)
       if opens.len > 0:
         if opens.len > 1:
-          raise newException(ValueError,
-            "merge not supported: multiple distinct Open patterns at one position")
+          fail "merge not supported: multiple distinct Open patterns at one position"
         let it = opens[0]
         let p = entries[it.entry].siblings[it.idx]
         let childDFA = buildScopeDFA(e, @[ScopeEntry(ruleId: entries[it.entry].ruleId,
                                                      siblings: childCursors(p))])
-        let dest = getState(@[(it.entry, it.idx + 1)])
+        let dest = getState(b, @[(entry: it.entry, idx: it.idx + 1)])
         bucket.refines.add Refine(guards: @[], writes: @[], descend: true,
                                   childDFA: childDFA, dest: dest)
       else:
@@ -425,16 +468,16 @@ proc buildScopeDFA(e: Engine; entries: seq[ScopeEntry]): int =
             let p = entries[it.entry].siblings[it.idx]
             let r = patCapReg(e, p)
             if r >= 0: writes.add r
-            destItems.add (it.entry, it.idx + 1)
-          let dest = getState(destItems)
+            destItems.add (entry: it.entry, idx: it.idx + 1)
+          let dest = getState(b, destItems)
           bucket.refines.add Refine(guards: guards, writes: writes,
                                     descend: false, childDFA: -1, dest: dest)
       st.buckets.add bucket
 
-    dfa.states[sid] = st
+    b.dfa.states[sid] = st
     inc wi
 
-  e.dfas.add dfa
+  e.dfas.add ensureMove(b.dfa)
   result = e.dfas.len - 1
 
 # ---- rule parsing ---------------------------------------------------------
@@ -455,7 +498,14 @@ proc parseRule(e: Engine; c: Cursor) =
           assert l.kind == TagLit and ruleTok(e, l) == rtOther,
             "IF root must be a concrete tag"
           rule.rootTag = cursorTagId(l)
-          compilePat(e, rule, l, rule.patBuf)   # emits (rootTag <kids…>) into patBuf
+          # `compilePat(e, rule, l, rule.patBuf)` would hand the same object in
+          # twice as a mutable argument — legal in Nim, rejected by Nimony's
+          # alias check, and genuinely ambiguous. Compile into a fresh buffer
+          # and install it: `compilePat` only ever appends to the destination it
+          # is handed, so nothing is lost by not starting from `rule.patBuf`.
+          var pat = createTokenBuf(16, e.pool, e.tags)
+          compilePat(e, rule, l, pat)           # emits (rootTag <kids…>)
+          rule.patBuf = ensureMove(pat)
         compiled = true
         skip rc
       of rtDo:
@@ -477,16 +527,16 @@ proc parseRule(e: Engine; c: Cursor) =
               while call.hasMore:
                 assert call.kind == Ident, "(WHEN …) args must be captured names"
                 let argName = strVal(call)
-                let s = e.pool.syms.getOrIncl(argName)
+                let s = e.pool.symId(argName)
                 assert s in rule.capIndex,
                   "(WHEN …) references unbound name: " & argName
-                slots.add rule.capIndex[s]
+                slots.add getOrQuit(rule.capIndex, s)
                 call.inc
             rule.sideConds.add SideCond(pred: predTag, slots: slots)
             skip wc
         skip rc
       else:
-        raise newException(ValueError, "unknown rule section: " & tagNameOf(rc))
+        fail "unknown rule section: " & tagNameOf(rc)
   assert compiled, "rule missing (IF …)"
   assert haveRhs, "rule missing (DO …)"
   e.rules.add ensureMove(rule)
@@ -503,7 +553,7 @@ proc parseRules(e: Engine) =
   of rtRule:
     parseRule(e, c)
   else:
-    raise newException(ValueError, "rule file: expected (rules …) or (rule …)")
+    fail "rule file: expected (rules …) or (rule …)"
 
 proc finalizeRules(e: Engine) =
   ## Take cursors into each rule's (now-immutable) patBuf. Done after all rules
@@ -523,8 +573,22 @@ proc buildDispatch(e: Engine) =
       entries.add ScopeEntry(ruleId: ri, siblings: e.rules[ri].rootKids)
     e.dispatch[tag] = buildScopeDFA(e, entries)
 
-proc newEngine*(rulesSrc: string): Engine =
-  result = Engine(pool: newPool(), tags: newTagPool(),
+proc isIntTPred(args: openArray[Cursor]): bool =
+  ## The built-in `(WHEN (isIntT T))` guard: T is a SIGNED integer type `(i N)`.
+  ## Used by the `x - x → 0` rule — a float `x - x` is not `0.0` under IEEE
+  ## (NaN/Inf), and the integer `0` template would be ill-typed for `(f N)`/
+  ## `(u N)` operands.
+  let c = args[0]
+  c.kind == TagLit and c.tags.tagName(c.cursorTagId) == "i"
+
+proc newEngine*(rulesSrc: string; pool: Pool = nil; tags: TagPool = nil): Engine =
+  ## Build an engine from a rules source. Pass the MODULE's `pool`/`tags` (e.g.
+  ## the typenav context's, as `optdriver` does) so the compiled patterns' tag
+  ## ids line up with the buffers the engine will rewrite; with no pool given
+  ## (tests, fuzzing) the engine owns a private one and inputs go through
+  ## `parseInput`.
+  result = Engine(pool: (if pool == nil: newPool() else: pool),
+                  tags: (if tags == nil: newTagPool() else: tags),
                   dispatch: initTable[TagId, int](),
                   preds: initTable[TagId, PredProc]())
   result.metaWild   = result.tags.registerTag("@wild")
@@ -533,13 +597,11 @@ proc newEngine*(rulesSrc: string): Engine =
   result.metaAnyLit = result.tags.registerTag("@anylit")
   result.metaPure   = result.tags.registerTag("@pure")
   result.metaSame   = result.tags.registerTag("@same")
-  # Register the DSL vocabulary contiguously so `ruleTok` is a cast.
-  for i in 0 ..< RuleTokNames.len:
-    let id = uint32 result.tags.registerTag(RuleTokNames[i])
-    if i == 0: result.dslBase = id
-    else: assert id == result.dslBase + uint32(i), "DSL tags not contiguous"
+  for rt in rtRules..rtSame:
+    result.dslIds[rt] = result.tags.registerTag(RuleTokNames[ord(rt)])
   result.tagVar   = result.tags.registerTag("var")
   result.tagParam = result.tags.registerTag("param")
+  result.preds[result.tags.registerTag("isIntT")] = isIntTPred   # built-in guard
   result.ruleBuf = parseFromBuffer(rulesSrc, "R", 256, result.pool, result.tags)
   parseRules(result)
   finalizeRules(result)
@@ -615,9 +677,9 @@ proc emitRhs(e: Engine; t: var Cursor; dest: var TokenBuf; caps: seq[Cursor];
   ## stamped with `info`; spliced captures keep their own info via `addSubtree`.
   case t.kind
   of Ident:
-    let s = t.pool.syms.getOrIncl(strVal(t))
+    let s = t.pool.symId(strVal(t))
     assert s in capIndex, "DO references unbound name: " & strVal(t)
-    dest.addSubtree caps[capIndex[s]]
+    dest.addSubtree caps[getOrQuit(capIndex, s)]
     inc t
   of IntLit:   dest.addIntLit intVal(t);   dest.appendLineInfo info; inc t
   of UIntLit:  dest.addUIntLit uintVal(t); dest.appendLineInfo info; inc t
@@ -629,9 +691,9 @@ proc emitRhs(e: Engine; t: var Cursor; dest: var TokenBuf; caps: seq[Cursor];
   of TagLit:
     if ruleTok(e, t) in MetaToks:
       let childName = metaChildName(t)
-      let s = t.pool.syms.getOrIncl(childName)
+      let s = t.pool.symId(childName)
       assert s in capIndex, "DO meta references unbound name: " & childName
-      dest.addSubtree caps[capIndex[s]]
+      dest.addSubtree caps[getOrQuit(capIndex, s)]
       skip t
     else:
       dest.openTag cursorTagId(t)
@@ -641,7 +703,7 @@ proc emitRhs(e: Engine; t: var Cursor; dest: var TokenBuf; caps: seq[Cursor];
           emitRhs(e, t, dest, caps, capIndex, info)
       dest.closeTag()
   else:
-    raise newException(ValueError, "unsupported DO token: " & $t.kind)
+    fail "unsupported DO token: " & $t.kind
 
 # ---- driver ---------------------------------------------------------------
 
@@ -657,11 +719,12 @@ proc tryRulesAt(e: Engine; node: Cursor; dest: var TokenBuf): bool =
   for r in accepts:                        # priority (ascending rule id) order
     template rule: untyped = e.rules[r]     # no copy (Rule holds a TokenBuf)
     var ok = true
-    for sc in rule.sideConds:
+    for i in 0 ..< rule.sideConds.len:
+      let sc = rule.sideConds[i]
       var args: seq[Cursor] = @[]
       for s in sc.slots: args.add caps[s]
       let p = e.preds.getOrDefault(sc.pred)
-      if p.isNil or not p(args):
+      if p == nil or not p(args):
         ok = false
         break
     if ok:
@@ -728,7 +791,7 @@ proc collectLocals(e: Engine; c: Cursor;
     var nm = c
     inc nm                                   # first child = the name
     if nm.kind == SymbolDef:
-      let s = e.pool.syms.getOrIncl(symName(nm))
+      let s = e.pool.symId(symName(nm))
       if s notin map:
         map[s] = "_canon." & $counter
         inc counter
@@ -748,15 +811,15 @@ proc rebuildCanon(e: Engine; src: var Cursor; dest: var TokenBuf;
       while src.hasMore: rebuildCanon(e, src, dest, map)
     dest.closeTag()
   of Symbol:
-    let s = e.pool.syms.getOrIncl(symName(src))
+    let s = e.pool.symId(symName(src))
     if s in map:
-      dest.addSymUse map[s]; dest.appendLineInfo rawLineInfo(src); inc src
+      dest.addSymUse getOrQuit(map, s); dest.appendLineInfo rawLineInfo(src); inc src
     else:
       dest.addSubtree src; skip src
   of SymbolDef:
-    let s = e.pool.syms.getOrIncl(symName(src))
+    let s = e.pool.symId(symName(src))
     if s in map:
-      dest.addSymDef map[s]; dest.appendLineInfo rawLineInfo(src); inc src
+      dest.addSymDef getOrQuit(map, s); dest.appendLineInfo rawLineInfo(src); inc src
     else:
       dest.addSubtree src; skip src
   else:
@@ -783,14 +846,7 @@ proc canon*(e: Engine; buf: var TokenBuf) =
 when isMainModule:
   const rulesSrc = staticRead("rules/arith.rewrite.nif")
 
-  proc isPow2(args: openArray[Cursor]): bool =
-    let c = args[0]
-    if c.kind != IntLit: return false
-    let v = intVal(c)
-    v > 0 and (v and (v - 1)) == 0
-
   var e = newEngine(rulesSrc)
-  e.registerPred("isPow2", isPow2)
 
   proc sameTokens(a, b: var TokenBuf): bool =
     if a.len != b.len: return false
@@ -864,21 +920,51 @@ when isMainModule:
     discard runRewrites(e, buf)
     check buf, "(stmts (asgn x.0.M 0))"
 
+  block sub_same_float_blocked:
+    # x - x is NOT 0.0 under IEEE (NaN/Inf), and the `0` template would be
+    # ill-typed for a float sub — the rule is gated to `(i W)`.
+    var buf = e.parseInput("(stmts (asgn x.0.M (sub (f 64) y.0.M y.0.M)))")
+    discard runRewrites(e, buf)
+    check buf, "(stmts (asgn x.0.M (sub (f 64) y.0.M y.0.M)))"
+
+  block sub_same_impure_blocked:
+    # Eliding `f() - f()` would drop two calls — the rule requires a pure operand.
+    var buf = e.parseInput("(stmts (asgn x.0.M (sub (i 32) (call side.0.M) (call side.0.M))))")
+    discard runRewrites(e, buf)
+    check buf, "(stmts (asgn x.0.M (sub (i 32) (call side.0.M) (call side.0.M))))"
+
   block fixpoint_chains:
     var buf = e.parseInput("(stmts (asgn x.0.M (and (true) (not (not y.0.M)))))")
     let passes = runRewritesFix(e, buf)
     doAssert passes >= 1
     check buf, "(stmts (asgn x.0.M y.0.M))"
 
-  block pow2_when_fires:
-    var buf = e.parseInput("(stmts (asgn x.0.M (mul (i 32) y.0.M 4)))")
-    discard runRewrites(e, buf)
-    check buf, "(stmts (asgn x.0.M (shl (i 32) y.0.M 4)))"
+  # (The old `mul by pow2 → shl` rule is gone: its DO template shifted by the
+  # MULTIPLIER (`y*4 → y shl 4`), not log2 of it — a miscompile the DSL cannot
+  # express correctly until it grows computed captures.)
 
-  block pow2_when_blocks:
-    var buf = e.parseInput("(stmts (asgn x.0.M (mul (i 32) y.0.M 3)))")
-    discard runRewrites(e, buf)
-    check buf, "(stmts (asgn x.0.M (mul (i 32) y.0.M 3)))"
+  block deref_addr_lvalue:
+    # The fold must also fire in LVALUE position — this is the inliner residue
+    # of `inc(addr i)` after addr-argument substitution.
+    var buf = e.parseInput(
+      "(stmts (asgn (deref (addr i.0.M)) (add (i 64) (deref (addr i.0.M)) 1)))")
+    let passes = runRewritesFix(e, buf)
+    doAssert passes >= 1
+    check buf, "(stmts (asgn i.0.M (add (i 64) i.0.M 1)))"
+
+  block shared_pool_engine:
+    # The production pipeline hands the module's pool/tags in; tag ids of rules
+    # and input then coincide (including the `pure` DSL/Leng name collision).
+    var pool = newPool()
+    var tags = newTagPool()
+    var e2 = newEngine(rulesSrc, pool, tags)
+    var buf = parseFromBuffer("(stmts (asgn x.0.M (deref (addr y.0.M))))", "M",
+                              100, pool, tags)
+    discard runRewrites(e2, buf)
+    var exp = parseFromBuffer("(stmts (asgn x.0.M y.0.M))", "M", 100, pool, tags)
+    if not sameTokens(buf, exp):
+      echo "FAILED shared_pool_engine. got:\n", toString(buf)
+      quit 1
 
   block lineinfo_preserved:
     let f = e.pool.filenames.getOrIncl("t.nim")
@@ -917,26 +1003,21 @@ when isMainModule:
         wantInfo c, 4, 2
         skip c
 
+    # A SYNTHESIZED template token (the `x - x → 0` rule's `0`) is stamped with
+    # the matched node's info.
     var b2 = createTokenBuf(16, e.pool, e.tags)
-    b2.openTag tg("mul");  b2.appendLineInfo li(f, 7, 3)
+    b2.openTag tg("sub");  b2.appendLineInfo li(f, 7, 3)
     b2.openTag tg("i");    b2.appendLineInfo li(f, 7, 5)
     b2.addIntLit 32
     b2.closeTag()
     b2.addSymUse "y.0.M";  b2.appendLineInfo li(f, 7, 9)
-    b2.addIntLit 4;        b2.appendLineInfo li(f, 7, 11)
+    b2.addSymUse "y.0.M";  b2.appendLineInfo li(f, 7, 11)
     b2.closeTag()
 
     discard runRewrites(e, b2)
     var d = b2.beginRead()
-    doAssert tagNameOf(d) == "shl"
+    doAssert d.kind == IntLit and intVal(d) == 0
     wantInfo d, 7, 3
-    d.into:
-      wantInfo d, 7, 5
-      skip d
-      wantInfo d, 7, 9
-      skip d
-      wantInfo d, 7, 11
-      skip d
 
   block canon_alpha_equiv:
     # Two procs differing only in parameter/local names canon to the same tokens.

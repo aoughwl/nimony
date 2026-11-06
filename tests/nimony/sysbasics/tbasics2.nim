@@ -102,6 +102,7 @@ type
     else:
       d: X
 
+proc `=wasMoved`(x: var X) {.nodestroy, inline.} = zeroMem(addr x, sizeof(x))
 proc `=destroy`(x: var X) =
   echo "x destroyed"
 
@@ -215,7 +216,7 @@ block:
 type
   ProcType = proc (x: int) {.nimcall.}
 
-var call: ProcType = ProcType(nil)
+var call: ProcType = proc (x: int) = discard x  # `ProcType` is not-nil: no `ProcType(nil)`
 call = proc (x: int) = discard x
 call(1)
 

@@ -27,8 +27,29 @@ when defined(js):
       let jsObj = navigator.hardwareConcurrency
     result = jsObj.to int
 else:
-  when defined(posix) and not (defined(macosx) or defined(bsd)):
+  when defined(posix) and not (defined(macosx) or
+      (defined(bsd) and not defined(freebsd))):
     import posix/posix
+
+  when defined(freebsd) and defined(nimNoLibc):
+    type
+      CpuAffinityMask = object  ## cpuset_t (FreeBSD 14+: a 1024-bit mask)
+        abi: array[16, uint64]
+    proc cpusetGetaffinity(level, which: cint; id: int; setsize: csize_t;
+                           mask: pointer): cint {.importc: "cpuset_getaffinity".}
+      ## No libc, so no `sysconf`: ask the kernel for this process's CPU set
+      ## (`CPU_LEVEL_WHICH`, `CPU_WHICH_PID`, id -1 = the caller), which is
+      ## what libc's own `_SC_NPROCESSORS_ONLN` reports on FreeBSD too.
+
+  when defined(linux):
+    type
+      CpuAffinityMask = object  ## cpu_set_t (glibc: a 1024-bit mask)
+        abi: array[16, uint64]
+    proc schedGetaffinity(pid: cint; setsize: csize_t; mask: pointer): cint {.
+      importc: "sched_getaffinity".}
+      ## Bare name: glibc's wrapper where libc is linked, and under `nimNoLibc`
+      ## arkham lowers it to the raw syscall. The wrapper returns 0 on success,
+      ## the syscall the number of BYTES written; both are negative on failure.
 
   when defined(windows):
     type
@@ -48,28 +69,10 @@ else:
         dynlib: "kernel32", importc: "GetSystemInfo".}
 
 
-  when defined(freebsd) or defined(macosx):
-    {.emit: "#include <sys/types.h>".}
-
-  when defined(openbsd) or defined(netbsd):
-    {.emit: "#include <sys/param.h>".}
-
-  when defined(macosx) or defined(bsd):
-    # we HAVE to emit param.h before sysctl.h so we cannot use .header here
-    # either. The amount of archaic bullshit in Poonix based OSes is just insane.
-    {.emit: "#include <sys/sysctl.h>".}
-    {.push nodecl.}
-    when defined(macosx):
-      proc sysctlbyname(name: cstring,
-        oldp: pointer, oldlenp: var csize_t,
-        newp: nil pointer, newlen: csize_t): cint {.importc.}
-    let
-      CTL_HW{.importc.}: cint
-      HW_NCPU{.importc.}: cint
-    proc sysctl[I](name: var array[I, cint], namelen: cuint,
+  when defined(macosx):
+    proc sysctlbyname(name: cstring,
       oldp: pointer, oldlenp: var csize_t,
-      newp: nil pointer, newlen: csize_t): cint {.importc.}
-    {.pop.}
+      newp: nil pointer, newlen: csize_t): cint {.importc: "sysctlbyname".}
 
   when defined(genode):
     import genode/env
@@ -91,16 +94,12 @@ else:
         si: SystemInfo = default(SystemInfo)
       getSystemInfo(addr si)
       result = int(si.dwNumberOfProcessors)
-    elif defined(macosx) or defined(bsd):
+    elif defined(macosx):
       result = 0
       let dest = addr result
       var len = sizeof(result).csize_t
-      when defined(macosx):
-        # alias of "hw.activecpu"
-        if sysctlbyname("hw.logicalcpu", dest, len, nil, 0) == 0:
-          return
-      var mib = [CTL_HW, HW_NCPU]
-      if sysctl(mib, 2, dest, len, nil, 0) == 0:
+      # alias of "hw.activecpu"
+      if sysctlbyname("hw.logicalcpu", dest, len, nil, 0) == 0:
         return
     elif defined(hpux):
       result = mpctl(MPC_GETNUMSPUS, nil, nil)
@@ -115,6 +114,34 @@ else:
         result = sysinfo.cpuCount.int
       else:
         result = 0
+    elif defined(linux):
+      # Ask the kernel which CPUs this thread may run on and count the bits.
+      # It is what `nproc` reports, and it respects a cpuset or a `taskset`,
+      # which a count of installed CPUs (`sysconf`) does not: a thread pool
+      # sized from the latter oversubscribes every container that has a cpuset.
+      var mask = default(CpuAffinityMask)
+      let n = schedGetaffinity(0.cint, csize_t(sizeof(mask)), addr mask)
+      result = 0
+      if n >= 0:
+        # The mask starts zeroed and the kernel writes only its own cpumask
+        # size, so every word can be counted.
+        for i in 0 ..< mask.abi.len:
+          var w = mask.abi[i]
+          while w != 0'u64:
+            inc result
+            w = w and (w - 1'u64)     # clear the lowest set bit
+      when not defined(nimNoLibc):
+        if result == 0:
+          result = sysconf(SC_NPROCESSORS_ONLN)
+    elif defined(freebsd) and defined(nimNoLibc):
+      var mask = default(CpuAffinityMask)
+      result = 0
+      if cpusetGetaffinity(3.cint, 2.cint, -1, csize_t(sizeof(mask)), addr mask) == 0:
+        for i in 0 ..< mask.abi.len:
+          var w = mask.abi[i]
+          while w != 0'u64:
+            inc result
+            w = w and (w - 1'u64)     # clear the lowest set bit
     else:
       result = sysconf(SC_NPROCESSORS_ONLN)
     if result < 0: result = 0
@@ -122,6 +149,7 @@ else:
 
 
 proc countProcessors*(): int =
-  ## Returns the number of the processors/cores the machine has.
-  ## Returns 0 if it cannot be detected.
+  ## Returns the number of processors this process may run on. On Linux that is
+  ## its CPU affinity, so a cpuset or `taskset` narrows it; elsewhere it is the
+  ## number the machine has. Returns 0 if it cannot be detected.
   countProcessorsImpl()

@@ -9,13 +9,14 @@
 import std / [os, assertions, sets, hashes, tables, syncio]
 include ".." / lib / nifprelude
 include ".." / lib / compat2
+import ".." / lib / nifreader as rd
+from ".." / lib / nifcoreparse import parse
 import ".." / lib / [nifindexes, symparser]
 import decls, nimony_model, programs, semos
 import ".." / models / nifindex_tags
 
 proc getAttachedOp(symId: SymId, attackedOp: var AttachedOp): bool =
-  var name = pool.syms[symId]
-  extractBasename(name)
+  var name = pool.symBasename(symId)
 
   attackedOp = case name
     of "=destroy": attachedDestroy
@@ -29,38 +30,37 @@ proc getAttachedOp(symId: SymId, attackedOp: var AttachedOp): bool =
   return true
 
 proc buildIndexExports(exports: Table[string, HashSet[SymId]]; infile: string): TokenBuf =
-  result = default(TokenBuf)
+  result = initTokenBuf()
   let mp = splitModulePath infile
   if exports.len != 0:
     result = createTokenBuf(32)
     for suffix, syms in exports:
       # open NIF file to get the path of source file of the module from the line info.
       let modPath = mp.dir / (suffix & mp.ext)
-      var stream = nifstreams.open(modPath)
-      discard processDirectives(stream.r)
-      discard stream.next   # first stmts node doesn't have line info.
-      let t = stream.next
-      let fileId = pool.man.getFileId(t.info)
+      var r = rd.open(modPath)
+      var mbuf = createTokenBuf()
+      parse(r, mbuf)
+      rd.close(r)
+      var mn = beginRead(mbuf)
+      if mn.isTagLit: inc mn      # into the stmts; first child carries the info
+      let fileId = mn.info.file
       assert fileId.isValid
-      stream.close
-      let path = pool.files[fileId].toAbsolutePath
+      let path = realFile(pool.filenames[fileId]).toAbsolutePath
       result.addParLe(TagId(FromexportIdx))
-      result.addStrLit path
+      result.addStrLit(path, NoLineInfo)
       for s in syms:
-        var isGlobal = false
-        let ident = extractBasename(pool.syms[s], isGlobal)
-        result.addIdent(ident)
+        let ident = pool.symBasename(s)
+        result.addIdent(ident, NoLineInfo)
       result.addParRi()
 
 proc indexFromNif*(infile: string) =
   ## Extract index from `infile` Nif file and write it to `*.idx.nif` file.
   ##
   ## See https://github.com/nim-lang/nimony/issues/1162
-  var stream = nifstreams.open(infile)
-  discard processDirectives(stream.r)
-  var buf = fromStream(stream)
-  stream.close
-
+  var r = rd.open(infile)
+  var buf = createTokenBuf()
+  parse(r, buf)
+  rd.close(r)
   var n = beginRead buf
   let root = n.info
   var converterIndexMap = default seq[(SymId, SymId)]
@@ -68,14 +68,14 @@ proc indexFromNif*(infile: string) =
 
   n.into StmtsS:
     while n.hasMore:
-      if n.kind == ParLe:
+      if n.isTagLit:
         case n.stmtKind:
         of ProcS, FuncS, ConverterS, MethodS:
           let kind = n.stmtKind
           let routine = takeRoutine(n, SkipFinalParRi)
           let symId = routine.name.symId
           if kind == ConverterS:
-            if routine.exported.kind != DotToken and
+            if not routine.exported.isDotToken and
                routine.typevars.typeKind != InvokeT:
               # don't register instances and not exported ones
               let root = routine.retType.skipModifier.symId
@@ -86,10 +86,9 @@ proc indexFromNif*(infile: string) =
           # So they are indexed only with `FromexportIdx`.
           n.into ExportS:
             while n.hasMore:
-              assert n.kind == Symbol
+              assert n.isSymbol
               let sym = n.symId
-              let name = pool.syms[sym]
-              let suffix = extractModule(name)
+              let suffix = pool.symModule(sym)
               assert suffix != ""
               exports.mgetOrPut(suffix, default(HashSet[SymId])).incl sym
               inc n, AnyExpr
@@ -98,7 +97,6 @@ proc indexFromNif*(infile: string) =
       else:
         skip n
 
-  endRead buf
 
   var exportBuf = buildIndexExports(exports, infile)
 

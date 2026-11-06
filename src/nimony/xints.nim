@@ -30,7 +30,8 @@ proc asSigned*(x: xint; err: var bool): int64 =
       if x.val > uint64(high(int64))+1:
         err = true
       else:
-        result = -int64(x.val)
+        # not `-int64(x.val)`: the magnitude of `low(int64)` is not an int64
+        result = cast[int64](0'u64 - x.val)
     else:
       if x.val > uint64(high(int64)):
         err = true
@@ -48,9 +49,14 @@ proc asUnsigned*(x: xint; err: var bool): uint64 =
       result = x.val
 
 proc `-`*(a: xint): xint =
-  xint(nan: a.nan, neg: not a.neg, val: a.val)
+  # Zero has no sign. This is sign-magnitude, so negating it would otherwise
+  # mint a `-0` that `==` and `<` both read as *less* than `0` — and `-lo` with
+  # `lo == 0` is exactly what `seedRangeFacts` builds for every `Natural`.
+  if a.val == 0'u64: xint(nan: a.nan, neg: false, val: 0'u64)
+  else: xint(nan: a.nan, neg: not a.neg, val: a.val)
 
-proc negate*(a: var xint) {.inline.} = a.neg = not a.neg
+proc negate*(a: var xint) {.inline.} =
+  if a.val != 0'u64: a.neg = not a.neg
 
 proc `+`*(a, b: xint): xint =
   if a.nan or b.nan:
@@ -99,7 +105,7 @@ proc `*`*(a, b: xint): xint =
   )
 
   # Check for overflow (requires casting to uint128 in Nim)
-  if result.val div a.val != b.val:
+  if a.val != 0 and result.val div a.val != b.val:
     result.nan = true
 
 proc `div`*(a, b: xint): xint =
@@ -156,32 +162,36 @@ proc `shr`*(a: xint, b: int): xint =
     val: a.val shr b
   )
 
+proc toTwos(a: xint): uint64 {.inline.} =
+  ## 64 bit two's complement bit pattern of `a`.
+  if a.neg: (not a.val) + 1'u64 else: a.val
+
+proc fromTwos(bits: uint64; signed: bool): xint {.inline.} =
+  if signed and (bits shr 63) != 0'u64:
+    xint(neg: true, val: (not bits) + 1'u64)
+  else:
+    xint(neg: false, val: bits)
+
+# the bitwise ops work on the two's complement pattern, not on sign+magnitude
 proc `and`*(a, b: xint): xint =
-  xint(
-    nan: a.nan or b.nan,
-    neg: a.neg and b.neg,
-    val: a.val and b.val
-  )
+  if a.nan or b.nan: xint(nan: true)
+  else: fromTwos(toTwos(a) and toTwos(b), a.neg or b.neg)
 
 proc `or`*(a, b: xint): xint =
-  xint(
-    nan: a.nan or b.nan,
-    neg: a.neg or b.neg,
-    val: a.val or b.val
-  )
+  if a.nan or b.nan: xint(nan: true)
+  else: fromTwos(toTwos(a) or toTwos(b), a.neg or b.neg)
 
 proc `xor`*(a, b: xint): xint =
-  xint(
-    nan: a.nan or b.nan,
-    neg: a.neg xor b.neg,
-    val: a.val xor b.val
-  )
+  if a.nan or b.nan: xint(nan: true)
+  else: fromTwos(toTwos(a) xor toTwos(b), a.neg or b.neg)
 
 proc `not`*(a: xint): xint =
+  # the result's signedness depends on the operand's type, which `xint` does
+  # not track, so the raw pattern is returned; `mask` applies the sign.
   xint(
     nan: a.nan,
-    neg: a.neg,
-    val: not a.val
+    neg: false,
+    val: not toTwos(a)
   )
 
 proc `mod`*(a, b: xint): xint =
@@ -254,12 +264,15 @@ proc `==`*(a, b: xint): bool =
   elif b.nan:
     return false
 
-  # Compare sign and value
+  # Compare sign and value; zero is zero whichever sign it carries.
+  if a.val == 0'u64 and b.val == 0'u64: return true
   a.neg == b.neg and a.val == b.val
 
 proc `<`*(a, b: xint): bool =
   if a.nan or b.nan:
     return false
+
+  if a.val == 0'u64 and b.val == 0'u64: return false   # `-0 < 0` is false
 
   # Different signs
   if a.neg and not b.neg:

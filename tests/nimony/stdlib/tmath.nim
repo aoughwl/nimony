@@ -334,6 +334,47 @@ block: # pow
   assert pow(2.0, -1.0) == 0.5
   assert pow(2.0, 2.0) == 4.0
   assert pow(2.0'f32, 2.0'f32) == 4.0'f32
+  assert pow(2.0'f32, 3.0'f32) == 8.0'f32
+  assert pow(-2.0'f32, 3.0'f32) == -8.0'f32
+  assert pow(-0.0'f32, 3.0'f32).signbit
+  assert pow(-0.0'f32, 2.0'f32) == 0.0'f32 and not pow(-0.0'f32, 2.0'f32).signbit
+  assert pow(-0.0'f32, -3.0'f32) == -Inf.float32
+  assert pow(-Inf.float32, 3.0'f32) == -Inf.float32
+  assert pow(-Inf.float32, -2.0'f32) == 0.0'f32
+  assert pow(-2.0'f32, 0.5'f32).isNaN
+
+  # C99 power special cases, including sign preservation for odd powers.
+  assert pow(-1.0, Inf) == 1.0
+  assert pow(-1.0, -Inf) == 1.0
+  assert pow(-0.0, 3.0).signbit
+  assert pow(-0.0, 2.0) == 0.0 and not pow(-0.0, 2.0).signbit
+  assert pow(-0.0, -3.0) == -Inf
+  assert pow(-0.0, -2.0) == Inf
+  assert pow(-Inf, 3.0) == -Inf
+  assert pow(-Inf, 2.0) == Inf
+  assert pow(-Inf, -3.0) == 0.0 and pow(-Inf, -3.0).signbit
+  assert pow(-Inf, -2.0) == 0.0 and not pow(-Inf, -2.0).signbit
+  assert pow(-Inf, 0.5) == Inf
+  assert pow(-Inf, -0.5) == 0.0
+  assert pow(-0.0, 0.5) == 0.0 and not pow(-0.0, 0.5).signbit
+
+  # Parity is exact up to 2^53; representable exponents above it are even.
+  assert pow(-1.0, 4503599627370497.0) == -1.0
+  assert pow(-1.0, 9007199254740992.0) == 1.0
+  assert pow(-2.0, 9007199254740992.0) == Inf
+  assert pow(-2.0, -9007199254740992.0) == 0.0
+  assert not pow(-2.0, -9007199254740992.0).signbit
+
+  # Neighboring exceptional-input precedence and infinity limits.
+  assert pow(NaN, 0.0) == 1.0
+  assert pow(1.0, NaN) == 1.0
+  assert pow(-2.0, NaN).isNaN
+  assert pow(-2.0, Inf) == Inf
+  assert pow(-2.0, -Inf) == 0.0
+  assert pow(-0.5, Inf) == 0.0
+  assert pow(-0.5, -Inf) == Inf
+  assert pow(0.0, -3.0) == Inf
+  assert pow(-2.0, 0.5).isNaN
 
 block: # hypot
   assert almostEqual(hypot(3.0, 4.0), 5.0)
@@ -341,11 +382,57 @@ block: # hypot
   assert almostEqual(hypot(6.0, 8.0), 10.0)
   assert almostEqual(hypot(6.0'f32, 8.0'f32), 10.0'f32)
 
+  # Low-magnitude scaling must not overflow while squaring the scaled values.
+  let
+    f64x = cast[float64](565'u64 shl 52) # 2^-458
+    f64y = cast[float64](512'u64 shl 52) # 2^-511
+    f32x = cast[float32](89'u32 shl 23) # 2^-38
+    f32y = cast[float32](66'u32 shl 23) # 2^-61
+  assert hypot(f64x, f64y) == f64x
+  assert hypot(f32x, f32y) == f32x
+
+  # Subnormal inputs, true overflow, zero, and IEEE infinity/NaN precedence.
+  let
+    f64tiny = cast[float64](1'u64)
+    f32tiny = cast[float32](1'u32)
+    f64max = cast[float64](0x7fefffffffffffff'u64)
+    f32max = cast[float32](0x7f7fffff'u32)
+  assert hypot(f64tiny, f64tiny) == f64tiny
+  assert hypot(f32tiny, f32tiny) == f32tiny
+  assert hypot(f64max, 0.0) == f64max
+  assert hypot(f32max, 0.0'f32) == f32max
+  assert classify(hypot(f64max, f64max)) == fcInf
+  assert classify(hypot(f32max, f32max)) == fcInf
+  assert hypot(0.0, -0.0) == 0.0
+  assert hypot(Inf, NaN) == Inf
+  assert hypot(float32(Inf), float32(NaN)) == float32(Inf)
+  assert hypot(NaN, 1.0).isNaN
+  assert hypot(float32(NaN), 1.0'f32).isNaN
+
 block: # exp
   assert exp(0.0) == 1.0
   assert almostEqual(exp(1.0), E)
   assert almostEqual(exp(2.0), E * E)
+  assert almostEqual(exp(-0.5), 0.6065306597126334)
   assert almostEqual(exp(1.0'f32), float32(E))
+
+  # Scaling at the subnormal and overflow boundaries.
+  assert classify(exp(-709.0'f64)) == fcSubnormal
+  assert exp(-709.0'f64) > 0.0'f64
+  assert exp(-745.0'f64) > 0.0'f64
+  assert exp(-746.0'f64) == 0.0'f64
+  assert classify(exp(-90.0'f32)) == fcSubnormal
+  assert exp(-90.0'f32) > 0.0'f32
+  assert exp(-103.0'f32) > 0.0'f32
+  assert exp(-104.0'f32) == 0.0'f32
+  assert classify(exp(709.5'f64)) == fcNormal
+  assert exp(710.0'f64) == Inf
+  assert classify(exp(88.5'f32)) == fcNormal
+  assert exp(89.0'f32) == Inf
+
+  assert exp(Inf) == Inf
+  assert exp(-Inf) == 0.0
+  assert exp(NaN).isNaN
 
 block: # ln
   assert almostEqual(ln(1.0), 0.0)
@@ -380,20 +467,20 @@ block: # log10
   assert log10(-12.0'f32).isNaN
 
 block: # log
-  assert log(9.0, 3.0) == 2.0
-  assert log(0.125, 0.5) == 3.0
-  assert log(2.0, 4.0) == 0.5
-  assert log(0.25, 4.0) == -1.0
-  assert log(1.0, 100.0) == 0.0
-  assert log(100000.0, 10.0) == 5.0
+  assert almostEqual(log(9.0, 3.0), 2.0)
+  assert almostEqual(log(0.125, 0.5), 3.0)
+  assert almostEqual(log(2.0, 4.0), 0.5)
+  assert almostEqual(log(0.25, 4.0), -1.0)
+  assert almostEqual(log(1.0, 100.0), 0.0)
+  assert almostEqual(log(100000.0, 10.0), 5.0)
   assert log(-1.0, 2.0).isNaN
   assert log(4.0, -2.0).isNaN
-  assert log(9'f32, 3'f32) == 2'f32
-  assert log(0.125'f32, 0.5'f32) == 3'f32
-  assert log(2'f32, 4'f32) == 0.5'f32
-  assert log(0.25'f32, 4'f32) == -1'f32
-  assert log(1'f32, 100'f32) == 0'f32
-  assert log(100000'f32, 10'f32) == 5'f32
+  assert almostEqual(log(9'f32, 3'f32), 2'f32)
+  assert almostEqual(log(0.125'f32, 0.5'f32), 3'f32)
+  assert almostEqual(log(2'f32, 4'f32), 0.5'f32)
+  assert almostEqual(log(0.25'f32, 4'f32), -1'f32)
+  assert almostEqual(log(1'f32, 100'f32), 0'f32)
+  assert almostEqual(log(100000'f32, 10'f32), 5'f32)
   assert log(-1'f32, 2'f32).isNaN
   assert log(4'f32, -2'f32).isNaN
 
@@ -707,6 +794,9 @@ block: # binom
   assert binom(101, 100) == 101
   assert binom(9999, 2) == 49985001
 
+func genericGcd[T: SomeInteger and IntegerArithmetic](x, y: T): T = gcd(x, y)
+func genericLcm[T: SomeInteger and IntegerArithmetic](x, y: T): T = lcm(x, y)
+
 block:  # gcd
   assert gcd(0, 0) == 0
   assert gcd(0, 1) == 1
@@ -746,6 +836,19 @@ block:  # gcd
 
   assert gcd(@[2, 6, 12]) == 2
 
+  assert gcd(0u, 0u) == 0u
+  assert gcd(0u, 12u) == 12u
+  assert gcd(12u, 0u) == 12u
+  assert gcd(12u, 8u) == 4u
+  assert gcd(12'u8, 8'u8) == 4'u8
+  assert gcd(12'u16, 8'u16) == 4'u16
+  assert gcd(12'u32, 8'u32) == 4'u32
+  assert gcd(12'u64, 8'u64) == 4'u64
+  assert gcd(@[12u, 8u, 4u]) == 4u
+
+  assert genericGcd(12u, 8u) == 4u
+  assert genericGcd(12, 8) == 4
+
 block:  # lcm
   assert lcm(1, 1) == 1
   assert lcm(1, 2) == 2
@@ -762,3 +865,15 @@ block:  # lcm
 
   assert lcm([3, 5, 7]) == 105
   assert lcm([4, 6, 9, 12]) == 36
+
+  assert lcm(0u, 1u) == 0u
+  assert lcm(1u, 0u) == 0u
+  assert lcm(4u, 6u) == 12u
+  assert lcm(4'u8, 6'u8) == 12'u8
+  assert lcm(4'u16, 6'u16) == 12'u16
+  assert lcm(4'u32, 6'u32) == 12'u32
+  assert lcm(4'u64, 6'u64) == 12'u64
+  assert lcm(@[4u, 6u, 9u, 12u]) == 36u
+
+  assert genericLcm(4u, 6u) == 12u
+  assert genericLcm(4, 6) == 12

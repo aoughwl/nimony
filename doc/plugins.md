@@ -15,9 +15,10 @@ There are five kinds of plugins:
 | **For-loop plugin** | `iterator foo(...) {.plugin: "path".}` | Rewrites a `for` loop using the iterator |
 | **Module plugin** | `{.plugin: "path".}` as statement | Transforms the entire module |
 | **Type plugin** | `type T {.plugin: "path".} = ...` | Invoked for every module that uses `T` |
-| **Import plugin** | `import (path/foo) {.plugin: "std/v2".}` | Imports the module `path/foo` **from the plugin** `std/v2` |
+| **Import plugin** | `import (path/foo) {.plugin: "v2".}` | Imports the module `path/foo` **from the plugin** `v2` |
 
-All plugins share the same API (`plugins`) and execution model.
+The first four share the same API (`plugins`) and execution model. Import
+plugins are different in both respects; see [Import plugins](#import-plugins).
 
 
 ## Quick start
@@ -141,17 +142,31 @@ in the plugin rather than a malformed NIF tree at runtime.
 
 ## How plugins are compiled and run
 
-1. The compiler finds the `.plugin` pragma and resolves the path relative to the
-   source file containing the pragma string literal.
-2. The plugin is compiled with Nimony.
-   The compiled executable is cached in the nimcache directory and reused until the source changes.
+1. The parser (nifler) lists every `.plugin` pragma in the module's deps file,
+   and the dependency scanner resolves the path relative to the source file
+   containing the pragma string literal.
+2. The plugin is compiled with Nimony as a node of the build graph: nifmake
+   builds the executable exactly once, before any of the module compilations
+   that may run it (the declaring module and everything importing it), and
+   rebuilds it — and them — when the plugin's source changes. The executable
+   is cached in the nimcache directory. Should a plugin reach the compiler
+   without a build-graph node (a pragma the parser could not see), it is
+   built on demand instead; that path shares nothing between processes, so
+   concurrent compilations of one module set stay safe.
 3. At the call site, the compiler writes the input AST to a `.nif` file and invokes
    the plugin executable as a subprocess.
 4. The plugin reads the input, transforms it, writes output, and exits.
 5. The compiler reads the output NIF and splices it back into the AST.
 
 Plugins are deterministic: same input produces same output. The compiler caches
-results and skips re-execution when possible.
+results and skips re-execution when possible — the cache key is the input tree,
+so a plugin that reads a file its input does not mention has to say so with
+`dependsOn` (see [Reading files](#reading-files)).
+
+The input files are written in NIF's *binary* form (bif) for speed — the names
+keep their `.nif` extension and the plugin API sniffs the file header, so it
+transparently accepts text NIF too (hand-written inputs keep working). To
+inspect a cached input, decode it with `tools/niftools bif2nif <file>`.
 
 
 ## Plugin search
@@ -206,6 +221,101 @@ renderTree:
 ```
 
 Here the plugin receives the entire block as typed, semantically checked NIF.
+
+
+### Inspecting types: `needTypes`
+
+Type arguments reach a plugin already sem-checked, but only *structural* types
+arrive expanded:
+
+| call | what the plugin sees |
+|------|----------------------|
+| `f(array[3, int])` | `(array (i 64) (rangetype (i 64) 0 2))` |
+| `f(ptr int)` | `(ptr (i 64) (notnil))` |
+| `f(tuple[a: int])` | `(tuple (kv a (i 64)))` |
+| `f(Foo[int])` | `Foo.0.Iw3zqsv.mymod` |
+| `f(MyDistinct)` | `MyDistinct.0.mymod` |
+
+A nominal type — object, enum, distinct, generic instance — is a bare `Symbol`,
+and a plugin cannot resolve it: it runs in its own process, and the module it
+would have to read is still being sem-checked.
+
+So it asks. Returning `needTypes(syms)` as the plugin's whole output makes the
+compiler append those declarations to the second input and run the plugin again:
+
+```nim
+var defs = loadTypeDefinitions()   # (stmts (type :Sym … )*), empty at first
+...
+if missing.len > 0:
+  return needTypes(missing)
+```
+
+Nothing is shipped that was not asked for, so a plugin that never inspects types
+pays nothing. Batch each level into one request — a round costs a re-run, so a
+plugin walking a type graph should ask for a whole level at a time rather than
+one symbol at a time.
+
+Two properties make the exchange safe:
+
+- Asking again for a declaration already provided is a compile-time error. Every
+  round must name something new, so the loop is finite by construction.
+- A symbol that turns out to be a *type variable* is answered with its
+  `(typevar …)` declaration rather than silence. A plugin can therefore
+  recognize `T` positively instead of inferring it from absence — which would
+  misread every not-yet-requested type as a type variable.
+
+A generic instance's `<typevars>` slot holds `(at <head> <args>...)`, so
+`genericHead` and `genericParams` fall straight out of it.
+
+`lib/std/typetraits.nim` is implemented this way, with no compiler magic at all;
+`lib/std/deps/typetraits.nim` is the plugin.
+
+
+### Types in, types out
+
+A template plugin declared to return `typedesc` may be used in type position,
+and its output is re-checked as a type:
+
+```nim
+type Q = distinctBase(MyOtherInt)
+var y: genericHead(Foo[int])[float]
+```
+
+Inside a generic body the plugin runs **once**, on the generic body, with the
+*typevar* as its argument — not once per instantiation. Its output then takes
+part in ordinary substitution, so a plugin that transforms types symbolically
+(`pointerBase(ptr T)` → `T`) is correct there, and cheaper: one expansion
+instead of one per instantiation.
+
+A plugin that has to *decide* something from the concrete type cannot answer
+that way. It says so, by returning `deferExpansion()` as its whole output:
+
+```nim
+if mentionsTypevar(defs, arg):
+  return deferExpansion()
+```
+
+The compiler then leaves the call in the tree as `(at <template> <args>…)` —
+nimony's ordinary unresolved type application, the same shape `Foo[T]` takes in
+a generic body. Instantiation substitutes into it and re-checks it, which asks
+the plugin again with concrete types:
+
+```nim
+proc unwrap[T](x: T): distinctBase(T) =
+  result = distinctBase(T)(x)
+
+echo unwrap(MyInt(12))      # plugin asked again with MyInt  -> int
+echo unwrap(MyFloat(2.5))   # ... and with MyFloat           -> float
+```
+
+Deferring is rejected — a hard error — when no argument contains a generic
+parameter, since nothing would be substituted before the next round and the
+plugin would be asked the same question forever.
+
+Until it is resolved, a deferred type is exactly as usable as a bare type
+variable: it can be declared, passed, converted and returned, but operations
+that need to look through it (`echo` on a value of that type, field access)
+fail in the generic body for the same reason they fail for `T` itself.
 
 
 ## Module plugins
@@ -308,10 +418,21 @@ The `import` statement can be combined with a plugin pragma to load a module
 whose NIF is produced by a plugin:
 
 ```nim
-import (path/foo) {.plugin: "std/v2".}
+import (path/foo) {.plugin: "v2".}
 ```
 
 This is used for compatibility layers that translate between different NIF formats.
+
+Import plugins do not follow the rules above: the string is **not** a path to a
+`.nim` file resolved against the importing module, and the compiler does not
+build it. It names an already-built executable, looked up first relative to the
+current directory and then in the toolchain's `bin` directory. The plugin is run
+as `<plugin> <path/foo.nim> <nimcache/<plugin>/<module>.s.nif>` and is
+responsible for filling `nimcache/<plugin>` with the semchecked NIF **and** the
+matching index files.
+
+The `v2` plugin (`src/v2`) is the in-tree example; it shells out to a Nim 2
+compiler to translate Nim 2 modules. Build it with `nim c src/v2/v2.nim`.
 
 
 ## The plugin API (`plugins`)
@@ -384,6 +505,45 @@ when textual names are needed; `$id` is intentionally not a text lookup.
 | `isValid(info)` | True when info refers to a real source location |
 | `filePath(info)` | Source file path, or `""` |
 | `lineCol(info)` | `SourcePos(line, col)` (1-based), or `(0, 0)` |
+
+
+### Typed views of declarations
+
+Reading a declaration by child position (`n[4]` for the parameters of a `proc`)
+puts the slot numbers into every plugin. The typed views name the parts instead:
+`asRoutine(n)` returns an object whose fields are cursors at the named parts, and
+only `plugins` knows which slot is which. They follow `decls.nim`, which does the
+same inside the compiler.
+
+| View | Node | Fields |
+|------|------|--------|
+| `asLocal(n)` | `let`, `var`, `const`, `param`, `fld` | `name exported pragmas typ val` |
+| `asRoutine(n)` | `proc`, `func`, `iterator`, `template`, ... | `name exported pattern typevars params retType pragmas effects body` |
+| `asTypeDecl(n)` | `type` | `name exported typevars pragmas body` |
+| `asObjectDecl(n)` | `object` type | `parentType body`, and `fields(o)` |
+| `asForStmt(n)` | `for` | `iter vars body` |
+
+`isGeneric` tells whether a `Routine` or a `TypeDecl` has generic parameters, and
+`for c in n.children` visits the children of a node. `fields(o)` yields the fields
+declared directly in an object as `Local`s; fields inside a `case` or `when` part
+are not yielded.
+
+A view holds copies of cursors, so the node it was made from does not move, and
+the fields stay valid for as long as the input does.
+
+```nim
+import plugins
+
+proc describe(n: NifCursor): string =
+  result = ""
+  if n.stmtKind == ProcS:
+    let r = asRoutine(n)
+    result.add symBasename(r.name.symId) & "("
+    for p in r.params.children:         # each parameter is a Local
+      result.add symBasename(asLocal(p).name.symId) & " "
+    result.add ")"
+    if isGeneric(r): result.add " is generic"
+```
 
 
 ### NifBuilder — building NIF output
@@ -462,6 +622,45 @@ proc renderTree*(tree: var NifBuilder): string         # debug rendering (no lin
 ```
 
 
+### Reading files
+
+```nim
+proc dependsOn*(path: string)
+```
+
+A plugin's output is cached under a checksum of its *input tree*, so a plugin
+that reads anything else — a schema, a template, a table of constants — would
+otherwise be memoized forever: the file changes, the input does not, and the
+build keeps the old expansion. `dependsOn` reports the read, and the compiler
+re-runs the plugin (and re-checks the module) when the file changes.
+
+```nim
+proc tr(n: NifCursor): NifBuilder =
+  let schema = getCurrentDir() / "schema.json"
+  dependsOn schema
+  ...
+```
+
+Call it for every file the plugin opens, before or after the read. Paths are
+made absolute against the plugin's working directory, which is the compiler's.
+
+Two limits are worth knowing:
+
+* Only a path that exists is recorded, so *creating* a file the plugin looked
+  for and did not find invalidates nothing. Deleting a recorded one does force
+  a rebuild.
+* Naming a **directory** tracks add/remove of its direct entries and nothing
+  else, because that is all a directory mtime says. To follow the contents of a
+  tree, name each file.
+
+Under the hood the paths travel back as a leading `(dependency …)` tree next to
+the gensym hint. The compiler peels both off before the output becomes part of
+the module, compares the listed files against the cached output to decide
+whether to rerun the plugin, and writes the list into the module's
+`.s.deps.nif`, where the next build picks it up as extra inputs of the
+module's `nimsem` node.
+
+
 ### Error reporting
 
 ```nim
@@ -475,6 +674,36 @@ Return an `ErrT` node that the compiler reports as a compile-time error. The
 `info` overload provides source location only; `at` provides both source location
 and embedded source context; `orig` lets the diagnostic location and embedded
 source context differ.
+
+
+### Parsing Nim code: `nimparser`
+
+A plugin that finds it easier to write Nim than to build its trees can have
+the text parsed. `nimparser` is a module of its own, next to `plugins`, so that
+only the plugins that import it compile a Nim parser:
+
+```nim
+import plugins, nimparser
+
+proc tr(n: NifCursor): NifBuilder =
+  var code = parseStmt("echo " & $2 & " * 21", n.info)
+  result = createTree()
+  result.takeTree code
+```
+
+```nim
+proc parseStmt*(code: string; info = NoLineInfo): NifCursor
+proc parseExpr*(code: string; info = NoLineInfo): NifCursor
+```
+
+`parseStmt` returns a cursor at `(stmts ...)`; `parseExpr` one at exactly one
+expression and rejects anything else. The cursor keeps its tree alive. The tree
+is the one the parser writes for a `.nim` file, so it can be spliced into the
+output as it is. Every node is
+positioned at `info`. A syntax error comes back as an error tree at `info`,
+whose message says where in `code` the error is.
+
+`std/macros` offers the same two procs, returning a `NimNode`.
 
 
 ### Validation

@@ -18,12 +18,11 @@ include ".." / lib / compat2
 import lifter
 import ".." / nimony / [nimony_model, typenav, langmodes, sizeof]
 
-export RcField, DataField
+export RcField, DataField, RootIdxField
 
 type
   EContext* = object
     dir*, main*, ext*: string
-    nestedIn*: seq[(StmtKind, SymId)]
     dynlibs*: Table[StrId, seq[(SymId, StrId, SymId)]]
     strLits*: Table[string, SymId]
     newTypes*: Table[string, SymId]
@@ -34,10 +33,18 @@ type
     sizeofCache*: SizeofCache  ## shared size-by-symbol memoization
     bits*: int
     bigEndian*: bool
+    inAsmBody*: bool      ## inside an `{.assembler.}` body: its `while true` and
+                          ## `break` are the back end's, passed through as Leng
+    nativeBackend*: bool  ## targeting arkham+nifasm (no C): the synthesized
+                          ## `main` terminates through `cExit`, and see
+                          ## `dynlibIsStaticImport` below.
+    crtEntry*: bool       ## native, linked with libc by the system linker: crt's
+                          ## `_start` calls `main`, which returns like the C
+                          ## backend's instead of terminating through `cExit`.
+    isWindows*: bool      ## target OS is Windows: the entry point receives no
+                          ## argc/argv/envp, and `dynlib` names an import
+                          ## library rather than something to load at runtime.
 
-    breaks*: seq[SymId] # how to translate `break`
-    continues*: seq[SymId] # how to translate `continue`
-    exceptLabels*: seq[SymId] # how to translate `except`
     instId*: int # per forStmt
     tmpId*: int # per proc
     resultSym*: SymId
@@ -47,6 +54,38 @@ type
     liftingCtx*: ref LiftingCtx
     importedModuleSuffixes*: seq[string]
     initBody*: TokenBuf
+
+proc dynlibIsStaticImport*(e: EContext): bool {.inline.} =
+  ## How `{.dynlib.}` on an `importc` proc is mapped, which is hexer's call to
+  ## make and depends on BOTH the target OS and the backend.
+  ##
+  ## On Windows a `dynlib` is an import LIBRARY: the symbol is bound through the
+  ## image's import table, filled in by the loader before the first instruction
+  ## of the process runs. The native backend needs the `(dynlib …)` pragma to
+  ## build that table itself, so the annotation is passed on to Leng. Everywhere
+  ## else it is dropped and the declaration stays an ordinary prototype:
+  ##
+  ##   * Windows + C/LLVM — the linker binds it from the import library
+  ##     (kernel32 and friends are linked implicitly by every toolchain).
+  ##   * Posix + native — a static, libc-free image has no dynamic section to
+  ##     import through in the first place.
+  ##
+  ## The remaining case, Posix + C/LLVM, is the only one that keeps the runtime
+  ## loader lowering in `trProc` (`dlopen`/`dlsym` behind a function-pointer
+  ## global). Handing Windows to that lowering is not merely redundant, it
+  ## cannot work: `system/dyncalls` imports `LoadLibraryA` and `GetProcAddress`
+  ## from kernel32 with `dynlib`, and those two ARE the loader — resolving them
+  ## through it means the module init calls `nimLoadLibrary("kernel32")`, which
+  ## jumps through a function pointer that the same init only assigns further
+  ## down. A call to address 0 before the process can print anything.
+  e.isWindows
+
+proc usesRuntimeDynlibLoader*(e: EContext): bool {.inline.} =
+  ## True when a `dynlib` importc proc is replaced by a function-pointer global
+  ## that the module init resolves at run time. The inverse of
+  ## `dynlibIsStaticImport` for the C/LLVM backends; the native backend never
+  ## emits loader stubs.
+  not e.nativeBackend and not e.dynlibIsStaticImport
 
 proc getTmpId*(e: var EContext): int {.inline.} =
   result = e.tmpId
@@ -68,27 +107,6 @@ proc error*(e: var EContext; msg: string) {.noreturn.} =
   quit 1
 
 
-proc takeParRi*(e: var EContext; dest: var TokenBuf; c: var Cursor) =
-  if c.kind == ParRi:
-    dest.add c
-    consumeParRi c
-  else:
-    error e, "expected ')', but got: ", c
-
-proc skipParRi*(e: var EContext; c: var Cursor) =
-  if c.kind == ParRi:
-    consumeParRi c
-  else:
-    error e, "expected ')', but got: ", c
-
-template loop*(e: var EContext; dest: var TokenBuf; c: var Cursor; body: untyped) =
-  while true:
-    case c.kind
-    of ParRi:
-      dest.add c
-      inc c
-      break
-    of EofToken:
-      error e, "expected ')', but EOF reached"
-    else: discard
-    body
+# The classic `takeParRi`/`skipParRi`/`loop` helpers are gone: they required
+# a physical close token, which ParRi elision removes. Use the bounded-scope
+# API (`into`/`takeInto`/`enterScope`+`leaveScope`) instead.

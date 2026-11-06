@@ -20,6 +20,11 @@ import ".." / ".." / "lib" / nifcdecl        # stmtKind/exprKind, tag enums
 import ".." / ".." / "models" / tags          # *TagId ordinals for synthesis
 import patchsets
 
+include ".." / ".." / "lib" / compat2   # getOrQuit (host Nim)
+import ".." / nifmodules                      # MainModule (type context, threaded through)
+import intrinsiceffects                       # is this `(instr …)` a pure value?
+import ".." / typenav                         # getNominalType — the temp's declared type
+
 type
   AccessInfo = object
     arrSym: SymId
@@ -31,25 +36,31 @@ type
     patchset: Patchset
     synth: seq[TokenBuf]
     tempCounter: int
-    moduleSuffix: string
+    m: ptr MainModule  ## module type context; nil ⇒ emit `.` and let the backend
+                       ## re-infer (what the self-tests, which parse a body in
+                       ## isolation, still do)
 
-proc createContext(orig: ptr TokenBuf; moduleSuffix: string): Context =
+proc createContext(orig: ptr TokenBuf;
+                   m: ptr MainModule): Context =
   Context(orig: orig,
           patchset: initPatchset(orig),
           synth: @[],
           tempCounter: 0,
-          moduleSuffix: moduleSuffix)
+          m: m)
 
 proc freshTempName(c: var Context): string =
   inc c.tempCounter
-  result = "iv.p." & $c.tempCounter & "." & c.moduleSuffix
+  # A pointer induction variable is a LOCAL of this body, so its name is a
+  # local's: `<ident>.<disamb>`. The backtick keeps it out of the source
+  # namespace, like every other minted name here.
+  result = "`iv.p." & $c.tempCounter
 
 # ---- pattern detection ----------------------------------------------------
 
 proc isIvIncPattern(c: Cursor; outIvSym: var SymId): bool =
   ## Matches `(asgn lhs (add T lhs 1))`. Sets `outIvSym` to `lhs`'s id.
   if c.kind != TagLit: return false
-  if c.stmtKind notin {AsgnS, StoreS}: return false
+  if c.stmtKind != AsgnS: return false
   var probe = c
   inc probe                                  # past `(asgn`
   if probe.kind != Symbol: return false
@@ -67,8 +78,7 @@ proc isIvIncPattern(c: Cursor; outIvSym: var SymId): bool =
   return true
 
 proc loopBodyCursor(loopCursor: Cursor): Cursor =
-  ## Cursor at the loop body. Handles `(while cond body)` and
-  ## `(loop pre cond body after)`.
+  ## Cursor at the loop body. Handles `(while cond body)` and `(loop body)`.
   result = loopCursor
   case loopCursor.stmtKind
   of WhileS:
@@ -76,9 +86,12 @@ proc loopBodyCursor(loopCursor: Cursor): Cursor =
     skip result                              # past cond
   of LoopS:
     inc result                               # past `(loop`
-    skip result                              # past before-cond
-    skip result                              # past cond
   else: discard
+
+proc writeTargetOf(start: Cursor): Cursor =
+  ## The lvalue a statement writes: `(asgn dest src)` → `dest`.
+  result = start
+  inc result                                 # past the tag
 
 proc countWritesOf(start: Cursor; sym: SymId; counter: var int) =
   ## Counts Symbol-LHS assignments to `sym` anywhere in the subtree at `start`,
@@ -86,9 +99,8 @@ proc countWritesOf(start: Cursor; sym: SymId; counter: var int) =
   if not start.hasMore: return
   case start.kind
   of TagLit:
-    if start.stmtKind in {AsgnS, StoreS}:
-      var lhs = start
-      inc lhs
+    if start.stmtKind == AsgnS:
+      let lhs = writeTargetOf(start)
       if lhs.kind == Symbol and symId(lhs) == sym:
         inc counter
     var n = start
@@ -107,9 +119,9 @@ proc scanBody(c: var Context; n: Cursor;
   if isIvIncPattern(n, ivSym):
     candidates.add (ivSym, cursorToPosition(c.orig[], n))
     return                                   # iv-inc's children can't matter
-  if n.exprKind == AddrC:
+  if n.exprKind in AddrKinds:
     var probe = n
-    inc probe                                # past `(addr`
+    inc probe                                # past `(addr`/`(haddr`
     while probe.hasMore:
       if probe.kind == Symbol:
         addrTaken.incl symId(probe)
@@ -123,6 +135,65 @@ proc scanBody(c: var Context; n: Cursor;
   m.loopInto:
     scanBody(c, m, candidates, addrTaken)
     skip m
+
+type
+  LoopFacts = object
+    ## What the loop does to the symbols an access is rooted at. Collected once
+    ## per loop; used to decide whether the hoisted `addr base[0]` stays valid
+    ## for the whole loop (see `baseIsStable`).
+    assigned: HashSet[SymId]   ## symbol-LHS writes anywhere in the loop
+    addrTaken: HashSet[SymId]  ## `(addr S)` / `(haddr S)` anywhere in the loop
+    hasCall: bool              ## a callee can rebind a global or an escaped local
+    m: ptr MainModule          ## to ask a row whether an `(instr …)` is pure;
+                               ## nil ⇒ every intrinsic counts as a call
+
+proc collectLoopFacts(n: Cursor; f: var LoopFacts) =
+  if not n.hasMore or n.kind != TagLit: return
+  if n.stmtKind == AsgnS:
+    let lhs = writeTargetOf(n)
+    if lhs.kind == Symbol: f.assigned.incl symId(lhs)
+  # An `(instr …)` counts unless its row is `efPure`: the loop rewrites below
+  # hoist an address and assume nothing in the body wrote the memory it names, and
+  # a `volatileStore` in the loop is exactly something that did. `Ctz` and friends
+  # keep the loop rewritable, which is the whole reason this is per-row.
+  if n.stmtKind == CallS or n.exprKind == CallC: f.hasCall = true
+  elif (n.stmtKind == InstrS or n.exprKind == InstrC) and
+       not (f.m != nil and instrIsPure(f.m[], n)): f.hasCall = true
+  if n.exprKind in AddrKinds:
+    var probe = n
+    inc probe
+    while probe.hasMore:
+      if probe.kind == Symbol:
+        f.addrTaken.incl symId(probe)
+        break
+      elif probe.kind == TagLit:
+        inc probe
+      else:
+        inc probe
+  var m = n
+  m.loopInto:
+    collectLoopFacts(m, f)
+    skip m
+
+proc baseIsStable(c: var Context; base: Cursor; f: LoopFacts): bool =
+  ## Is `addr base[0]` — the address this rewrite hoists out of the loop — the
+  ## same on every iteration?
+  ##
+  ## For an ARRAY base it always is: the address is the variable's own storage,
+  ## which no assignment moves (`arr = other` copies *into* it) and no callee can
+  ## relocate. That is the case this pass was written for.
+  ##
+  ## For a POINTER-like base (`ptr`/`aptr`/`flexarray`, all of which `typenav`
+  ## admits under `(at …)`) the hoisted address IS the base's value, so a loop
+  ## that rebinds it — directly, through a taken address, or through a callee
+  ## that can reach it — would leave the pointer walking the old buffer. The
+  ## same holds when the type does not resolve at all: unproven is not proven.
+  if base.kind != Symbol: return false
+  if c.m != nil:
+    let t = navigateToObjectBody(c.m[], getType(c.m[], base))
+    if t.typeKind == ArrayT: return true
+  let s = symId(base)
+  result = s notin f.assigned and s notin f.addrTaken and not f.hasCall
 
 proc findIV(c: var Context; body: Cursor): tuple[ivSym: SymId, incPos: int, found: bool] =
   ## Identifies the loop body's induction variable (exactly one
@@ -193,7 +264,14 @@ proc addPtrVarDecl(c: var Context; p: string; atCursor: Cursor): int =
   if info.isValid: buf.appendLineInfo info
   buf.addSymDef p
   buf.addDotToken()                          # pragmas
-  buf.addDotToken()                          # type — inferred from init
+  # Declared type: `(ptr typeof <atCursor>)`. Spelled out rather than left to the
+  # backend's re-inference, for the same reason as `cse.emitTempType`.
+  if c.m == nil:
+    buf.addDotToken()                        # no type context: self-tests only
+  else:
+    buf.openTag TagId(ord(PtrTagId))
+    buf.addSubtree getNominalType(c.m[], atCursor)
+    buf.closeTag()
   buf.openTag TagId(ord(AddrTagId))
   buf.addSubtree atCursor
   buf.closeTag()                             # close addr
@@ -237,11 +315,17 @@ proc transformLoop(c: var Context; n: var Cursor) =
   if ivInfo.found:
     var accesses: seq[AccessInfo] = @[]
     collectAccesses(c, body, ivInfo.ivSym, accesses)
+    var facts = LoopFacts(assigned: initHashSet[SymId](),
+                          addrTaken: initHashSet[SymId](), m: c.m)
+    collectLoopFacts(body, facts)
     var arrToP = initTable[SymId, string]()
     for acc in accesses:
+      var base = acc.atCursor
+      inc base                               # past `(at` → the base
+      if not baseIsStable(c, base, facts): continue
       var p: string
       if acc.arrSym in arrToP:
-        p = arrToP[acc.arrSym]
+        p = arrToP.getOrQuit(acc.arrSym)
       else:
         p = freshTempName(c)
         arrToP[acc.arrSym] = p
@@ -256,12 +340,49 @@ proc transformLoop(c: var Context; n: var Cursor) =
   n.loopInto:
     tr(c, n)
 
+proc registerDecl(c: var Context; n: Cursor) =
+  ## Records a local's declared type in the current typenav scope, so that a
+  ## later `(at LOCAL iv)` can be typed. `optdriver.rebuildTree` opens the scope
+  ## and registers the proc's *params*; the body's locals are ours to add, and
+  ## since `tr` walks in source order every decl is registered before the loops
+  ## that can use it. Mirrors the `VarS` case of `aliasing.walk`.
+  ##
+  ## Without this, a body-local array whose type is a nominal symbol — e.g. the
+  ## 32-byte word buffer a `char` set operation desugars to,
+  ## `` `t.0.IAarrayAuS8ZS32. `` rather than a literal `(array …)` — resolves to
+  ## the `(err)` sentinel and `addPtrVarDecl` bakes `(ptr (err))` into the
+  ## declared type, which the backends then reject.
+  if c.m == nil: return
+  var probe = n
+  var nameStart = default(Cursor)
+  var typeStart = default(Cursor)
+  probe.into:
+    nameStart = probe
+    skip probe                             # name
+    if probe.hasMore: skip probe           # pragmas
+    if probe.hasMore:
+      typeStart = probe
+      skip probe                           # type
+    while probe.hasMore: skip probe
+  if nameStart.kind == SymbolDef and not cursorIsNil(typeStart):
+    c.m[].registerLocal(nameStart.symId, typeStart)
+
 proc tr(c: var Context; n: var Cursor) =
   if not n.hasMore: return
   case n.kind
   of TagLit:
-    if n.stmtKind in {WhileS, LoopS}:
+    case n.stmtKind
+    of WhileS, LoopS:
       transformLoop(c, n)
+    of VarS, GvarS, TvarS, ConstS:
+      registerDecl(c, n)
+      n.loopInto:
+        tr(c, n)
+    of ScopeS:
+      if c.m != nil: c.m[].openScope()
+      n.loopInto:
+        tr(c, n)
+      if c.m != nil: c.m[].closeScope()
     else:
       n.loopInto:
         tr(c, n)
@@ -270,11 +391,12 @@ proc tr(c: var Context; n: var Cursor) =
 
 # ---- public entry --------------------------------------------------------
 
-proc runInductionVariables*(buf: var TokenBuf; moduleSuffix = "M") =
+proc runInductionVariables*(buf: var TokenBuf;
+                            m: ptr MainModule = nil) =
   ## Two-phase IV strength reduction: record rewrite patches, then rebuild
   ## `buf` with pointer decls hoisted before each loop, pointer bumps before
   ## the iv-inc, and `(deref p)` substituted for each `(at arr iv)` access.
-  var ctx = createContext(addr buf, moduleSuffix)
+  var ctx = createContext(addr buf, m)
   var n = beginRead(buf)
   tr(ctx, n)
   if not ctx.patchset.isEmpty:
@@ -307,18 +429,18 @@ when isMainModule:
       "(stmts (asgn i.0.M 0) (while (lt (i 32) i.0.M 10) (stmts (asgn x.0.M (at arr.0.M i.0.M)) (asgn i.0.M (add (i 32) i.0.M 1)))))")
     runInductionVariables buf
     assertSame(buf,
-      "(stmts (asgn i.0.M 0) (var :iv.p.1.M . . (addr (at arr.0.M i.0.M))) " &
-      "(while (lt (i 32) i.0.M 10) (stmts (asgn x.0.M (deref iv.p.1.M)) " &
-      "(asgn iv.p.1.M (addr (pat iv.p.1.M 1))) (asgn i.0.M (add (i 32) i.0.M 1)))))")
+      "(stmts (asgn i.0.M 0) (var :`iv.p.1 . . (addr (at arr.0.M i.0.M))) " &
+      "(while (lt (i 32) i.0.M 10) (stmts (asgn x.0.M (deref `iv.p.1)) " &
+      "(asgn `iv.p.1 (addr (pat `iv.p.1 1))) (asgn i.0.M (add (i 32) i.0.M 1)))))")
 
   block multiple_accesses_same_array:
     var buf = parse(
       "(stmts (while (lt (i 32) i.0.M 10) (stmts (asgn x.0.M (at arr.0.M i.0.M)) (asgn y.0.M (at arr.0.M i.0.M)) (asgn i.0.M (add (i 32) i.0.M 1)))))")
     runInductionVariables buf
     assertSame(buf,
-      "(stmts (var :iv.p.1.M . . (addr (at arr.0.M i.0.M))) " &
-      "(while (lt (i 32) i.0.M 10) (stmts (asgn x.0.M (deref iv.p.1.M)) " &
-      "(asgn y.0.M (deref iv.p.1.M)) (asgn iv.p.1.M (addr (pat iv.p.1.M 1))) " &
+      "(stmts (var :`iv.p.1 . . (addr (at arr.0.M i.0.M))) " &
+      "(while (lt (i 32) i.0.M 10) (stmts (asgn x.0.M (deref `iv.p.1)) " &
+      "(asgn y.0.M (deref `iv.p.1)) (asgn `iv.p.1 (addr (pat `iv.p.1 1))) " &
       "(asgn i.0.M (add (i 32) i.0.M 1)))))")
 
   block multiple_arrays:
@@ -326,11 +448,11 @@ when isMainModule:
       "(stmts (while (lt (i 32) i.0.M 10) (stmts (asgn x.0.M (at arr1.0.M i.0.M)) (asgn y.0.M (at arr2.0.M i.0.M)) (asgn i.0.M (add (i 32) i.0.M 1)))))")
     runInductionVariables buf
     assertSame(buf,
-      "(stmts (var :iv.p.1.M . . (addr (at arr1.0.M i.0.M))) " &
-      "(var :iv.p.2.M . . (addr (at arr2.0.M i.0.M))) " &
-      "(while (lt (i 32) i.0.M 10) (stmts (asgn x.0.M (deref iv.p.1.M)) " &
-      "(asgn y.0.M (deref iv.p.2.M)) (asgn iv.p.1.M (addr (pat iv.p.1.M 1))) " &
-      "(asgn iv.p.2.M (addr (pat iv.p.2.M 1))) (asgn i.0.M (add (i 32) i.0.M 1)))))")
+      "(stmts (var :`iv.p.1 . . (addr (at arr1.0.M i.0.M))) " &
+      "(var :`iv.p.2 . . (addr (at arr2.0.M i.0.M))) " &
+      "(while (lt (i 32) i.0.M 10) (stmts (asgn x.0.M (deref `iv.p.1)) " &
+      "(asgn y.0.M (deref `iv.p.2)) (asgn `iv.p.1 (addr (pat `iv.p.1 1))) " &
+      "(asgn `iv.p.2 (addr (pat `iv.p.2 1))) (asgn i.0.M (add (i 32) i.0.M 1)))))")
 
   block iv_used_outside_at:
     assertUnchanged(
@@ -338,6 +460,28 @@ when isMainModule:
 
   block no_iv_no_transform:
     assertUnchanged("(stmts (while c.0.M (stmts (asgn x.0.M 1))))")
+
+  block base_reassigned_in_loop:
+    # The hoisted `addr arr[0]` is only the loop-invariant address of a stable
+    # storage if `arr` is an array. Here the type does not resolve (no module
+    # context), and the loop rebinds `arr`, so the rewrite would leave the
+    # pointer walking the old buffer.
+    assertUnchanged(
+      "(stmts (while (lt (i 32) i.0.M 10) (stmts (asgn x.0.M (at arr.0.M i.0.M)) " &
+      "(asgn arr.0.M other.0.M) (asgn i.0.M (add (i 32) i.0.M 1)))))")
+
+  block call_in_loop_with_unresolved_base:
+    # Same reasoning one step removed: a callee can rebind a global or an escaped
+    # local. With a resolved ARRAY type this transforms as before — the address
+    # of an array variable is not something a callee can move.
+    assertUnchanged(
+      "(stmts (while (lt (i 32) i.0.M 10) (stmts (asgn x.0.M (at arr.0.M i.0.M)) " &
+      "(call f.0.M) (asgn i.0.M (add (i 32) i.0.M 1)))))")
+
+  block base_addr_taken_in_loop:
+    assertUnchanged(
+      "(stmts (while (lt (i 32) i.0.M 10) (stmts (asgn x.0.M (at arr.0.M i.0.M)) " &
+      "(call f.0.M (addr arr.0.M)) (asgn i.0.M (add (i 32) i.0.M 1)))))")
 
   block iv_written_twice_disqualifies:
     assertUnchanged(
@@ -352,8 +496,8 @@ when isMainModule:
       "(stmts (while c.0.M (stmts (while (lt (i 32) i.0.M 10) (stmts (asgn x.0.M (at arr.0.M i.0.M)) (asgn i.0.M (add (i 32) i.0.M 1)))))))")
     runInductionVariables buf
     assertSame(buf,
-      "(stmts (while c.0.M (stmts (var :iv.p.1.M . . (addr (at arr.0.M i.0.M))) " &
-      "(while (lt (i 32) i.0.M 10) (stmts (asgn x.0.M (deref iv.p.1.M)) " &
-      "(asgn iv.p.1.M (addr (pat iv.p.1.M 1))) (asgn i.0.M (add (i 32) i.0.M 1)))))))")
+      "(stmts (while c.0.M (stmts (var :`iv.p.1 . . (addr (at arr.0.M i.0.M))) " &
+      "(while (lt (i 32) i.0.M 10) (stmts (asgn x.0.M (deref `iv.p.1)) " &
+      "(asgn `iv.p.1 (addr (pat `iv.p.1 1))) (asgn i.0.M (add (i 32) i.0.M 1)))))))")
 
   echo "induction_variables.nim: all self-tests passed"

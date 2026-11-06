@@ -4,8 +4,13 @@
 # See the file "license.txt", included in this
 # distribution, for details about the copyright.
 
+when defined(nimony):
+  # `Scope.up` is a nilable chain: the toplevel scope has nothing above it.
+  {.feature: "lenientnils".}
+
 import std / [tables]
 include ".." / lib / nifprelude
+include ".." / lib / compat2
 import nimony_model, identstyle
 
 const
@@ -47,7 +52,7 @@ proc commitShadowScope*(s: Scope) =
 
 proc rollbackShadowScope*(s: Scope) =
   let last = s.undo.len - 1
-  for k, oldLen in pairs(s.undo[last]):
+  for k, oldLen in uncheckedBorrow(s.undo[last]):
     # `k` was recorded here when we shadowed it, so the entry exists; use
     # `mgetOrPut` rather than `[]` to stay non-raising.
     s.tab.mgetOrPut(k, @[]).shrink oldLen

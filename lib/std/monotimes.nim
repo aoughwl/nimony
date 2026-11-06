@@ -7,6 +7,8 @@
 #    distribution, for details about the copyright.
 #
 
+import std/times
+
 ##[
 The `std/monotimes` module implements monotonic timestamps. A monotonic
 timestamp represents the time that has passed since some system defined
@@ -44,13 +46,12 @@ type
 
 when defined(macosx):
   type
-    MachTimebaseInfoData {.pure, final, importc: "mach_timebase_info_data_t",
-        header: "<mach/mach_time.h>".} = object
-      numer {.exportc.} , denom {.exportc.} : int32
+    MachTimebaseInfoData {.pure, final.} = object ## mach_timebase_info_data_t
+      numer, denom: int32
 
-  proc mach_absolute_time(): int64 {.importc, header: "<mach/mach.h>".}
-  proc mach_timebase_info(info: var MachTimebaseInfoData) {.importc,
-    header: "<mach/mach_time.h>".}
+  proc mach_absolute_time(): int64 {.importc: "mach_absolute_time".}
+  proc mach_timebase_info(info: var MachTimebaseInfoData) {.
+    importc: "mach_timebase_info".}
 
 when defined(js):
   proc getJsTicks: float =
@@ -86,6 +87,15 @@ elif defined(windows):
   proc QueryPerformanceFrequency(res: var uint64) {.
     importc: "QueryPerformanceFrequency", stdcall, dynlib: "kernel32".}
 
+when defined(wasm32) and defined(standalone):
+  var gWasmTickFallback {.threadvar.}: int64
+  proc wasmMonoTicks(): int64 =
+    # Strictly-increasing counter: ordering holds, durations are ~zero. A
+    # real host clock (performance.now via an env import) arrives with the
+    # ward-bridge B6 host-imports mechanism; swapping it in here is one line.
+    inc gWasmTickFallback
+    result = gWasmTickFallback
+
 proc getMonoTime*(): MonoTime {.tags: [TimeEffect].} =
   ## Returns the current `MonoTime` timestamp.
   ##
@@ -93,7 +103,10 @@ proc getMonoTime*(): MonoTime {.tags: [TimeEffect].} =
   ## this proc calls `window.performance.now()`.
   ## See [MDN](https://developer.mozilla.org/en-US/docs/Web/API/Performance/now)
   ## for more information.
-  when defined(js):
+  when defined(wasm32) and defined(standalone):
+    # Freestanding wasm has no clock instruction; see wasmMonoTicks.
+    result = MonoTime(ticks: wasmMonoTicks())
+  elif defined(js):
     let ticks = getJsTicks()
     result = MonoTime(ticks: (ticks * 1_000_000_000).int64)
   elif defined(macosx):
@@ -128,17 +141,17 @@ func ticks*(t: MonoTime): int64 =
 func `$`*(t: MonoTime): string =
   $t.ticks
 
-# func `-`*(a, b: MonoTime): Duration =
-#   ## Returns the difference between two `MonoTime` timestamps as a `Duration`.
-#   initDuration(nanoseconds = (a.ticks - b.ticks))
+func `-`*(a, b: MonoTime): Duration =
+  ## Returns the difference between two `MonoTime` timestamps as a `Duration`.
+  initDuration(nanoseconds = (a.ticks - b.ticks))
 
-# func `+`*(a: MonoTime, b: Duration): MonoTime =
-#   ## Increases `a` by `b`.
-#   MonoTime(ticks: a.ticks + b.inNanoseconds)
+func `+`*(a: MonoTime, b: Duration): MonoTime =
+  ## Increases `a` by `b`.
+  MonoTime(ticks: a.ticks + b.inNanoseconds)
 
-# func `-`*(a: MonoTime, b: Duration): MonoTime =
-#   ## Reduces `a` by `b`.
-#   MonoTime(ticks: a.ticks - b.inNanoseconds)
+func `-`*(a: MonoTime, b: Duration): MonoTime =
+  ## Reduces `a` by `b`.
+  MonoTime(ticks: a.ticks - b.inNanoseconds)
 
 func `<`*(a, b: MonoTime): bool =
   ## Returns true if `a` happened before `b`.

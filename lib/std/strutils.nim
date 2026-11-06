@@ -6,6 +6,7 @@
 ## classes; see each constant for details.
 
 {.feature: "lenientnils".}
+{.feature: "staticContracts".}
 
 import std/[assertions, parseutils]
 
@@ -60,12 +61,71 @@ const
 func spaces*(n: int): string =
   ## Returns a string with `n` space characters.
   result = newString(n)
-  for i in 0 ..< n: result[i] = ' '
+  for i in 0 ..< result.len: result[i] = ' '
+
+func align*(s: string; count: Natural; padding = ' '): string =
+  ## Aligns a string `s` with `padding`, so that it is of length `count`.
+  ##
+  ## `padding` characters (by default spaces) are added before `s` resulting in
+  ## right alignment. If `s.len >= count`, no spaces are added and `s` is
+  ## returned unchanged. If you need to left align a string use the `alignLeft
+  ## func<#alignLeft,string,Natural,char>`_.
+  runnableExamples:
+    assert align("abc", 4) == " abc"
+    assert align("a", 0) == "a"
+    assert align("1232", 6) == "  1232"
+    assert align("1232", 6, '#') == "##1232"
+  if s.len < count:
+    result = newStringOfCap(count)
+    for i in s.len ..< count: result.add padding
+    result.add s
+  else:
+    result = s
+
+func alignLeft*(s: string; count: Natural; padding = ' '): string =
+  ## Left-aligns a string `s` with `padding`, so that it is of length `count`.
+  ##
+  ## `padding` characters (by default spaces) are added after `s` resulting in
+  ## left alignment. If `s.len >= count`, no spaces are added and `s` is
+  ## returned unchanged. If you need to right align a string use the `align
+  ## func<#align,string,Natural,char>`_.
+  runnableExamples:
+    assert alignLeft("abc", 4) == "abc "
+    assert alignLeft("a", 0) == "a"
+    assert alignLeft("1232", 6) == "1232  "
+    assert alignLeft("1232", 6, '#') == "1232##"
+  if s.len < count:
+    result = newStringOfCap(count)
+    result.add s
+    for i in s.len ..< count: result.add padding
+  else:
+    result = s
+
+func center*(s: string; width: int; fillChar: char = ' '): string =
+  ## Returns the contents of `s` centered in a string `width` long using
+  ## `fillChar` (default: space) as padding. If the padding cannot be split
+  ## evenly, the extra `fillChar` goes on the right.
+  ##
+  ## The original string is returned if `width` is less than or equal
+  ## to `s.len`.
+  runnableExamples:
+    let a = "foo"
+    doAssert a.center(2) == "foo"
+    doAssert a.center(5) == " foo "
+    doAssert a.center(6) == " foo  "
+  if width <= s.len:
+    result = s
+  else:
+    result = newStringOfCap(width)
+    let leftPadding = (width - s.len) div 2
+    for i in 0 ..< leftPadding: result.add fillChar
+    result.add s
+    for i in leftPadding + s.len ..< width: result.add fillChar
 
 func repeat*(c: char; n: int): string =
   ## Returns a string made of `c` repeated `n` times.
   result = newString(n)
-  for i in 0 ..< n: result[i] = c
+  for i in 0 ..< result.len: result[i] = c
 
 func repeat*(s: string; n: int): string =
   ## Returns `s` repeated `n` times.
@@ -179,15 +239,18 @@ func `$`*(x: cstring): string =
 
 func `$`*(x: char): string =
   ## Returns a one-character string containing `x`.
-  result = newString(1)
-  result[0] = x
+  result = newStringOfCap(1)
+  result.add x
 
 func substrEq(s: string, pos: int, substr: string): bool =
   var length = substr.len
   if length > 0:
+    if pos < 0: return false
     var i = 0
-    while i < length and pos + i < s.len and s[pos + i] == substr[i]:
+    var k = pos
+    while i < length and k < s.len and s[k] == substr[i]:
       inc i
+      inc k
     i == length
   else:
     false
@@ -203,7 +266,7 @@ template stringHasSep(s: string, index: int, sep: string): bool =
 
 template splitCommon(s, sep, maxsplit, sepLen) {.untyped.} =
   ## Common code for split procs
-  var last = 0
+  var last: Natural = 0
   var splits = maxsplit
 
   while last <= len(s):
@@ -213,6 +276,10 @@ template splitCommon(s, sep, maxsplit, sepLen) {.untyped.} =
     if splits == 0: last = len(s)
     yield substr(s, first, last-1)
     if splits == 0: break
+    # `last == len(s)`: no separator left, and the step below would end the
+    # loop anyway (`sepLen >= 1`). Leaving here tells the prover `last <
+    # len(s)`, which the inner `while` made it forget.
+    if last >= len(s): break
     dec(splits)
     inc(last, sepLen)
 
@@ -280,7 +347,10 @@ iterator split*(s: string; sep: char; maxsplit: int = -1): string =
 
 iterator split*(s: string; sep: string; maxsplit: int = -1): string =
   ## Splits the string `s` into substrings using the separator `sep`.
-  let sepLen = if sep.len == 0: 1 else: sep.len
+  # Typed as a range, not `let sepLen = if ...`: a declared bound survives the
+  # `yield` in `splitCommon`, which wipes what the flow facts know.
+  var sepLen: range[1..MaxContainerLen] = 1
+  if sep.len > 0: sepLen = sep.len
   splitCommon(s, sep, maxsplit, sepLen)
 
 iterator splitLines*(s: string; keepEol = false): string =
@@ -320,7 +390,7 @@ iterator splitWhitespace*(s: string; maxsplit: int = -1): string =
   ##   ```
   ##
   ## ...generates "foo", "bar", "baz".
-  var last = 0
+  var last: Natural = 0
   var splits = maxsplit
   while last < len(s):
     while last < len(s) and s[last] in Whitespace: inc(last)
@@ -352,6 +422,80 @@ func splitWhitespace*(s: string; maxsplit: int = -1): seq[string] =
   ## The same as the `splitWhitespace` iterator, but returns a sequence of substrings.
   accResult(splitWhitespace(s, maxsplit))
 
+func indent*(s: string; count: Natural; padding: string = " "): string =
+  ## Indents each line in `s` by `count` amount of `padding`.
+  ##
+  ## **Note:** This does not preserve the new line characters used in `s`.
+  runnableExamples:
+    doAssert indent("First line\c\l and second line.", 2) ==
+             "  First line\l   and second line."
+  result = ""
+  var first = true
+  for line in splitLines(s):
+    if not first: result.add '\n'
+    first = false
+    for j in 0 ..< count: result.add padding
+    result.add line
+
+func unindent*(s: string; count: Natural = high(int);
+               padding: string = " "): string =
+  ## Unindents each line in `s` by up to `count` amount of `padding`.
+  ##
+  ## **Note:** This does not preserve the new line characters used in `s`.
+  runnableExamples:
+    doAssert "    Hello\n      There\n".unindent() == "Hello\nThere\n"
+    doAssert "    Hello\n      There\n".unindent(2) == "  Hello\n    There\n"
+  result = ""
+  var first = true
+  for line in splitLines(s):
+    if not first: result.add '\n'
+    first = false
+    var pos = 0
+    var removed = 0
+    while removed < count and substrEq(line, pos, padding):
+      inc pos, padding.len
+      inc removed
+    result.add substr(line, pos)
+
+func indentation*(s: string): Natural =
+  ## Returns the amount of indentation all lines of `s` have in common,
+  ## ignoring lines that consist only of whitespace.
+  result = high(int)
+  for line in splitLines(s):
+    for i in 0 ..< line.len:
+      if i >= result: break
+      elif line[i] != ' ':
+        result = i
+        break
+  if result == high(int):
+    result = 0
+
+func dedent*(s: string; count: Natural): string =
+  ## Unindents each line in `s` by `count` spaces.
+  ##
+  ## **Note:** This does not preserve the new line characters used in `s`.
+  unindent(s, count, " ")
+
+func dedent*(s: string): string =
+  ## Unindents each line in `s` by the amount of indentation that all
+  ## lines of `s` share (see `indentation`). Unlike `unindent`, relative
+  ## indentation is preserved. It only supports spaces as padding.
+  ##
+  ## **Note:** This does not preserve the new line characters used in `s`.
+  runnableExamples:
+    doAssert "    Hello\n      There\n".dedent() == "Hello\n  There\n"
+  unindent(s, indentation(s), " ")
+
+func join*(a: openArray[string]; sep: string = ""): string =
+  ## Concatenates all strings in `a`, separating them with `sep`.
+  runnableExamples:
+    doAssert join(["A", "B", "Conclusion"], " -> ") == "A -> B -> Conclusion"
+    doAssert join(["ab", "cd"]) == "abcd"
+  result = ""
+  for i in 0 ..< a.len:
+    if i > 0: result.add sep
+    result.add a[i]
+
 func delete*(s: var string, slice: Slice[int]) =
   ## Deletes the items `s[slice]`.
   ##
@@ -374,14 +518,13 @@ func delete*(s: var string, slice: Slice[int]) =
     return
   if slice.b >= slice.a:
     var i = slice.a
-    var j = slice.b + 1
-    var newLen = s.len - j + i
     # if j < s.len: moveMem(addr s[i], addr s[j], s.len - j) # pending benchmark
-    while i < newLen:
+    for j in slice.b + 1 ..< s.len:
+      # `i` starts at `slice.a <= slice.b < j` and both advance together
+      {.assume: i < j.}
       s[i] = s[j]
-      inc(i)
-      inc(j)
-    shrink(s, newLen)
+      inc i
+    shrink(s, i)
 
 func continuesWith*(s, prefix: string; start: int): bool =
   ## Returns true if `s` continues with `prefix` at position `start`.
@@ -393,11 +536,14 @@ func continuesWith*(s, prefix: string; start: int): bool =
   ## * `endsWith func<#endsWith,string,string>`_
   if prefix.len == 0:
     return true
+  if start < 0: return false
   if prefix.len > s.len-start:
     return false
+  var k = start
   for i in 0 ..< prefix.len:
-    if s[i+start] != prefix[i]:
+    if k >= s.len or s[k] != prefix[i]:
       return false
+    inc k
   return true
 
 func startsWith*(s, prefix: string): bool =
@@ -459,9 +605,9 @@ func toLowerAscii*(s: string): string =
   ## * `normalize func<#normalize,string>`_
   runnableExamples:
     assert toLowerAscii("FooBar!") == "foobar!"
-  result = newString(s.len)
-  for i in 0 ..< s.len:
-    result[i] = toLowerAscii(s[i])
+  result = s
+  for i in 0 ..< result.len:
+    result[i] = toLowerAscii(result[i])
 
 func toUpperAscii*(c: char): char {.inline.} =
   ## Converts character `c` into upper case.
@@ -491,9 +637,9 @@ func toUpperAscii*(s: string): string =
   ## * `capitalizeAscii func<#capitalizeAscii,string>`_
   runnableExamples:
     assert toUpperAscii("FooBar!") == "FOOBAR!"
-  result = newString(s.len)
-  for i in 0 ..< s.len:
-    result[i] = toUpperAscii(s[i])
+  result = s
+  for i in 0 ..< result.len:
+    result[i] = toUpperAscii(result[i])
 
 func capitalizeAscii*(s: string): string {.inline.} =
   ## Converts the first character of string `s` into upper case.
@@ -506,9 +652,8 @@ func capitalizeAscii*(s: string): string {.inline.} =
   runnableExamples:
     assert capitalizeAscii("foo") == "Foo"
     assert capitalizeAscii("-bar") == "-bar"
-  if s.len == 0: result = ""
-  else:
-    result = s
+  result = s
+  if result.len > 0:
     result[0] = toUpperAscii(result[0])
 
 func normalize*(s: string): string =
@@ -522,16 +667,12 @@ func normalize*(s: string): string =
   runnableExamples:
     assert normalize("Foo_bar") == "foobar"
     assert normalize("Foo Bar") == "foo bar"
-  result = newString(s.len)
-  var j = 0
-  for i in 0 ..< len(s):
-    if s[i] in UppercaseLetters:
-      result[j] = chr(ord(s[i]) + (ord('a') - ord('A')))
-      inc j
-    elif s[i] != '_':
-      result[j] = s[i]
-      inc j
-  if j != s.len: shrink(result, j)
+  result = newStringOfCap(s.len)
+  for c in items(s):
+    if c >= 'A' and c <= 'Z':
+      result.add chr(ord(c) + (ord('a') - ord('A')))
+    elif c != '_':
+      result.add c
 
 func cmpIgnoreCase*(a, b: string): int =
   ## Compares two strings in a case insensitive manner. Returns:
@@ -544,13 +685,12 @@ func cmpIgnoreCase*(a, b: string): int =
     assert cmpIgnoreCase("bar", "Foo") < 0
     assert cmpIgnoreCase("Foo5", "foo4") > 0
 
-  let aLen = a.len
-  let bLen = b.len
-  let minLen = min(aLen, bLen)
-  for i in 0 ..< minLen:
+  var i = 0
+  while i < a.len and i < b.len:
     result = a[i].toLowerAscii.ord - b[i].toLowerAscii.ord
     if result != 0: return
-  result = aLen - bLen
+    inc i
+  result = a.len - b.len
 
 func cmpIgnoreStyle*(a, b: string): int =
   ## Semantically the same as `cmp(normalize(a), normalize(b))`. It
@@ -566,21 +706,19 @@ func cmpIgnoreStyle*(a, b: string): int =
   runnableExamples:
     assert cmpIgnoreStyle("foo_bar", "FooBar") == 0
     assert cmpIgnoreStyle("foo_bar_5", "FooBar4") > 0
-  let aLen = a.len
-  let bLen = b.len
   var i = 0
   var j = 0
   while true:
-    while i < aLen and a[i] == '_': inc i
-    while j < bLen and b[j] == '_': inc j
-    if i == aLen:
-      if j == bLen:
+    while i < a.len and a[i] == '_': inc i
+    while j < b.len and b[j] == '_': inc j
+    if i >= a.len:
+      if j >= b.len:
         # both cursors at the end:
         return 0
       else:
         # not yet at the end of 'b':
         return -1
-    elif j == bLen:
+    elif j >= b.len:
       return 1
     let aa = toLowerAscii(a[i])
     let bb = toLowerAscii(b[j])
@@ -591,7 +729,14 @@ func cmpIgnoreStyle*(a, b: string): int =
     inc j
   return 0
 
-func find*(s: string; sub: char; start: Natural = 0; last = -1): int =
+func lastIndex(s: string; last: int): int {.ensures: result < s.len.} =
+  ## The `last` of a search: `s.high` when `last` is negative, and clamped to
+  ## `s.high` when it lies past the end.
+  result = s.len - 1
+  if last >= 0 and last < s.len: result = last
+
+func find*(s: string; sub: char; start: Natural = 0; last = -1): int {.
+    ensures: result < s.len.} =
   ## Searches for `sub` in `s` inside range `start..last` (both ends included).
   ## If `last` is unspecified or negative, it defaults to `s.high` (the last element).
   ##
@@ -602,13 +747,12 @@ func find*(s: string; sub: char; start: Natural = 0; last = -1): int =
   ## See also:
   ## * `replace func<#replace,string,char,char>`_
   result = -1
-  let last = if last < 0: s.high else: last
-
-  for i in int(start)..last:
+  for i in int(start)..lastIndex(s, last):
     if s[i] == sub:
       return i
 
-func find*(s: string; chars: set[char]; start: Natural = 0; last = -1): int =
+func find*(s: string; chars: set[char]; start: Natural = 0; last = -1): int {.
+    ensures: result < s.len.} =
   ## Searches for `chars` in `s` inside range `start..last` (both ends included).
   ## If `last` is unspecified or negative, it defaults to `s.high` (the last element).
   ##
@@ -619,8 +763,7 @@ func find*(s: string; chars: set[char]; start: Natural = 0; last = -1): int =
   ## See also:
   ## * `multiReplace func<#multiReplace,string,varargs[]>`_
   result = -1
-  let last = if last < 0: s.high else: last
-  for i in int(start)..last:
+  for i in int(start)..lastIndex(s, last):
     if s[i] in chars:
       return i
 
@@ -649,7 +792,8 @@ func initSkipTable*(sub: string): SkipTable {.noinit.} =
   ## * `find func<#find,SkipTable,string,string,Natural,int>`_
   initSkipTable(result, sub)
 
-func find*(a: SkipTable; s, sub: string; start: Natural = 0; last = -1): int =
+func find*(a: SkipTable; s, sub: string; start: Natural = 0; last = -1): int {.
+    ensures: result <= s.len.} =
   ## Searches for `sub` in `s` inside range `start..last` using preprocessed
   ## table `a`. If `last` is unspecified, it defaults to `s.high` (the last
   ## element).
@@ -660,28 +804,31 @@ func find*(a: SkipTable; s, sub: string; start: Natural = 0; last = -1): int =
   ## * `initSkipTable func<#initSkipTable,string>`_
   ## * `initSkipTable func<#initSkipTable,SkipTable,string>`_
   let
-    last = if last < 0: s.high else: last
+    last = lastIndex(s, last)
     subLast = sub.len - 1
 
   if subLast == -1:
     # this was an empty needle string,
     # we count this as match in the first possible position:
+    if start > s.len: return -1 # there is none past the end
     return start
 
   # This is an implementation of the Boyer-Moore Horspool algorithms
   # https://en.wikipedia.org/wiki/Boyer%E2%80%93Moore%E2%80%93Horspool_algorithm
   result = -1
-  var skip = start
+  var skip = int(start)
 
-  while last - skip >= subLast:
-    var i = subLast
-    while s[skip + i] == sub[i]:
-      if i == 0:
-        return skip
-      dec i
-    inc skip, a[s[skip + subLast]]
+  # `skip <= last` follows from the second test (`subLast >= 0`); stated
+  # alone it is a fact the prover can keep, and `result < s.len` with it
+  while skip <= last and last - skip >= subLast:
+    if s.continuesWith(sub, skip):
+      return skip
+    let e = skip + subLast
+    if e >= 0 and e < s.len: inc skip, a[s[e]]
+    else: break
 
-func find*(s, sub: string; start: Natural = 0; last = -1): int =
+func find*(s, sub: string; start: Natural = 0; last = -1): int {.
+    ensures: result <= s.len.} =
   ## Searches for `sub` in `s` inside range `start..last` (both ends included).
   ## If `last` is unspecified or negative, it defaults to `s.high` (the last element).
   ##
@@ -697,14 +844,53 @@ func find*(s, sub: string; start: Natural = 0; last = -1): int =
   # TODO: use `memmem` C function like Nim 2.
   result = find(initSkipTable(sub), s, sub, start, last)
 
+func rfind*(s: string; sub: char; start: Natural = 0; last = -1): int =
+  ## Searches for `sub` in `s` inside range `start..last` (both ends included)
+  ## in reverse -- starting at high indexes and moving lower to the first
+  ## character or `start`. If `last` is unspecified or negative, it defaults to
+  ## `s.high` (the last element).
+  ##
+  ## Searching is case-sensitive. If `sub` is not in `s`, -1 is returned.
+  result = -1
+  for i in countdown(lastIndex(s, last), int(start)):
+    if s[i] == sub:
+      return i
+
+func rfind*(s: string; chars: set[char]; start: Natural = 0; last = -1): int =
+  ## Searches for `chars` in `s` inside range `start..last` (both ends included)
+  ## in reverse. If `last` is unspecified or negative, it defaults to `s.high`.
+  ##
+  ## If `s` contains none of the characters in `chars`, -1 is returned.
+  result = -1
+  for i in countdown(lastIndex(s, last), int(start)):
+    if s[i] in chars:
+      return i
+
+func rfind*(s, sub: string; start: Natural = 0; last = -1): int =
+  ## Searches for `sub` in `s` inside range `start..last` (both ends included)
+  ## in reverse. If `last` is unspecified or negative, it defaults to `s.high`.
+  ##
+  ## Searching is case-sensitive. If `sub` is not in `s`, -1 is returned.
+  if sub.len == 0:
+    let rightIndex = if last < 0: s.len else: last
+    return max(int(start), rightIndex)
+  if sub.len > s.len - start:
+    return -1
+  result = -1
+  for i in countdown(lastIndex(s, last) - sub.len + 1, int(start)):
+    var j = 0
+    var k = i
+    while j < sub.len and k < s.len and sub[j] == s[k]:
+      inc j
+      inc k
+    if j == sub.len:
+      return i
+
 func replace*(s: string; sub, by: char): string =
   ## Returns a copy of `s` where every `sub` is replaced by `by`.
-  result = newString(s.len)
-  var i = 0
-  while i < s.len:
-    if s[i] == sub: result[i] = by
-    else: result[i] = s[i]
-    inc i
+  result = s
+  for i in 0 ..< result.len:
+    if result[i] == sub: result[i] = by
 
 func replace*(s, sub: string; by = ""): string =
   ## Replaces every occurrence of the string `sub` in `s` with the string `by`.
@@ -725,7 +911,7 @@ func replace*(s, sub: string; by = ""): string =
     # char-based search that doesn't need a skip table:
     let c = sub[0]
     let last = s.high
-    var i = 0
+    var i: Natural = 0
     while true:
       let j = find(s, c, i, last)
       if j < 0: break
@@ -737,7 +923,7 @@ func replace*(s, sub: string; by = ""): string =
   else:
     var a = initSkipTable(sub)
     let last = s.high
-    var i = 0
+    var i: Natural = 0
     while true:
       let j = find(a, s, sub, i, last)
       if j < 0: break
@@ -746,6 +932,11 @@ func replace*(s, sub: string; by = ""): string =
       i = j + subLen
     # copy the rest:
     add result, substr(s, i)
+
+func charInSetAt(s: string; i: int; chars: set[char]): bool =
+  ## `s[i] in chars`, false for an `i` outside of `s`.
+  result = false
+  if i >= 0 and i < s.len: result = s[i] in chars
 
 func replaceWord*(s, sub: string, by = ""): string =
   ## Replaces every occurrence of the string `sub` in `s` with the string `by`.
@@ -757,7 +948,7 @@ func replaceWord*(s, sub: string, by = ""): string =
   const wordChars = {'a'..'z', 'A'..'Z', '0'..'9', '_', '\128'..'\255'}
   result = ""
   var a = initSkipTable(sub)
-  var i = 0
+  var i: Natural = 0
   let last = s.high
   let sublen = sub.len
   if sublen > 0:
@@ -765,8 +956,8 @@ func replaceWord*(s, sub: string, by = ""): string =
       var j = find(a, s, sub, i, last)
       if j < 0: break
       # word boundary?
-      if (j == 0 or s[j-1] notin wordChars) and
-          (j+sub.len >= s.len or s[j+sub.len] notin wordChars):
+      if not s.charInSetAt(j-1, wordChars) and
+          not s.charInSetAt(j+sub.len, wordChars):
         add result, substr(s, i, j - 1)
         add result, by
         i = j + sublen
@@ -803,7 +994,7 @@ func multiReplace*(s: string; replacements: openArray[(string, string)]): string
     # continues from 'c', so the "bc" replacement is never matched and thus skipped.
     assert multireplace("abc", [("bc", "x"), ("ab", "_b")]) == "_bc"
   result = newStringOfCap(s.len)
-  var i = 0
+  var i: Natural = 0
   var fastChk: set[char] = {}
   # workaround https://github.com/nim-lang/nimony/issues/1461
   # and https://github.com/nim-lang/nimony/issues/1451
@@ -814,15 +1005,22 @@ func multiReplace*(s: string; replacements: openArray[(string, string)]): string
   while i < s.len:
     block sIteration:
       # Assume most chars in s are not candidates for any replacement operation
-      if s[i] in fastChk:
+      let c = s[i]
+      if c in fastChk:
+        # `i` advances outside the `for`: stepping it inside would make the
+        # loop forget `i < s.len`, and the `inc(i)` below with it
+        var matched = 0
         for repl in replacements.items:
           if repl[0].len > 0 and s.continuesWith(repl[0], i):
             add result, repl[1]
-            inc(i, repl[0].len)
-            break sIteration
+            matched = repl[0].len
+            break
+        if matched > 0:
+          inc(i, matched)
+          break sIteration
       # No matching replacement found
       # copy current character from s
-      add result, s[i]
+      add result, c
       inc(i)
 
 func multiReplace*(s: openArray[char]; replacements: openArray[(set[char], char)]): string =
@@ -849,7 +1047,7 @@ func multiReplace*(s: openArray[char]; replacements: openArray[(set[char], char)
     # Sanitize a filename with Windows-incompatible characters
     const file = "a/file:with?invalid*chars.txt"
     assert file.multiReplace(WinSanitationRules) == "a-file-with_invalid_chars.txt"
-  result = newString(s.len)
+  result = newStringOfCap(s.len)
   for i in 0..<s.len:
     var nextChar = s[i]
     # Workaround https://github.com/nim-lang/nimony/issues/1451
@@ -857,9 +1055,30 @@ func multiReplace*(s: openArray[char]; replacements: openArray[(set[char], char)
       if nextChar in repl[0]:
         nextChar = repl[1]
         break
-    result[i] = nextChar
+    result.add nextChar
 
 const HexChars = "0123456789ABCDEF"
+
+func toHex*(x: BiggestInt; len: Positive): string =
+  ## Converts `x` to a hexadecimal string exactly `len` uppercase digits wide
+  ## (no `0x` prefix). Negative values render in two's complement, and a value
+  ## needing more than `len` digits keeps only its least-significant `len` nibbles.
+  runnableExamples:
+    doAssert toHex(BiggestInt(1984), 4) == "07C0"
+    doAssert toHex(BiggestInt(-1), 2) == "FF"
+  var n = x
+  result = newString(len)
+  for j in countdown(result.len - 1, 0):
+    result[j] = HexChars[int(n and 0xF)]
+    n = n shr 4
+    # Keep sign nibbles coming for a negative value regardless of whether `shr`
+    # is arithmetic or logical, so its two's-complement form fills `len`.
+    if n == 0 and x < 0: n = -1
+
+func toHex*[T: SomeInteger](x: T): string {.inline.} =
+  ## Full-width hex for `x`: `2 * sizeof(T)` uppercase digits, e.g.
+  ## `toHex(0'u16) == "0000"`, `toHex(255'u8) == "FF"`.
+  toHex(BiggestInt(x), 2 * sizeof(T))
 
 func escape*(s: string, prefix = "\"", suffix = "\""): string =
   ## Escapes a string `s`.
@@ -903,22 +1122,22 @@ func unescape*(s: string, prefix = "\"", suffix = "\""): string {.raises.} =
   ## If `s` does not begin with `prefix` and end with `suffix` a
   ## ValueError exception will be raised.
   result = newStringOfCap(s.len)
-  var i = prefix.len
+  var i: Natural = prefix.len
   if not s.startsWith(prefix):
     raise ValueError
-  while true:
-    if i >= s.len-suffix.len: break
+  # `i < s.len` follows from the first condition; the prover needs it spelled out
+  while i < s.len-suffix.len and i < s.len:
     if s[i] == '\\':
       if i+1 >= s.len:
         result.add('\\')
         break
       case s[i+1]:
       of 'x':
-        inc i, 2
         var c = 0
-        i += parseutils.parseHex(s, c, i, maxLen = 2)
-        result.add(chr(c))
-        dec i, 2
+        let n = parseutils.parseHex(s, c, i+2, maxLen = 2)
+        # `maxLen = 2`: `n` is `0..2`, which the prover cannot know
+        if n > 0 and n <= 2: inc i, n
+        result.add(chr(c and 0xFF)) # two hex digits: `and` says so to the prover
       of '\\':
         result.add('\\')
       of '\'':
@@ -935,15 +1154,254 @@ func unescape*(s: string, prefix = "\"", suffix = "\""): string {.raises.} =
   if not s.endsWith(suffix):
     raise ValueError
 
-func c_snprintf(buf: cstring, n: csize_t, frmt: cstring): cint {.
-  header: "<stdio.h>", importc: "snprintf", varargs.}
-
 type
   FloatFormatMode* = enum
     ## The different modes of floating point formatting.
     ffDefault,   ## use the shorter floating point notation
     ffDecimal,   ## use decimal floating point notation
     ffScientific ## use scientific notation (using `e` character)
+
+# Float formatting reproduces C's `%f`, `%e` and `%g` from the EXACT decimal
+# expansion of the double instead of calling `snprintf`. Three reasons:
+#
+# * WebAssembly has no variadic calling convention. An imported function has
+#   ONE type, so a `{.varargs.}` importc cannot be called with different
+#   argument tails, and `c_snprintf(buf, n, fmt, precision, f)` emits a call
+#   whose f64 argument contradicts the import's declared type. The engine
+#   rejects the whole MODULE, not the call, which is how a single
+#   `formatFloat` on a diagnostic path takes a program down before it starts.
+# * The freestanding targets and `nimony n` have no libc to call.
+# * `snprintf` produces the digit separator of the current C locale, which
+#   then has to be patched back to `decimalSep`.
+#
+# A double is `m * 2^e` with `m < 2^53`, so its decimal expansion is finite:
+# for `e >= 0` it is the integer `m * 2^e`, and for `e < 0` it is `m * 5^-e`
+# read with the point moved `-e` places to the left. Both are computed exactly
+# with a small base-10^9 bignum on the stack, and that exactness is what makes
+# the rounding agree with C digit for digit: the digit after the cut and
+# everything behind it are the true expansion, so a tie is RECOGNIZED rather
+# than guessed at, and goes half-to-even like the default rounding mode.
+# (Rounding the shortest round-tripping form from `$f` instead would get
+# 9.995 wrong at two places: it prints as "9.995" but the double is
+# 9.99499999999999957, which rounds DOWN.)
+
+const
+  DecBase = 1_000_000_000'u64
+    ## One limb holds nine decimal digits.
+  DecMaxLimbs = 96
+    ## `2^-1074 * (2^53-1)` needs 767 digits, the largest expansion there is.
+  Pow5: array[0..12, uint32] = [1'u32, 5, 25, 125, 625, 3125, 15625, 78125,
+    390625, 1953125, 9765625, 48828125, 244140625]
+    ## `5^12` is the largest power of five below `DecBase`.
+
+type
+  DecInt = object ## Non-negative integer, base `DecBase`, least significant limb first.
+    limbs: array[DecMaxLimbs, uint32]
+    len: range[0..DecMaxLimbs]
+
+func mulSmall(x: var DecInt; factor: uint32) =
+  var carry = 0'u64
+  var i = 0
+  while i < x.len:
+    let cur = uint64(x.limbs[i]) * uint64(factor) + carry
+    x.limbs[i] = uint32(cur mod DecBase)
+    carry = cur div DecBase
+    inc i
+  while carry > 0'u64 and x.len < DecMaxLimbs:
+    x.limbs[x.len] = uint32(carry mod DecBase)
+    carry = carry div DecBase
+    inc x.len
+
+func toDigits(x: DecInt): string =
+  ## Decimal digits of `x`, without leading zeros.
+  result = ""
+  var i = x.len - 1
+  while i > 0 and x.limbs[i] == 0'u32: dec i
+  if i < 0 or (i == 0 and x.limbs[0] == 0'u32):
+    result = "0"
+  else:
+    result.add $x.limbs[i]
+    dec i
+    while i >= 0:
+      let limb = $x.limbs[i]
+      for _ in limb.len ..< 9: result.add '0'
+      result.add limb
+      dec i
+
+func exactDigits(f: BiggestFloat): tuple[neg: bool, digits: string, exp: int] =
+  ## `f` as `0.<digits> * 10^exp`, `digits` exact and free of leading and
+  ## trailing zeros. Zero yields no digits and `exp = 1`, which is the
+  ## exponent `%e` and `%g` print for it (`0.000e+00`, not `0.000e-01`).
+  let bits = cast[uint64](f)
+  # Seed the whole tuple: nimony proves initialization per RESULT, not per
+  # field, so field-by-field assignment leaves it "possibly uninitialized".
+  result = (neg: (bits shr 63) != 0'u64, digits: "", exp: 1)
+  let biasedExp = int((bits shr 52) and 0x7FF'u64)
+  var mant = bits and 0xF_FFFF_FFFF_FFFF'u64
+  var e2 = 0
+  if biasedExp == 0:
+    if mant == 0'u64: return                  # +-0.0
+    e2 = -1074                                # subnormal: no hidden bit
+  else:
+    mant = mant or (1'u64 shl 52)
+    e2 = biasedExp - 1075
+  var x = default(DecInt)
+  # `mant < 2^53 < DecBase^2`: two limbs hold it
+  x.limbs[0] = uint32(mant mod DecBase)
+  x.limbs[1] = uint32(mant div DecBase)
+  x.len = if x.limbs[1] != 0'u32: 2 else: 1
+  var pointPos = 0                            # digits to the right of the point
+  if e2 > 0:
+    var k = e2
+    while k > 0:
+      let step = if k > 29: 29 else: k        # 2^29 is the largest power of two below the base
+      mulSmall(x, 1'u32 shl step)
+      k = k - step
+  elif e2 < 0:
+    # `m * 2^-k` is `(m * 5^k) / 10^k`: the same digits, the point moved.
+    var k = -e2
+    pointPos = k
+    while k > 0:
+      var step: range[1..12] = 12
+      if k < 12: step = k
+      mulSmall(x, Pow5[step])
+      k = k - step
+  var d = toDigits(x)
+  result.exp = d.len - pointPos
+  var last = d.len
+  while last > 0 and d[last-1] == '0': dec last
+  d.setLen last
+  result.digits = d
+
+func roundDigits(digits: string; keep: int): tuple[digits: string, carry: bool] =
+  ## Round the exact `digits` to `keep` leading digits, half-to-even. `carry`
+  ## reports an overflow into a new leading digit, so `999` kept at two digits
+  ## is `("10", true)`: the caller reads it with the exponent raised by one.
+  result = (digits: "", carry: false)
+  if keep < 0: return
+  if keep >= digits.len:
+    result.digits = digits
+    for _ in digits.len ..< keep: result.digits.add '0'
+    return
+  var kept = if keep == 0: "" else: digits.substr(0, keep-1)
+  let first = digits[keep]
+  var roundUp = false
+  if first > '5':
+    roundUp = true
+  elif first == '5':
+    var restNonZero = false
+    for i in keep+1 ..< digits.len:
+      if digits[i] != '0': restNonZero = true
+    if restNonZero:
+      roundUp = true
+    else:
+      # An exact tie, because the digits are the exact expansion: half-to-even.
+      let prev = if keep > 0: digits[keep-1] else: '0'
+      roundUp = ((int(prev) - int('0')) and 1) == 1
+  if roundUp:
+    var i = kept.len - 1
+    var carry = true
+    while i >= 0 and carry:
+      if kept[i] == '9':
+        kept[i] = '0'
+      else:
+        kept[i] = char(int(kept[i]) + 1)
+        carry = false
+      dec i
+    if carry:
+      # All nines: the leading 1 takes the place of the last digit and the
+      # caller lifts the exponent, `999` -> `10` at exponent+1.
+      if kept.len > 0: kept.setLen kept.len - 1
+      kept = "1" & kept
+      result.carry = true
+  result.digits = kept
+
+func fmtDecimal(neg: bool; digits: string; exp, precision: int;
+                decimalSep: char; forcePoint: bool): string =
+  ## `%.*f`: `precision` digits after the point. `forcePoint` is the `#` flag,
+  ## which keeps the point at precision 0 ("2." rather than "2").
+  let (d, carry) = roundDigits(digits, exp + precision)
+  var e = exp
+  if carry: inc e
+  result = ""
+  if neg: result.add '-'
+  if e <= 0:
+    result.add '0'
+  else:
+    var i = 0
+    while i < e:
+      result.add (if i < d.len: d[i] else: '0')
+      inc i
+  if precision > 0 or forcePoint:
+    result.add decimalSep
+    # The k-th digit after the point sits at index `e + k - 1`; a negative
+    # index is a leading zero of the fraction, one past the end a trailing one.
+    var k = 1
+    while k <= precision:
+      let idx = e + k - 1
+      result.add (if idx >= 0 and idx < d.len: d[idx] else: '0')
+      inc k
+
+func fmtScientific(neg: bool; digits: string; exp, precision: int;
+                   decimalSep: char; forcePoint: bool): string =
+  ## `%.*e`: one digit before the point, `precision` after it.
+  let (d, carry) = roundDigits(digits, precision + 1)
+  var e = exp
+  if carry: inc e
+  result = ""
+  if neg: result.add '-'
+  result.add (if d.len > 0: d[0] else: '0')
+  if precision > 0 or forcePoint:
+    result.add decimalSep
+    for k in 0 ..< precision:
+      let i = k + 1 # `1 .. precision` could not be shown to end
+      result.add (if i < d.len: d[i] else: '0')
+  let e10 = e - 1
+  result.add 'e'
+  if e10 < 0: result.add '-' else: result.add '+'
+  let a = abs(e10)
+  if a < 10: result.add '0'                   # C pads the exponent to two digits
+  result.add $a
+
+func stripTrailingZeros(s: string; decimalSep: char): string =
+  ## `%g` without `#` drops the trailing zeros of the fraction, and the point
+  ## with them when nothing is left behind it.
+  var mantEnd = s.len
+  for i in 0 ..< s.len:
+    if s[i] == 'e':
+      mantEnd = i
+      break
+  var pointAt = -1
+  for i in 0 ..< mantEnd:
+    if s[i] == decimalSep:
+      pointAt = i
+      break
+  if pointAt < 0:
+    result = s
+  else:
+    var last = mantEnd
+    for i in countdown(mantEnd - 1, pointAt + 1):
+      if s[i] != '0': break
+      last = i
+    if last == pointAt+1: last = pointAt
+    result = s.substr(0, last-1) & s.substr(mantEnd, s.len-1)
+
+func fmtDefault(neg: bool; digits: string; exp, precision: int;
+                decimalSep: char; forcePoint: bool): string =
+  ## `%.*g`: `p` significant digits, printed in `%e` style when the exponent
+  ## falls outside `[-4, p)` and in `%f` style otherwise. C reads a precision
+  ## of 0 as 1.
+  let p = if precision == 0: 1 else: precision
+  let (d, carry) = roundDigits(digits, p)
+  var e = exp
+  if carry: inc e
+  let x = e - 1                               # the exponent `%e` would print
+  # `d` is already rounded to `p` digits, so the re-rounding below is a no-op.
+  let s = if x < -4 or x >= p:
+            fmtScientific(neg, d, e, p-1, decimalSep, forcePoint)
+          else:
+            fmtDecimal(neg, d, e, p-1-x, decimalSep, forcePoint)
+  result = if forcePoint: s else: stripTrailingZeros(s, decimalSep)
 
 func formatBiggestFloat*(f: BiggestFloat, format: FloatFormatMode = ffDefault,
                          precision: range[-1..32] = 16;
@@ -963,29 +1421,19 @@ func formatBiggestFloat*(f: BiggestFloat, format: FloatFormatMode = ffDefault,
     assert x.formatBiggestFloat() == "123.4560000000000"
     assert x.formatBiggestFloat(ffDecimal, 4) == "123.4560"
     assert x.formatBiggestFloat(ffScientific, 2) == "1.23e+02"
-  const floatFormatToChar: array[FloatFormatMode, char] = ['g', 'f', 'e']
-  var
-    frmtstr {.noinit.}: array[0..5, char]
-    buf {.noinit.}: array[0..2500, char]
-    L: cint
-  frmtstr[0] = '%'
-  if precision.int >= 0:
-    frmtstr[1] = '#'
-    frmtstr[2] = '.'
-    frmtstr[3] = '*'
-    frmtstr[4] = floatFormatToChar[format]
-    frmtstr[5] = '\0'
-    L = c_snprintf(cast[cstring](addr buf), csize_t(2501), cast[cstring](addr frmtstr), precision, f)
+  let bits = cast[uint64](f)
+  if int((bits shr 52) and 0x7FF'u64) == 0x7FF:
+    result = $f                               # inf, -inf, nan print as themselves
   else:
-    frmtstr[1] = floatFormatToChar[format]
-    frmtstr[2] = '\0'
-    L = c_snprintf(cast[cstring](addr buf), csize_t(2501), cast[cstring](addr frmtstr), f)
-  result = newString(L)
-  for i in 0 ..< L:
-    # Depending on the locale either dot or comma is produced,
-    # but nothing else is possible:
-    if buf[i] in {'.', ','}: result[i] = decimalSep
-    else: result[i] = buf[i]
+    let (neg, digits, exp) = exactDigits(f)
+    # Without an explicit precision C uses its default of 6 and no `#` flag;
+    # with one it used `%#.*g` and friends, whose point is never dropped.
+    let p = if precision.int < 0: 6 else: precision.int
+    let forcePoint = precision.int >= 0
+    case format
+    of ffDefault: result = fmtDefault(neg, digits, exp, p, decimalSep, forcePoint)
+    of ffDecimal: result = fmtDecimal(neg, digits, exp, p, decimalSep, forcePoint)
+    of ffScientific: result = fmtScientific(neg, digits, exp, p, decimalSep, forcePoint)
 
 func formatFloat*(f: float, format: FloatFormatMode = ffDefault,
                   precision: range[-1..32] = 16; decimalSep = '.'): string =
@@ -1007,10 +1455,13 @@ func formatFloat*(f: float, format: FloatFormatMode = ffDefault,
 
   result = formatBiggestFloat(f, format, precision.int, decimalSep)
 
-func findNormalized(x: string, inArray: openArray[string]): int =
+func findNormalized(x: string, inArray: openArray[string]): int {.
+    ensures: result < inArray.len.} =
+  ## The index of the value that follows the key `x` in `inArray`, -1 if
+  ## there is none.
   var i = 0
   while i < inArray.len - 1:
-    if cmpIgnoreStyle(x, inArray[i]) == 0: return i
+    if cmpIgnoreStyle(x, inArray[i]) == 0: return i+1
     inc(i, 2) # incrementing by 1 would probably lead to a
               # security hole...
   return -1
@@ -1068,16 +1519,19 @@ func `%`*(formatstr: string; a: openArray[string]): string {.raises.} =
   ## raised if an ill-formed format string has been passed to the `%` operator.
   result = newStringOfCap(formatstr.len + a.len shl 4)
   const PatternChars = {'a'..'z', 'A'..'Z', '0'..'9', '\128'..'\255', '_'}
-  var i = 0
+  # `Natural`, not `int`: these walk `formatstr` and the lower half of every
+  # index obligation then comes from the type, not from a guard.
+  var i: Natural = 0
   var num = 0
   while i < len(formatstr):
     if formatstr[i] == '$' and i+1 < len(formatstr):
       case formatstr[i+1]
       of '#':
         if num >= a.len: invalidFormatString(formatstr)
-        add result, a[num]
+        else:
+          add result, a[num]
+          inc num
         inc i, 2
-        inc num
       of '$':
         add result, '$'
         inc(i, 2)
@@ -1090,13 +1544,15 @@ func `%`*(formatstr: string; a: openArray[string]): string {.raises.} =
           j = j * 10 + ord(formatstr[i]) - ord('0')
           inc(i)
         let idx = if not negative: j-1 else: a.len-j
-        if idx < 0 or idx >= a.len: invalidFormatString(formatstr)
-        add result, a[idx]
+        if idx >= 0 and idx < a.len: add result, a[idx]
+        else: invalidFormatString(formatstr)
       of '{':
-        var j = i+2
+        var j: Natural = i+2
         var k = 0
-        var negative = formatstr[j] == '-'
-        if negative: inc j
+        var negative = false
+        if j < formatstr.len and formatstr[j] == '-':
+          negative = true
+          inc j
         var isNumber = 0
         while j < formatstr.len and formatstr[j] notin {'\0', '}'}:
           if formatstr[j] in Digits:
@@ -1105,20 +1561,22 @@ func `%`*(formatstr: string; a: openArray[string]): string {.raises.} =
           else:
             isNumber = -1
           inc(j)
+        # `j` started at most at `formatstr.len`: `i+1 < len(formatstr)`
+        {.assume: j <= formatstr.len.}
         if isNumber == 1:
           let idx = if not negative: k-1 else: a.len-k
-          if idx < 0 or idx >= a.len: invalidFormatString(formatstr)
-          add result, a[idx]
+          if idx >= 0 and idx < a.len: add result, a[idx]
+          else: invalidFormatString(formatstr)
         else:
-          var x = findNormalized(substr(formatstr, i+2, j-1), a)
-          if x >= 0 and x < a.len - 1: add result, a[x+1]
+          let x = findNormalized(substr(formatstr, i+2, j-1), a)
+          if x >= 0: add result, a[x]
           else: invalidFormatString(formatstr)
         i = j+1
       of 'a'..'z', 'A'..'Z', '\128'..'\255', '_':
-        var j = i+1
+        var j: Natural = i+1
         while j < formatstr.len and formatstr[j] in PatternChars: inc(j)
-        var x = findNormalized(substr(formatstr, i+1, j-1), a)
-        if x >= 0 and x < a.len - 1: add result, a[x+1]
+        let x = findNormalized(substr(formatstr, i+1, j-1), a)
+        if x >= 0: add result, a[x]
         else: invalidFormatString(formatstr)
         i = j
       else:
@@ -1176,10 +1634,13 @@ func trimZeros*(x: var string; decimalSep = '.') =
 
   let sPos = find(x, decimalSep)
   if sPos >= 0:
-    var last = find(x, 'e', start = sPos)
-    last = if last >= 0: last - 1 else: high(x)
+    let e = find(x, 'e', start = sPos)
+    var last = x.len - 1
+    if e >= 0: last = e - 1
     var pos = last
-    while pos >= 0 and x[pos] == '0': dec(pos)
+    for i in countdown(last, 0):
+      if x[i] != '0': break
+      pos = i - 1
     if pos > sPos: inc(pos)
     if last >= pos:
       try:
@@ -1219,7 +1680,7 @@ func formatSize*(bytes: int64; decimalSep = '.'; prefix = bpIEC; includeSpace = 
 
   # TODO: use fastLog2 when it is added.
   #let lg2 = if bytes == 0: 0 else: fastLog2(bytes)
-  let Lg2MaxDiv10 = sizeof(bytes) * 8 div 10
+  const Lg2MaxDiv10 = sizeof(int64) * 8 div 10
   var lg2 = Lg2MaxDiv10 * 10
   var matchedIndex = Lg2MaxDiv10
   for i in 1 .. Lg2MaxDiv10:

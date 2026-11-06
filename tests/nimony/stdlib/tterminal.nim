@@ -1,43 +1,77 @@
-import std/assertions
-import std/terminal
+# std/terminal: the escape sequences of styles, colors, true color, cursor
+# movement and erasing (written to a file and read back), and the terminal
+# size fallbacks.
 
-# --- single foreground colour ---
-assert "hi".red == "\e[31mhi\e[39m"
-assert "hi".green == "\e[32mhi\e[39m"
-assert "hi".blue == "\e[34mhi\e[39m"
-assert "hi".black == "\e[30mhi\e[39m"
-assert "hi".white == "\e[37mhi\e[39m"
-assert "hi".gray == "\e[90mhi\e[39m"
-assert "hi".brightCyan == "\e[96mhi\e[39m"
+import std/[assertions, syncio, os, envvars, colors, terminal]
 
-# --- styles ---
-assert "hi".bold == "\e[1mhi\e[22m"
-assert "hi".dim == "\e[2mhi\e[22m"
-assert "hi".underline == "\e[4mhi\e[24m"
-assert "hi".italic == "\e[3mhi\e[23m"
-assert "hi".inverse == "\e[7mhi\e[27m"
-assert "hi".strikethrough == "\e[9mhi\e[29m"
+proc main() {.raises.} =
+  assert ansiStyleCode(styleBright) == "\e[1m"
+  assert ansiForegroundColorCode(fgRed) == "\e[31m"
+  assert ansiForegroundColorCode(fgRed, true) == "\e[91m"
+  assert ansiBackgroundColorCode(bgBlue) == "\e[44m"
+  assert ansiForegroundColorCode(rgb(240, 236, 228)) == "\e[38;2;240;236;228m"
+  assert ansiBackgroundColorCode(colGold) == "\e[48;2;255;215;0m"
 
-# --- background ("on<Colour>", not "bg<Colour>") ---
-assert "hi".onWhite == "\e[47mhi\e[49m"
-assert "hi".onRed == "\e[41mhi\e[49m"
+  # true color stays off until enabled, like Nim
+  disableTrueColors()
+  let path = getTempDir() / "nimony_tterminal.txt"
+  var f = open(path, fmWrite)
+  setForegroundColor(f, colRed)
+  when not defined(windows):  # the Windows branches use the console API
+    hideCursor(f)
+    showCursor(f)
+    setCursorPos(f, 4, 2)
+    setCursorXPos(f, 0)
+    cursorUp(f, 3)
+    cursorDown(f)
+    cursorForward(f, 2)
+    cursorBackward(f, 5)
+    eraseLine(f)
+    eraseScreen(f)
+  styledWrite(f, fgColor, colRed, "x", bgColor, colBlue, styleBright, "y")
+  close(f)
+  let got = readFile(path)
+  when defined(windows):
+    assert got == "x\e[1my\e[0m"
+  else:
+    assert got == "\e[?25l\e[?25h\e[3;5f\e[1G\e[3A\e[1B\e[2C\e[5D\e[2K\e[1G\e[2J" &
+                  "x\e[1my\e[0m"
 
-# --- chaining ("x".red.bold == bold(red("x")), nested resets) ---
-assert "hi".red.bold == "\e[1m\e[31mhi\e[39m\e[22m"
-assert "x".green.underline.bold == "\e[1m\e[4m\e[32mx\e[39m\e[24m\e[22m"
-assert "sel".black.onWhite == "\e[47m\e[30msel\e[39m\e[49m"
+  when not defined(nimNoLibc):  # putEnv needs libc's setenv
+    # with true color on, `Color` arguments follow fgColor/bgColor
+    let oldColorTerm = getEnv("COLORTERM")
+    putEnv("COLORTERM", "truecolor")
+    enableTrueColors()
+    when not defined(windows): assert isTrueColorSupported()
+    if isTrueColorSupported():
+      f = open(path, fmWrite)
+      setBackgroundColor(f, rgb(1, 2, 3))
+      styledWrite(f, fgColor, colRed, "x", bgColor, colBlue, "y")
+      close(f)
+      assert readFile(path) ==
+        "\e[48;2;1;2;3m\e[38;2;255;0;0mx\e[48;2;0;0;255my\e[0m"
+    disableTrueColors()
+    if oldColorTerm.len > 0: putEnv("COLORTERM", oldColorTerm)
+    else: delEnv("COLORTERM")
 
-# --- alias ---
-assert "hi".grey == "hi".gray
+  # size: COLUMNS/LINES win; otherwise a terminal or the 80x24 fallback
+  when not defined(nimNoLibc):
+    let oldCols = getEnv("COLUMNS")
+    let oldLines = getEnv("LINES")
+    putEnv("COLUMNS", "77")
+    putEnv("LINES", "33")
+    assert terminalSize() == (77, 33)
+    delEnv("COLUMNS")
+    delEnv("LINES")
+  let (w, h) = terminalSize()
+  assert w > 0 and h > 0
+  assert terminalWidth() == w and terminalHeight() == h
+  when not defined(nimNoLibc):
+    if oldCols.len > 0: putEnv("COLUMNS", oldCols)
+    if oldLines.len > 0: putEnv("LINES", oldLines)
+  echo "terminal ok"
 
-# --- ANSI parsing ---
-assert stripAnsi("this is red and bold".red.bold) == "this is red and bold"
-assert stripAnsi("plain") == "plain"
-assert stripAnsi("a".red & "b".blue.bold) == "ab"
-assert stripAnsi("") == ""
-assert visibleLen("hi".red.bold) == 2
-assert visibleLen("plain") == 5
-
-# --- the existing File-oriented API still works alongside the new funcs ---
-assert ansiForegroundColorCode(fgRed) == "\e[31m"
-assert ansiStyleCode(styleBright) == "\e[1m"
+try:
+  main()
+except:
+  quit "tterminal: unexpected error"

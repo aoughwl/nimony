@@ -7,13 +7,13 @@ type
     NoExpr
     ErrX = (ord(ErrTagId), "err")  ## indicates an error
     SufX = (ord(SufTagId), "suf")  ## literal with suffix annotation
-    AtX = (ord(AtTagId), "at")  ## array indexing operation (typed Nimony form vs untyped Leng form); also used for generic proc/type instantiation `(at callee T1 T2 ...)` where an argument may also be a constant *value* bound to a `staticTypevar`
+    AtX = (ord(AtTagId), "at")  ## array indexing operation (typed Nimony form vs untyped Leng form); also used for generic proc/type instantiation `(at callee T1 T2 ...)` where an argument may also be a constant *value* bound to a `staticTypevar`. In a **type** slot the head always names a type: a deferred plugin call, which used to share this tag and did not, has its own `(pluginCall …)`
     DerefX = (ord(DerefTagId), "deref")  ## pointer deref operation
-    DotX = (ord(DotTagId), "dot")  ## object field selection; optional integer is the inheritance depth of the field; optional trailing `STRLIT` is an *access token* (carrying `"x"` like an export marker) — when present, the expression was already type-checked in a scope with access to the field, so re-check at expansion/serialization sites must accept the access even if the field is private. Emitted by sem when a template body or `.semantics` serializer is type-checked in the field's defining module and later expanded/consumed elsewhere.
+    DotX = (ord(DotTagId), "dot")  ## object field selection; optional integer is the inheritance depth of the field; optional trailing `STRLIT` is an *access token* carrying the suffix of the module the access was written in. When present, re-checks at expansion/serialization sites judge the private-field access against that module instead of against the module they are running in, so a template body keeps its author's visibility wherever it is expanded. The reserved value `"*"` means "already validated, originating module no longer comparable" and is used by `exprexec`, whose sub-compile runs under a synthesized module suffix. Emitted by sem whenever it resolves a non-exported field.
     PatX = (ord(PatTagId), "pat")  ## pointer indexing operation
     ParX = (ord(ParTagId), "par")  ## syntactic parenthesis
     AddrX = (ord(AddrTagId), "addr")  ## address of operation
-    NilX = (ord(NilTagId), "nil")  ## nil pointer value; closure `nil` carries the proc type and a nil environment
+    NilX = (ord(NilTagId), "nil")  ## nil pointer value; `T` is the pointer type it stands for. `nil` is the one type-polymorphic literal, so the frontend types every `ptr`/`ref`/`pointer`/`cstring` one (`derefs.nim`) and `T` survives into Leng; only a `nil` a later pass synthesizes is bare. A closure `nil` carries the proc type plus `X`, a nil environment
     InfX = (ord(InfTagId), "inf")  ## positive infinity floating point value
     NeginfX = (ord(NeginfTagId), "neginf")  ## negative infinity floating point value
     NanX = (ord(NanTagId), "nan")  ## NaN floating point value
@@ -27,7 +27,7 @@ type
     SizeofX = (ord(SizeofTagId), "sizeof")  ## `sizeof` operation
     AlignofX = (ord(AlignofTagId), "alignof")  ## `alignof` operation
     OffsetofX = (ord(OffsetofTagId), "offsetof")  ## `offsetof` operation
-    OconstrX = (ord(OconstrTagId), "oconstr")  ## object constructor
+    OconstrX = (ord(OconstrTagId), "oconstr")  ## object constructor. **Total**: it names every field of `T` — inherited ones included, in any order — so a consumer may store exactly the fields listed and zero nothing, which is what the native back end does. Sem fills in whatever the source omitted (`buildDefaultObjConstr`); a hexer pass that synthesizes a constructor for a type it invented owes the same and gets its defaults from `hexer/defaultvalues`. A `(union)` type is the exception: its members share storage, so only the active one is named
     AconstrX = (ord(AconstrTagId), "aconstr")  ## array constructor
     BracketX = (ord(BracketTagId), "bracket")  ## untyped array constructor
     CurlyX = (ord(CurlyTagId), "curly")  ## untyped set constructor
@@ -56,10 +56,11 @@ type
     CchoiceX = (ord(CchoiceTagId), "cchoice")  ## closed choice
     OchoiceX = (ord(OchoiceTagId), "ochoice")  ## open choice
     PragmaxX = (ord(PragmaxTagId), "pragmax")  ## pragma expressions
+    StaticX = (ord(StaticTagId), "static")  ## `static` type or annotation; as an expression, `static(expr)` evaluates `expr` at compile time
     QuotedX = (ord(QuotedTagId), "quoted")  ## name in backticks
     HderefX = (ord(HderefTagId), "hderef")  ## hidden pointer deref operation
-    DdotX = (ord(DdotTagId), "ddot")  ## deref dot: expression, field symbol, field index; optional trailing `STRLIT` is the same *access token* described on `(dot ...)` — certifies the access was type-checked with private-field visibility and must be accepted on re-check.
-    HaddrX = (ord(HaddrTagId), "haddr")  ## hidden address of operation
+    DdotX = (ord(DdotTagId), "ddot")  ## deref dot: expression, field symbol, field index; optional trailing `STRLIT` is the same *access token* described on `(dot ...)` — names the module the private-field access was written in, which is what a re-check judges it against.
+    HaddrX = (ord(HaddrTagId), "haddr")  ## hidden address: an address the COMPILER took to bind a location, not one the user asked for. `derefs.nim` inserts it wherever a `var`/`out` parameter needs the argument's location. It survives into Leng — where `(addr X)` is the user's `addr` — because the two mean different things to a consumer: `(addr x)` says "x's address is a value now", so x must have one, while `(haddr x)` says only "the callee wants x's *location*". An `(instr …)` operand slot whose row is `inout` can therefore bind the local's home directly instead of forcing it to memory. Everywhere else it lowers exactly like `(addr X)`
     NewrefX = (ord(NewrefTagId), "newref")  ## Nim's `new` magic proc that allocates a `ref T`; optional initializer expression
     NewobjX = (ord(NewobjTagId), "newobj")  ## new object constructor
     TupX = (ord(TupTagId), "tup")  ## untyped tuple constructor
@@ -90,6 +91,7 @@ type
     FieldpairsX = (ord(FieldpairsTagId), "fieldpairs")  ## fieldPairs iterator
     EnumtostrX = (ord(EnumtostrTagId), "enumtostr")
     IsmainmoduleX = (ord(IsmainmoduleTagId), "ismainmodule")
+    InstantiationinfoX = (ord(InstantiationinfoTagId), "instantiationinfo")  ## the call site as a `(filename, line, column)` tuple; inside a template body, the site of the template call
     DefaultobjX = (ord(DefaultobjTagId), "defaultobj")
     DefaulttupX = (ord(DefaulttupTagId), "defaulttup")
     DefaultdistinctX = (ord(DefaultdistinctTagId), "defaultdistinct")
@@ -109,6 +111,8 @@ type
     LtsetX = (ord(LtsetTagId), "ltset")
     InsetX = (ord(InsetTagId), "inset")
     CardX = (ord(CardTagId), "card")
+    SuccX = (ord(SuccTagId), "succ")  ## successor of an ordinal of type `T`, the optional step defaults to 1; for a `range` `T` the result owes `T`'s range. Lowered to `add` by the hexer
+    PredX = (ord(PredTagId), "pred")  ## predecessor; like `succ`
     EmoveX = (ord(EmoveTagId), "emove")
     DestroyX = (ord(DestroyTagId), "destroy")
     DupX = (ord(DupTagId), "dup")
@@ -122,9 +126,12 @@ type
     IsX = (ord(IsTagId), "is")  ## `is` operator
     EnvpX = (ord(EnvpTagId), "envp")  ## `envp.Y` field access to hidden `env` parameter which is of type `T`
     ToClosureX = (ord(ToClosureTagId), "toClosure")  ## converts non closure proc to closure proc
+    PluginCallX = (ord(PluginCallTagId), "pluginCall")  ## the parked form of a **deferred plugin call**: a `.plugin` template invocation that answered `(deferexpansion)` because its arguments still mention type variables. `Y` is the template symbol, the rest are its sem-checked arguments. Having its own tag is what keeps it apart from the three other meanings of `(at …)` — subscript, explicit generic instantiation, generic type invocation — none of which a pass has to probe for any more. Whether it stands for a TYPE or a VALUE is deliberately NOT in the node: the template's declared return type says, `typedesc` meaning a type and anything else (`untyped` included) meaning a value
+    CanFormCyclesX = (ord(CanFormCyclesTagId), "canFormCycles")  ## `canFormCycles(T)`: does the cycle collector trace through a value of type `T` (it owns a ref that can be part of a cycle)? Folded to `(true)`/`(false)` by `derefs`, with the lifter's own `needsTrace`; always false unless the runtime says `{.enableTrace.}`. Containers that own their buffer through a raw pointer use it to fence structural changes against a concurrent collector (`seq`, `--mm:yrc`)
+    SupportsCopyMemX = (ord(SupportsCopyMemTagId), "supportsCopyMem")  ## `supportsCopyMem(T)`: can a value of type `T` be moved and copied as its bytes, i.e. has it no hooks at all (no `=destroy`, `=dup`, `=copy`, nothing owned through a `ref`, `string`, `seq` or closure)? Raw pointers do not count. Folded to `(true)`/`(false)` by `derefs`, with the lifter's own `isTrivial`. `std/channels` uses it to keep values that own heap memory off a `Writer` that may leave the process
 
 proc rawTagIsNimonyExpr*(raw: TagEnum): bool {.inline.} =
-  raw in {ErrTagId, SufTagId, AtTagId, DerefTagId, DotTagId, PatTagId, ParTagId, AddrTagId, NilTagId, InfTagId, NeginfTagId, NanTagId, FalseTagId, TrueTagId, AndTagId, OrTagId, XorTagId, NotTagId, NegTagId, SizeofTagId, AlignofTagId, OffsetofTagId, OconstrTagId, AconstrTagId, BracketTagId, CurlyTagId, CurlyatTagId, KvTagId, OvfTagId, AddTagId, SubTagId, MulTagId, DivTagId, ModTagId, ShrTagId, ShlTagId, BitandTagId, BitorTagId, BitxorTagId, BitnotTagId, EqTagId, NeqTagId, LeTagId, LtTagId, CastTagId, ConvTagId, CallTagId, CmdTagId, CchoiceTagId, OchoiceTagId, PragmaxTagId, QuotedTagId, HderefTagId, DdotTagId, HaddrTagId, NewrefTagId, NewobjTagId, TupTagId, TupconstrTagId, SetconstrTagId, TabconstrTagId, AshrTagId, BaseobjTagId, HconvTagId, DconvTagId, CallstrlitTagId, InfixTagId, PrefixTagId, HcallTagId, CompilesTagId, DeclaredTagId, DefinedTagId, AstToStrTagId, BindSymTagId, BindSymNameTagId, InstanceofTagId, ProccallTagId, HighTagId, LowTagId, TypeofTagId, UnpackTagId, FieldsTagId, FieldpairsTagId, EnumtostrTagId, IsmainmoduleTagId, DefaultobjTagId, DefaulttupTagId, DefaultdistinctTagId, DelayTagId, Delay0TagId, SuspendTagId, ExprTagId, DoTagId, ArratTagId, TupatTagId, PlussetTagId, MinussetTagId, MulsetTagId, XorsetTagId, EqsetTagId, LesetTagId, LtsetTagId, InsetTagId, CardTagId, EmoveTagId, DestroyTagId, DupTagId, CopyTagId, WasmovedTagId, SinkhTagId, TraceTagId, InternalTypeNameTagId, InternalFieldPairsTagId, FailedTagId, IsTagId, EnvpTagId, ToClosureTagId}
+  raw in {ErrTagId, SufTagId, AtTagId, DerefTagId, DotTagId, PatTagId, ParTagId, AddrTagId, NilTagId, InfTagId, NeginfTagId, NanTagId, FalseTagId, TrueTagId, AndTagId, OrTagId, XorTagId, NotTagId, NegTagId, SizeofTagId, AlignofTagId, OffsetofTagId, OconstrTagId, AconstrTagId, BracketTagId, CurlyTagId, CurlyatTagId, KvTagId, OvfTagId, AddTagId, SubTagId, MulTagId, DivTagId, ModTagId, ShrTagId, ShlTagId, BitandTagId, BitorTagId, BitxorTagId, BitnotTagId, EqTagId, NeqTagId, LeTagId, LtTagId, CastTagId, ConvTagId, CallTagId, CmdTagId, CchoiceTagId, OchoiceTagId, PragmaxTagId, StaticTagId, QuotedTagId, HderefTagId, DdotTagId, HaddrTagId, NewrefTagId, NewobjTagId, TupTagId, TupconstrTagId, SetconstrTagId, TabconstrTagId, AshrTagId, BaseobjTagId, HconvTagId, DconvTagId, CallstrlitTagId, InfixTagId, PrefixTagId, HcallTagId, CompilesTagId, DeclaredTagId, DefinedTagId, AstToStrTagId, BindSymTagId, BindSymNameTagId, InstanceofTagId, ProccallTagId, HighTagId, LowTagId, TypeofTagId, UnpackTagId, FieldsTagId, FieldpairsTagId, EnumtostrTagId, IsmainmoduleTagId, InstantiationinfoTagId, DefaultobjTagId, DefaulttupTagId, DefaultdistinctTagId, DelayTagId, Delay0TagId, SuspendTagId, ExprTagId, DoTagId, ArratTagId, TupatTagId, PlussetTagId, MinussetTagId, MulsetTagId, XorsetTagId, EqsetTagId, LesetTagId, LtsetTagId, InsetTagId, CardTagId, SuccTagId, PredTagId, EmoveTagId, DestroyTagId, DupTagId, CopyTagId, WasmovedTagId, SinkhTagId, TraceTagId, InternalTypeNameTagId, InternalFieldPairsTagId, FailedTagId, IsTagId, EnvpTagId, ToClosureTagId, PluginCallTagId, CanFormCyclesTagId, SupportsCopyMemTagId}
 
 type
   NimonyStmt* = enum
@@ -161,6 +168,8 @@ type
     WhileS = (ord(WhileTagId), "while")  ## `while` statement
     CoroforS = (ord(CoroforTagId), "corofor")  ## closure-iterator for loop, lowered shape used between iterinliner and cps; first child is the iterator call, second child is a `(stmts ...)` whose first inner statement is a `(var :forLoopVar T .)` declaration that receives each yielded value
     CaseS = (ord(CaseTagId), "case")  ## `case` statement
+    LabS = (ord(LabTagId), "lab")  ## label, target of a `jmp` instruction. Also a **Nimony** statement: `xelim` lowers short-circuit `and`/`or` chains to the flat `(if c (jmp L))` / `(lab L)` form (the two-target condition compiler, see `doc/internals/multi_join_ir.md`), which needs a merge label that is not an enclosing region's end — something `(block)`/`(break)` cannot express without one wrapper per merge
+    JmpS = (ord(JmpTagId), "jmp")  ## jump/goto instruction. In Nimony IR it is **forward-only and scoped**: it may leave enclosing constructs but never enter one, and it never crosses a scope that owns destructible locals
     RetS = (ord(RetTagId), "ret")  ## `return` instruction
     YldS = (ord(YldTagId), "yld")  ## yield statement
     StmtsS = (ord(StmtsTagId), "stmts")  ## list of statements
@@ -168,6 +177,8 @@ type
     PragmaxS = (ord(PragmaxTagId), "pragmax")  ## pragma expressions
     InclS = (ord(InclTagId), "incl")  ## `incl` set operation; first child is the set's element type
     ExclS = (ord(ExclTagId), "excl")  ## `excl` set operation; first child is the set's element type
+    IncS = (ord(IncTagId), "inc")  ## `inc` of an ordinal location; `T` is the location's type, the optional step defaults to 1. A `range` location owes its range, like `x = succ(x, y)`. Lowered to `asgn`/`add` by the hexer
+    DecS = (ord(DecTagId), "dec")  ## `dec` of an ordinal location; like `inc`
     IncludeS = (ord(IncludeTagId), "include")  ## `include` statement
     ImportS = (ord(ImportTagId), "import")  ## `import` statement
     ImportasS = (ord(ImportasTagId), "importas")  ## `import as` statement
@@ -192,15 +203,16 @@ type
     UsingS = (ord(UsingTagId), "using")  ## `using` statement
     AsmS = (ord(AsmTagId), "asm")  ## `asm` statement
     DeferS = (ord(DeferTagId), "defer")  ## `defer` statement
+    AlwaysS = (ord(AlwaysTagId), "always")  ## the statements of one replicated `finally` section: the eraiser emits one `(always …)` per way out of a `try`, so each copy stays recognizable as "runs on every path" after the `try` itself is gone. Like `stmts`, it opens no scope. Currently pure meta information: `lengcgen` emits its statements unwrapped, so `lengc`/`arkham` never see it. It is meant for checking that every path destroys a value and, later, for precise stack unwinding that runs custom logic
 
 proc rawTagIsNimonyStmt*(raw: TagEnum): bool {.inline.} =
-  raw in {CallTagId, CmdTagId, GvarTagId, TvarTagId, VarTagId, ConstTagId, ResultTagId, GletTagId, TletTagId, LetTagId, CursorTagId, PatternvarTagId, ProcTagId, FuncTagId, IteratorTagId, ConverterTagId, MethodTagId, MacroTagId, TemplateTagId, TypeTagId, BlockTagId, EmitTagId, AsgnTagId, ScopeTagId, IfTagId, WhenTagId, BreakTagId, ContinueTagId, ForTagId, WhileTagId, CoroforTagId, CaseTagId, RetTagId, YldTagId, StmtsTagId, PragmasTagId, PragmaxTagId, InclTagId, ExclTagId, IncludeTagId, ImportTagId, ImportasTagId, FromimportTagId, ImportexceptTagId, ExportTagId, ExportexceptTagId, CommentTagId, DiscardTagId, TryTagId, RaiseTagId, UnpackdeclTagId, AssumeTagId, AssertTagId, CallstrlitTagId, InfixTagId, PrefixTagId, HcallTagId, StaticstmtTagId, BindTagId, MixinTagId, UsingTagId, AsmTagId, DeferTagId}
+  raw in {CallTagId, CmdTagId, GvarTagId, TvarTagId, VarTagId, ConstTagId, ResultTagId, GletTagId, TletTagId, LetTagId, CursorTagId, PatternvarTagId, ProcTagId, FuncTagId, IteratorTagId, ConverterTagId, MethodTagId, MacroTagId, TemplateTagId, TypeTagId, BlockTagId, EmitTagId, AsgnTagId, ScopeTagId, IfTagId, WhenTagId, BreakTagId, ContinueTagId, ForTagId, WhileTagId, CoroforTagId, CaseTagId, LabTagId, JmpTagId, RetTagId, YldTagId, StmtsTagId, PragmasTagId, PragmaxTagId, InclTagId, ExclTagId, IncTagId, DecTagId, IncludeTagId, ImportTagId, ImportasTagId, FromimportTagId, ImportexceptTagId, ExportTagId, ExportexceptTagId, CommentTagId, DiscardTagId, TryTagId, RaiseTagId, UnpackdeclTagId, AssumeTagId, AssertTagId, CallstrlitTagId, InfixTagId, PrefixTagId, HcallTagId, StaticstmtTagId, BindTagId, MixinTagId, UsingTagId, AsmTagId, DeferTagId, AlwaysTagId}
 
 type
   NimonyType* = enum
     NoType
     ErrT = (ord(ErrTagId), "err")  ## indicates an error
-    AtT = (ord(AtTagId), "at")  ## array indexing operation (typed Nimony form vs untyped Leng form); also used for generic proc/type instantiation `(at callee T1 T2 ...)` where an argument may also be a constant *value* bound to a `staticTypevar`
+    AtT = (ord(AtTagId), "at")  ## array indexing operation (typed Nimony form vs untyped Leng form); also used for generic proc/type instantiation `(at callee T1 T2 ...)` where an argument may also be a constant *value* bound to a `staticTypevar`. In a **type** slot the head always names a type: a deferred plugin call, which used to share this tag and did not, has its own `(pluginCall …)`
     AndT = (ord(AndTagId), "and")  ## boolean `and` operation; `Y+` form is also used for concept parent lists with more than two parents
     OrT = (ord(OrTagId), "or")  ## boolean `or` operation
     NotT = (ord(NotTagId), "not")  ## boolean `not` operation
@@ -223,8 +235,9 @@ type
     PtrT = (ord(PtrTagId), "ptr")  ## `ptr` type contructor; the `(unchecked)` pragma relaxes nil checking on deref
     ArrayT = (ord(ArrayTagId), "array")  ## `array` type constructor (element type, index type/range)
     VarargsT = (ord(VarargsTagId), "varargs")  ## `varargs` type/proc annotation: Nimony carries the element type and an optional transformer symbol (e.g. `` `$` ``); Leng keeps only the element type
-    StaticT = (ord(StaticTagId), "static")  ## `static` type or annotation
+    StaticT = (ord(StaticTagId), "static")  ## `static` type or annotation; as an expression, `static(expr)` evaluates `expr` at compile time
     TupleT = (ord(TupleTagId), "tuple")  ## `tuple` type
+    ClosureTupleT = (ord(ClosureTupleTagId), "closureTuple")  ## internal lifted-closure tuple type: `(closureTuple <proctype> (ref RootObj))`. Structurally a two-element tuple — a function pointer plus its environment — but tagged distinctly so lambda lifting and the coroutine transform can recognize an *already lifted* closure/iterator value by its tag instead of by probing a plain `(tuple ...)`. Produced by `hexer`'s `lambdalifting`/`coro_transform`/`cps` only; `lengcgen` lowers it to an ordinary Leng `(tuple ...)`
     OnumT = (ord(OnumTagId), "onum")  ## enum with holes type
     AnumT = (ord(AnumTagId), "anum")  ## sum type discriminator enum ("auto enum")
     RefT = (ord(RefTagId), "ref")  ## `ref` type; the `(unchecked)` pragma relaxes nil checking on deref
@@ -232,6 +245,7 @@ type
     OutT = (ord(OutTagId), "out")  ## `out` type
     LentT = (ord(LentTagId), "lent")  ## `lent` type
     SinkT = (ord(SinkTagId), "sink")  ## `sink` type
+    OwnedT = (ord(OwnedTagId), "owned")  ## `owned` type: the unique owning edge of a `ref` or closure (RFC #575)
     NiltT = (ord(NiltTagId), "nilt")  ## `nilt` type
     ConceptT = (ord(ConceptTagId), "concept")  ## `concept` type: two reserved slots, optional parent concepts (`.` / sym / `(and ...)`), a `Self` typevar `D`, and the concept body statements `S*` (body may be empty when parents are present)
     DistinctT = (ord(DistinctTagId), "distinct")  ## `distinct` type
@@ -248,14 +262,15 @@ type
     CstringT = (ord(CstringTagId), "cstring")  ## `cstring` type; optional first child is the string literal used in a `cstring"…"` generalized string; further attributes carry importc/header overrides inlined from `{.importc.}` aliases
     PointerT = (ord(PointerTagId), "pointer")  ## `pointer` type; the optional `(nil)` annotation marks a nilable pointer; further attributes carry importc/header overrides inlined from `{.importc.}` aliases
     OrdinalT = (ord(OrdinalTagId), "ordinal")  ## `ordinal` type
+    PluginCallT = (ord(PluginCallTagId), "pluginCall")  ## the parked form of a **deferred plugin call**: a `.plugin` template invocation that answered `(deferexpansion)` because its arguments still mention type variables. `Y` is the template symbol, the rest are its sem-checked arguments. Having its own tag is what keeps it apart from the three other meanings of `(at …)` — subscript, explicit generic instantiation, generic type invocation — none of which a pass has to probe for any more. Whether it stands for a TYPE or a VALUE is deliberately NOT in the node: the template's declared return type says, `typedesc` meaning a type and anything else (`untyped` included) meaning a value
 
 proc rawTagIsNimonyType*(raw: TagEnum): bool {.inline.} =
-  raw in {ErrTagId, AtTagId, AndTagId, OrTagId, NotTagId, ProcTagId, FuncTagId, IteratorTagId, ConverterTagId, MethodTagId, MacroTagId, TemplateTagId, ObjectTagId, EnumTagId, ProctypeTagId, ITagId, UTagId, FTagId, CTagId, BoolTagId, VoidTagId, PtrTagId, ArrayTagId, VarargsTagId, StaticTagId, TupleTagId, OnumTagId, AnumTagId, RefTagId, MutTagId, OutTagId, LentTagId, SinkTagId, NiltTagId, ConceptTagId, DistinctTagId, ItertypeTagId, RangetypeTagId, UarrayTagId, SetTagId, AutoTagId, SymkindTagId, TypekindTagId, TypedescTagId, UntypedTagId, TypedTagId, CstringTagId, PointerTagId, OrdinalTagId}
+  raw in {ErrTagId, AtTagId, AndTagId, OrTagId, NotTagId, ProcTagId, FuncTagId, IteratorTagId, ConverterTagId, MethodTagId, MacroTagId, TemplateTagId, ObjectTagId, EnumTagId, ProctypeTagId, ITagId, UTagId, FTagId, CTagId, BoolTagId, VoidTagId, PtrTagId, ArrayTagId, VarargsTagId, StaticTagId, TupleTagId, ClosureTupleTagId, OnumTagId, AnumTagId, RefTagId, MutTagId, OutTagId, LentTagId, SinkTagId, OwnedTagId, NiltTagId, ConceptTagId, DistinctTagId, ItertypeTagId, RangetypeTagId, UarrayTagId, SetTagId, AutoTagId, SymkindTagId, TypekindTagId, TypedescTagId, UntypedTagId, TypedTagId, CstringTagId, PointerTagId, OrdinalTagId, PluginCallTagId}
 
 type
   NimonyOther* = enum
     NoSub
-    NilU = (ord(NilTagId), "nil")  ## nil pointer value; closure `nil` carries the proc type and a nil environment
+    NilU = (ord(NilTagId), "nil")  ## nil pointer value; `T` is the pointer type it stands for. `nil` is the one type-polymorphic literal, so the frontend types every `ptr`/`ref`/`pointer`/`cstring` one (`derefs.nim`) and `T` survives into Leng; only a `nil` a later pass synthesizes is bare. A closure `nil` carries the proc type plus `X`, a nil environment
     NotnilU = (ord(NotnilTagId), "notnil")  ## `not nil` pointer annotation
     UncheckedU = (ord(UncheckedTagId), "unchecked")  ## `unchecked` pointer annotation (derefs do not require nil checking)
     KvU = (ord(KvTagId), "kv")  ## key-value pair; optional INTLIT indicates field is in an inherited object
@@ -265,17 +280,18 @@ type
     ParamU = (ord(ParamTagId), "param")  ## parameter declaration
     TypevarU = (ord(TypevarTagId), "typevar")  ## type variable declaration; constraint `.T` is optional
     StaticTypevarU = (ord(StaticTypevarTagId), "staticTypevar")  ## value generic parameter: a generic parameter that is a compile-time *value*; the type slot holds the value's plain element type (e.g. `int` for `N: static[int]`), never a `static` wrapper
+    StaticParamU = (ord(StaticParamTagId), "staticParam")  ## constant parameter restriction: a term parameter whose call-site argument must be a tier-1 constant expression (literal, `const`, `staticParam`/`staticTypevar` reference, primitive arithmetic); the type slot holds the plain element type (e.g. `int` for `x: static[int]`), never a `static` wrapper. Hexer lowers it to an ordinary `param`
     EfldU = (ord(EfldTagId), "efld")  ## enum field declaration; slot 2 carries the export marker *or* the compile-time value (may be `.`)
     FldU = (ord(FldTagId), "fld")  ## field declaration
     GfldU = (ord(GfldTagId), "gfld")  ## guarded field declaration, cannot be accessed outside an `of` branch
     WhenU = (ord(WhenTagId), "when")  ## when statement header
     ElifU = (ord(ElifTagId), "elif")  ## pair of (condition, action)
-    ElseU = (ord(ElseTagId), "else")  ## `else` action
+    ElseU = (ord(ElseTagId), "else")  ## `else` action, or the default branch of a Leng discriminated `union`
     TypevarsU = (ord(TypevarsTagId), "typevars")  ## type variable/generic parameters; after sem an entry may also be a `(staticTypevar ...)`
     CaseU = (ord(CaseTagId), "case")  ## `case` statement
-    OfU = (ord(OfTagId), "of")  ## `of` branch within a `case` statement
+    OfU = (ord(OfTagId), "of")  ## `of` branch within a `case` statement, or of a Leng discriminated `union`
     StmtsU = (ord(StmtsTagId), "stmts")  ## list of statements
-    ParamsU = (ord(ParamsTagId), "params")  ## list of proc parameters, also used as a "proc type"
+    ParamsU = (ord(ParamsTagId), "params")  ## list of proc parameters, also used as a "proc type"; after sem an entry may also be a `(staticParam ...)`
     PragmasU = (ord(PragmasTagId), "pragmas")  ## begin of pragma section
     EitherU = (ord(EitherTagId), "either")  ## `either` construct to combine location versions
     JoinU = (ord(JoinTagId), "join")  ## `join` construct inside `ite`
@@ -285,9 +301,11 @@ type
     ForcallU = (ord(ForcallTagId), "forcall")  ## for-loop plugin input: the iterator name, grouped call arguments, loop variables, and the loop body
     ExceptU = (ord(ExceptTagId), "except")  ## except subsection
     FinU = (ord(FinTagId), "fin")  ## finally subsection
+    DeferexpansionU = (ord(DeferexpansionTagId), "deferexpansion")  ## emitted by a template *plugin* as its entire output to say "I cannot answer while the argument still contains type variables — ask me again after instantiation". The compiler then parks the sem-checked call in the tree as `(pluginCall <template> <args>…)` instead of replacing it with an expansion. `subsGenericProc` substitutes into it like any other tree, and the instantiation's re-sem turns it back into a call, which drives the plugin again with concrete arguments. Rejected (a hard error) when no argument contains a generic parameter, which is what makes the retry well-founded
+    NeedtypesU = (ord(NeedtypesTagId), "needtypes")  ## emitted by a template *plugin* as its entire output to ask the compiler for the declarations of the named symbols. The compiler appends them to the plugin's second input (`loadTypeDefinitions()`) and runs the plugin again. This is how a plugin resolves a nominal type: it arrives in the main input as an opaque `Symbol`, and a plugin runs in its own process with no way to look it up. Only what is asked for is shipped, so a plugin that never asks pays nothing. Requesting a symbol that was already provided is a hard error, which is what bounds the loop
 
 proc rawTagIsNimonyOther*(raw: TagEnum): bool {.inline.} =
-  raw in {NilTagId, NotnilTagId, UncheckedTagId, KvTagId, VvTagId, RangeTagId, RangesTagId, ParamTagId, TypevarTagId, StaticTypevarTagId, EfldTagId, FldTagId, GfldTagId, WhenTagId, ElifTagId, ElseTagId, TypevarsTagId, CaseTagId, OfTagId, StmtsTagId, ParamsTagId, PragmasTagId, EitherTagId, JoinTagId, UnpackflatTagId, UnpacktupTagId, CallargsTagId, ForcallTagId, ExceptTagId, FinTagId}
+  raw in {NilTagId, NotnilTagId, UncheckedTagId, KvTagId, VvTagId, RangeTagId, RangesTagId, ParamTagId, TypevarTagId, StaticTypevarTagId, StaticParamTagId, EfldTagId, FldTagId, GfldTagId, WhenTagId, ElifTagId, ElseTagId, TypevarsTagId, CaseTagId, OfTagId, StmtsTagId, ParamsTagId, PragmasTagId, EitherTagId, JoinTagId, UnpackflatTagId, UnpacktupTagId, CallargsTagId, ForcallTagId, ExceptTagId, FinTagId, DeferexpansionTagId, NeedtypesTagId}
 
 type
   NimonyPragma* = enum
@@ -295,7 +313,7 @@ type
     CastP = (ord(CastTagId), "cast")  ## `cast` operation (typed cast expression, or `{.cast(pragma).}` pragma form)
     CursorP = (ord(CursorTagId), "cursor")  ## cursor variable declaration
     EmitP = (ord(EmitTagId), "emit")  ## emit statement
-    UnionP = (ord(UnionTagId), "union")  ## first one is Leng union declaration, second one is Nimony union pragma
+    UnionP = (ord(UnionTagId), "union")  ## first two are Leng union declarations (untagged, and discriminated from a case object - see `doc/internals/leng-spec.md`), third is the Nimony union pragma
     InlineP = (ord(InlineTagId), "inline")  ## `inline` proc annotation
     NoinlineP = (ord(NoinlineTagId), "noinline")  ## `noinline` proc annotation
     ClosureP = (ord(ClosureTagId), "closure")  ## `closure` proc annotation; not a calling convention anymore, simply annotates a proc as a closure
@@ -309,7 +327,7 @@ type
     MagicP = (ord(MagicTagId), "magic")  ## `magic` pragma; argument is the magic's name as string literal or ident (e.g. `"Bool"`, `HoleyEnum`)
     ImportcP = (ord(ImportcTagId), "importc")  ## `importc` pragma
     ImportcppP = (ord(ImportcppTagId), "importcpp")  ## `importcpp` pragma
-    DynlibP = (ord(DynlibTagId), "dynlib")  ## `dynlib` pragma
+    DynlibP = (ord(DynlibTagId), "dynlib")  ## `dynlib` pragma; on a Leng decl: static import library of an `importc` proc (native backend): the declaration binds through the image's import table instead of a runtime loader stub
     ExportcP = (ord(ExportcTagId), "exportc")  ## `exportc` pragma
     HeaderP = (ord(HeaderTagId), "header")  ## `header` pragma
     ThreadvarP = (ord(ThreadvarTagId), "threadvar")  ## `threadvar` pragma
@@ -327,10 +345,11 @@ type
     EnsuresP = (ord(EnsuresTagId), "ensures")  ## `ensures` pragma
     AssumeP = (ord(AssumeTagId), "assume")  ## `assume` pragma/annotation
     AssertP = (ord(AssertTagId), "assert")  ## `assert` pragma/annotation
-    BuildP = (ord(BuildTagId), "build")  ## `build` pragma
+    BuildP = (ord(BuildTagId), "build")  ## `build` pragma; in the index, each `(tup …)` entry is `(lang source flags [objectName])` for a `compile`d file, or `(builder tool args [linkflags])` for a `build` backend
     FeatureP = (ord(FeatureTagId), "feature")  ## `feature` pragma
     StringP = (ord(StringTagId), "string")  ## `string` pragma
     ViewP = (ord(ViewTagId), "view")  ## `view` pragma
+    EstablishesBorrowP = (ord(EstablishesBorrowTagId), "establishesBorrow")  ## `establishesBorrow` pragma: the routine's result borrows from its first parameter. `let v = f(x)` then starts a borrow of `x` that lasts until `v` dies, so `x` cannot be mutated or passed to a `var` parameter in between. This is what carries the borrow across the call boundary for view constructors such as `toOpenArray`, whose bodies build the view out of a raw pointer the borrow checker cannot follow.
     IncompleteStructP = (ord(IncompleteStructTagId), "incompleteStruct")  ## `incompleteStruct` pragma
     InjectP = (ord(InjectTagId), "inject")  ## `inject` pragma
     GensymP = (ord(GensymTagId), "gensym")  ## `gensym` pragma
@@ -347,7 +366,7 @@ type
     PureP = (ord(PureTagId), "pure")  ## `pure` pragma (currently ignored)
     FinalP = (ord(FinalTagId), "final")  ## `final` pragma
     AcyclicP = (ord(AcyclicTagId), "acyclic")  ## `acyclic` pragma (currently ignored)
-    PragmaP = (ord(PragmaTagId), "pragma")  ## `pragma` pragma
+    PragmaP = (ord(PragmaTagId), "pragma")  ## `pragma` pragma: a custom pragma attached to a declaration, naming the `{.pragma.}` template it resolved to, followed by its arguments exactly as written (they are `untyped`, so they are preserved unchecked)
     PackedP = (ord(PackedTagId), "packed")  ## `packed` pragma
     PassiveP = (ord(PassiveTagId), "passive")  ## `passive` pragma
     PushP = (ord(PushTagId), "push")  ## `push` pragma
@@ -363,11 +382,27 @@ type
     StacktraceP = (ord(StacktraceTagId), "stacktrace")  ## `stackTrace` pragma; accepted for Nim source compatibility, semantically ignored
     GcsafeP = (ord(GcsafeTagId), "gcsafe")  ## `gcsafe` pragma; accepted for Nim source compatibility, semantically ignored
     UsedP = (ord(UsedTagId), "used")  ## `used` pragma; accepted for Nim source compatibility, semantically ignored
-    CompileP = (ord(CompileTagId), "compile")  ## `compile` pragma (Nim-compatible alias of `build`; the source language is inferred from the file extension, e.g. `.m` → Objective-C)
+    CompileP = (ord(CompileTagId), "compile")  ## `compile` pragma (Nim-compatible): compile a foreign C/C++/ObjC source and link its object; the source language is inferred from the file extension, e.g. `.m` → Objective-C. Every argument is a constant string expression; the tuple form is `(pattern, objectPattern)`
     BundleP = (ord(BundleTagId), "bundle")  ## `bundle` pragma: a custom linker command override `(builder, tool[, args])`; the `tool` is built on demand by `builder` and replaces the final link step, consuming the project's link manifest
+    SyncP = (ord(SyncTagId), "sync")  ## `sync` routine pragma: the routine may operate on a shared global (or a field of one) passed to one of its `var`/`ptr` parameters; inside its body those parameters are themselves only usable as such arguments to other `.sync` routines
+    AssumeSyncP = (ord(AssumeSyncTagId), "assumeSync")  ## `assumeSync` marker; only valid inside `{.cast(assumeSync).}:` pragma blocks (the block may access shared globals freely)
+    InstructionP = (ord(InstructionTagId), "instruction")  ## target-pinned instruction annotation; the argument is an opcode NAME from `lib/intrinsics`'s `IntrinsicOp`, spelled as a string literal (`{.instruction: "bsf".}`). A string, not an ident: the name is data resolved by table lookup, it is never subject to scope or overload resolution, and an ident would additionally have to dodge Nim's keywords. The proc is a *declaration* of one machine instruction: calls to it become `(instr …)`, never an ABI call. Its signature spelling is dictated by the row's operand roles and checked at the declaration
+    IntrinsicP = (ord(IntrinsicTagId), "intrinsic")  ## portable-intrinsic annotation; like `instruction` (same string-literal argument) but the opcode is target-neutral and may expand to any number of instructions (`Memcpy`, `AtomicFetchAdd`, …). Its signature is unified against the row's shape at the declaration
+    RegisterP = (ord(RegisterTagId), "register")  ## pins a parameter, result or local to a named machine register (`{.register: "rdi".}`). In an `{.assembler.}` proc this is an *assertion* the back end verifies; in an ordinary proc it is a hard pin the register allocator honours
+    StackP = (ord(StackTagId), "stack")  ## pins a local to a stack slot rather than a register (`{.stack.}`) — the memory counterpart of `(register …)`
+    AssemblerP = (ord(AssemblerTagId), "assembler")  ## the `{.assembler.}` **proc pragma** (no children): every construct in the body maps one-to-one to assembler, in source order, with no temporaries invented and no operand materialised. The back end (arkham) owns that checking — see `nativenif/doc/intrinsics.md` §8. Spelled `assembler` rather than `asm` because Nim's parser reads a pragma entry as an expression and so cannot accept a keyword there; it is unrelated to the `(asm X+)` statement
+    AlwaysInlineP = (ord(AlwaysInlineTagId), "alwaysInline")  ## the `{.alwaysInline.}` proc pragma: splice this proc at every call site, unconditionally — no size bound, no per-call-site score. Unlike `(inline)`, which is an *emission* annotation the inlining policy deliberately ignores, this one overrides the policy. It is the author asserting what a token count cannot see: typically "my hot path is two instructions and the bulk is a cold tail behind a `(noinline)` callee". Only the recursion guard still applies — that is termination, not heuristics
+    NakedP = (ord(NakedTagId), "naked")  ## the `{.naked.}` **proc pragma** (no children): emit NO prologue and NO epilogue — the proc never touches SP, so on entry SP still points straight at the return address the `call` pushed. That is the one thing an ordinary proc cannot observe about its caller, and it is what lets `getStackTrace` seed a stack walk with a frame it did not create. Only legal together with `(assembler)`: without a frame there is nowhere to spill, so every location must already be declared. The back end (arkham) owns the checking
+    InterruptP = (ord(InterruptTagId), "interrupt")  ## the `{.interrupt: "SysTick".}` **proc pragma**: this routine is the handler for the named exception or interrupt, and the back end installs its address in the interrupt table. WHICH names exist is a target question — arkham's, exactly as for `(register)` — so sem checks only what is true of every part: a handler is invoked by hardware, which passes no arguments and has nowhere to put a result, so the routine must take no parameters and return nothing. It is also a DCE ROOT: nothing in the program calls it, it is reached only through the table, and without that it is deleted and the device silently never responds. The C and LLVM backends refuse it — they have no interrupt table to install anything into, and `{.exportc.}` is what binds a handler by name against a vendor startup file
+    ImportjsP = (ord(ImportjsTagId), "importjs")  ## the `{.importjs.}` **proc pragma**: a bodyless proc whose argument is the raw JavaScript splice template, in Nim 2's language (`#` consumes the next operand, `$1`/`$#` name the proc, `$$` a literal `$`, `@` spreads the operands left) so the existing `lib/js` binding declarations port verbatim. The template rides into the decl unchanged and is forwarded across Leng for the JS back end to splice at the call site; the C and native back ends have no lowering for it and reject the pragma.
+    LinkP = (ord(LinkTagId), "link")  ## `link` pragma (Nim-compatible): link a prebuilt object file or static library into the program; the argument is a constant string expression naming a path relative to the pragma's file (`.o` is appended when it has no extension). In the index, the absolute paths of every `link`ed file of the module
+    IntdefineP = (ord(IntdefineTagId), "intdefine")  ## `intdefine` pragma (Nim-compatible): on a `const`, the command line may override the written initializer. The key is the constant's name, or the optional string literal when one is given; `-d:key=42` then supplies the value, which is parsed as an integer literal and re-semchecked against the constant's declared type, so a narrower type still range-checks
+    BooldefineP = (ord(BooldefineTagId), "booldefine")  ## `booldefine` pragma (Nim-compatible): like `intdefine`, but the value is a boolean. A bare `-d:key` means `true`; `on`/`off` and `1`/`0` are accepted alongside `true`/`false`
+    StrdefineP = (ord(StrdefineTagId), "strdefine")  ## `strdefine` pragma (Nim-compatible): like `intdefine`, but the value is taken verbatim as a string literal
+    EnableTraceP = (ord(EnableTraceTagId), "enableTrace")  ## `{.enableTrace.}` statement in the body of a memory management runtime's `nimTraceRef`: the runtime collects cycles, so the compiler lifts `=trace` and hooks refs for it (see `lib/std/system/orc.nim`)
 
 proc rawTagIsNimonyPragma*(raw: TagEnum): bool {.inline.} =
-  raw in {CastTagId, CursorTagId, EmitTagId, UnionTagId, InlineTagId, NoinlineTagId, ClosureTagId, VarargsTagId, SelectanyTagId, AlignTagId, BitsTagId, NodeclTagId, RaisesTagId, UntypedTagId, MagicTagId, ImportcTagId, ImportcppTagId, DynlibTagId, ExportcTagId, HeaderTagId, ThreadvarTagId, GlobalTagId, DiscardableTagId, NoreturnTagId, BorrowTagId, NoSideEffectTagId, NodestroyTagId, PluginTagId, BycopyTagId, ByrefTagId, NoinitTagId, RequiresTagId, EnsuresTagId, AssumeTagId, AssertTagId, BuildTagId, FeatureTagId, StringTagId, ViewTagId, IncompleteStructTagId, InjectTagId, GensymTagId, DirtyTagId, ErrorTagId, ReportTagId, TagsTagId, DeprecatedTagId, SideEffectTagId, KeepOverflowFlagTagId, SemanticsTagId, InheritableTagId, BaseTagId, PureTagId, FinalTagId, AcyclicTagId, PragmaTagId, PackedTagId, PassiveTagId, PushTagId, CallConvTagId, PopTagId, PassLTagId, PassCTagId, MethodsTagId, SizeTagId, UncheckedAccessTagId, UncheckedAssignTagId, ProfilerTagId, StacktraceTagId, GcsafeTagId, UsedTagId, CompileTagId, BundleTagId}
+  raw in {CastTagId, CursorTagId, EmitTagId, UnionTagId, InlineTagId, NoinlineTagId, ClosureTagId, VarargsTagId, SelectanyTagId, AlignTagId, BitsTagId, NodeclTagId, RaisesTagId, UntypedTagId, MagicTagId, ImportcTagId, ImportcppTagId, DynlibTagId, ExportcTagId, HeaderTagId, ThreadvarTagId, GlobalTagId, DiscardableTagId, NoreturnTagId, BorrowTagId, NoSideEffectTagId, NodestroyTagId, PluginTagId, BycopyTagId, ByrefTagId, NoinitTagId, RequiresTagId, EnsuresTagId, AssumeTagId, AssertTagId, BuildTagId, FeatureTagId, StringTagId, ViewTagId, EstablishesBorrowTagId, IncompleteStructTagId, InjectTagId, GensymTagId, DirtyTagId, ErrorTagId, ReportTagId, TagsTagId, DeprecatedTagId, SideEffectTagId, KeepOverflowFlagTagId, SemanticsTagId, InheritableTagId, BaseTagId, PureTagId, FinalTagId, AcyclicTagId, PragmaTagId, PackedTagId, PassiveTagId, PushTagId, CallConvTagId, PopTagId, PassLTagId, PassCTagId, MethodsTagId, SizeTagId, UncheckedAccessTagId, UncheckedAssignTagId, ProfilerTagId, StacktraceTagId, GcsafeTagId, UsedTagId, CompileTagId, BundleTagId, SyncTagId, AssumeSyncTagId, InstructionTagId, IntrinsicTagId, RegisterTagId, StackTagId, AssemblerTagId, AlwaysInlineTagId, NakedTagId, InterruptTagId, ImportjsTagId, LinkTagId, IntdefineTagId, BooldefineTagId, StrdefineTagId, EnableTraceTagId}
 
 type
   NimonySym* = enum
@@ -385,6 +420,7 @@ type
     PatternvarY = (ord(PatternvarTagId), "patternvar")  ## pattern variable declaration
     TypevarY = (ord(TypevarTagId), "typevar")  ## type variable declaration; constraint `.T` is optional
     StaticTypevarY = (ord(StaticTypevarTagId), "staticTypevar")  ## value generic parameter: a generic parameter that is a compile-time *value*; the type slot holds the value's plain element type (e.g. `int` for `N: static[int]`), never a `static` wrapper
+    StaticParamY = (ord(StaticParamTagId), "staticParam")  ## constant parameter restriction: a term parameter whose call-site argument must be a tier-1 constant expression (literal, `const`, `staticParam`/`staticTypevar` reference, primitive arithmetic); the type slot holds the plain element type (e.g. `int` for `x: static[int]`), never a `static` wrapper. Hexer lowers it to an ordinary `param`
     EfldY = (ord(EfldTagId), "efld")  ## enum field declaration; slot 2 carries the export marker *or* the compile-time value (may be `.`)
     FldY = (ord(FldTagId), "fld")  ## field declaration
     GfldY = (ord(GfldTagId), "gfld")  ## guarded field declaration, cannot be accessed outside an `of` branch
@@ -399,9 +435,10 @@ type
     BlockY = (ord(BlockTagId), "block")  ## block declaration
     ModuleY = (ord(ModuleTagId), "module")  ## module declaration
     CchoiceY = (ord(CchoiceTagId), "cchoice")  ## closed choice
+    LabY = (ord(LabTagId), "lab")  ## label, target of a `jmp` instruction. Also a **Nimony** statement: `xelim` lowers short-circuit `and`/`or` chains to the flat `(if c (jmp L))` / `(lab L)` form (the two-target condition compiler, see `doc/internals/multi_join_ir.md`), which needs a merge label that is not an enclosing region's end — something `(block)`/`(break)` cannot express without one wrapper per merge
 
 proc rawTagIsNimonySym*(raw: TagEnum): bool {.inline.} =
-  raw >= GvarTagId and raw <= CchoiceTagId
+  raw in {GvarTagId, TvarTagId, VarTagId, ParamTagId, ConstTagId, ResultTagId, GletTagId, TletTagId, LetTagId, CursorTagId, PatternvarTagId, TypevarTagId, StaticTypevarTagId, StaticParamTagId, EfldTagId, FldTagId, GfldTagId, ProcTagId, FuncTagId, IteratorTagId, ConverterTagId, MethodTagId, MacroTagId, TemplateTagId, TypeTagId, BlockTagId, ModuleTagId, CchoiceTagId, LabTagId}
 
 type
   HookKind* = enum
@@ -419,7 +456,7 @@ proc rawTagIsHookKind*(raw: TagEnum): bool {.inline.} =
 type
   ControlFlowKind* = enum
     NoControlFlow
-    IteF = (ord(IteTagId), "ite")  ## if-then-else followed by `join` information followed by an optional label
+    IteF = (ord(IteTagId), "ite")  ## if-then-else, optionally followed by `join` information and by a label. The multi-join IR and `controlflow.nim` use the three-child form, whose else-part may be `.`; the `join` slot is Leng's
     GraphF = (ord(GraphTagId), "graph")  ## disjoint subgraph annotation
     ForbindF = (ord(ForbindTagId), "forbind")  ## bindings for a `for` loop but the loop itself is mapped to gotos
     KillF = (ord(KillTagId), "kill")  ## some.var is about to disappear (scope exit)

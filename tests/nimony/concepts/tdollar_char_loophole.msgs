@@ -1,0 +1,9 @@
+tests/nimony/concepts/tdollar_char_loophole.nim(36, 17) Error: Type mismatch at [position]
+render(Unstringable(3))
+[1] Unstringable does not match constraint Stringable (declared in tests/nimony/concepts/tdollar_char_loophole.nim(31, 1))
+tests/nimony/concepts/tdollar_char_loophole.nim(39, 17) Error: Type mismatch at [position]
+render('c')
+[1] char does not match constraint Stringable (declared in tests/nimony/concepts/tdollar_char_loophole.nim(31, 1))
+tests/nimony/concepts/tdollar_char_loophole.nim(43, 15) Error: Type mismatch at [position]
+show('c')
+[1] char does not match constraint Renderable (declared in tests/nimony/concepts/tdollar_char_loophole.nim(33, 1))

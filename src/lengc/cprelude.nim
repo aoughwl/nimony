@@ -28,6 +28,38 @@ const
 typedef unsigned char NB8; // best effort
 #endif
 
+/* Assembler-name prefix for `__asm__` symbol labels: Mach-O prepends an
+   underscore to C identifiers, ELF/PE(x64) do not. Used via string-literal
+   concatenation: __asm__(NIM_ASM_PREFIX "write"). */
+#ifdef __APPLE__
+#define NIM_ASM_PREFIX "_"
+#else
+#define NIM_ASM_PREFIX ""
+#endif
+
+/* The spin-wait hint behind `std/atomics`'s `cpuRelax` (the `CpuRelax`
+   intrinsic row). A macro rather than a builtin named on the Nimony side,
+   because WHICH instruction it is depends on the target the C compiler is
+   configured for, which Nimony does not know: `__builtin_ia32_pause` does not
+   exist off x86 and there is no ARM builtin portable across GCC and clang to
+   name instead. Every arm is a hint and nothing more, so a target with no
+   spelling for it gets an empty statement — the loop still spins correctly,
+   it just does not tell the core it is waiting. */
+#if defined(__GNUC__) || defined(__clang__)
+#  if defined(__i386__) || defined(__x86_64__)
+#    define NIM_CPU_RELAX() __builtin_ia32_pause()
+#  elif defined(__aarch64__) || defined(__arm__)
+#    define NIM_CPU_RELAX() __asm__ __volatile__("yield" ::: "memory")
+#  else
+#    define NIM_CPU_RELAX() ((void)0)
+#  endif
+#elif defined(_MSC_VER) && (defined(_M_IX86) || defined(_M_X64))
+#  include <intrin.h>
+#  define NIM_CPU_RELAX() _mm_pause()
+#else
+#  define NIM_CPU_RELAX() ((void)0)
+#endif
+
 typedef unsigned char NC8;
 
 typedef float NF32;
@@ -309,8 +341,6 @@ typedef NU8 NU;
 #  else
 #    define NIM_THREADVAR __thread
 #  endif
-#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112 && !defined __STDC_NO_THREADS__
-#  define NIM_THREADVAR _Thread_local
 #elif defined _WIN32 && ( \
        defined _MSC_VER || \
        defined __ICL || \
@@ -323,6 +353,8 @@ typedef NU8 NU;
        defined __SUNPRO_C || \
        defined __xlC__
 #  define NIM_THREADVAR __thread
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112 && !defined __STDC_NO_THREADS__
+#  define NIM_THREADVAR _Thread_local
 #else
 #  error "Cannot define NIM_THREADVAR"
 #endif

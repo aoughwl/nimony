@@ -220,6 +220,12 @@ proc typeSizeBits(c: var LLVMCode; n: Cursor): int =
           let sz = typeSizeBits(c, nn)
           if sz > result: result = sz
           skip nn
+        elif isUnionBranch(nn):
+          let b = asUnionBranch(nn)
+          if b.body.typeKind == ObjectT:
+            let sz = typeSizeBits(c, b.body)
+            if sz > result: result = sz
+          skip nn
         else:
           skip nn
   of VoidT, VarargsT, ParamsT:
@@ -271,6 +277,12 @@ proc typeAlignBits(c: var LLVMCode; n: Cursor): int =
           let a = typeAlignBits(c, nn)
           if a > result: result = a
           skip nn
+        elif isUnionBranch(nn):
+          let b = asUnionBranch(nn)
+          if b.body.typeKind == ObjectT:
+            let a = typeAlignBits(c, b.body)
+            if a > result: result = a
+          skip nn
         else:
           skip nn
   else:
@@ -312,6 +324,18 @@ proc collectUnionCandidates(c: var LLVMCode; n: Cursor;
           typ: genUnionBodyLLVM(c, u),
           sizeBits: typeSizeBits(c, nn),
           alignBits: typeAlignBits(c, nn))
+        skip nn
+      elif isUnionBranch(nn):
+        # Discriminated-union branch: only the payload contributes to layout.
+        # A field-less branch adds no candidate, exactly as an omitted branch
+        # did before the branches were tagged.
+        let b = asUnionBranch(nn)
+        if b.body.typeKind == ObjectT:
+          var obj = b.body
+          candidates.add UnionCandidate(
+            typ: genObjectBodyLLVM(c, obj),
+            sizeBits: typeSizeBits(c, b.body),
+            alignBits: typeAlignBits(c, b.body))
         skip nn
       else:
         skip nn
@@ -484,6 +508,25 @@ proc searchFieldIdx(c: var LLVMCode; body: var Cursor; fldSym: SymId;
               access = FieldAccess(isBranch: true, index: unionIdx,
                   branchType: brType, branchIndex: innerAccess.index)
               return true
+          elif isUnionBranch(search):
+            # Discriminated-union branch: the payload object is what carries
+            # the fields, so this resolves exactly like the untagged branch
+            # above. Missing this arm would fall through to `skip search`,
+            # leaving `access.index` at the union rather than the field - a
+            # silently wrong GEP index, not a compile error.
+            let b = asUnionBranch(search)
+            if b.body.typeKind == ObjectT:
+              var brCur = b.body
+              let brType = genObjectBodyLLVM(c, brCur)
+              var innerAccess = FieldAccess()
+              var brBfAccum = 0'i64
+              var brBfUnit = 0
+              var inner = b.body
+              if searchFieldIdx(c, inner, fldSym, innerAccess, brBfAccum, brBfUnit):
+                access = FieldAccess(isBranch: true, index: unionIdx,
+                    branchType: brType, branchIndex: innerAccess.index)
+                return true
+            skip search
           else:
             skip search
         body = unionBody
@@ -576,7 +619,7 @@ proc ensureTypeDef(c: var LLVMCode; symId: SymId): LLType =
   ## (enum→scalar, array) resolve inline — LLVM forbids forward refs to non-struct
   ## named types. The placeholder is inserted before the body so recursion returns
   ## a ref instead of looping.
-  let name = mangleToC(c.m.pool.syms[symId])
+  let name = mangleToC(c.m.pool.symString(symId))
   if typeDefByName(c, name) >= 0:
     return LLType(kind: llStruct, name: name) # already registered aggregate (incl. placeholder)
   let d = c.m.getDeclOrNil(symId)
@@ -656,7 +699,7 @@ proc getStructFieldTypes(c: var LLVMCode; typeSym: Cursor): seq[LLType] =
         var bitfieldUnit = 0
         body.into:
           if body.kind == Symbol:
-            let baseName = mangleToC(c.m.pool.syms[body.symId])
+            let baseName = mangleToC(c.m.pool.symString(body.symId))
             result.add LLType(kind: llStruct, name: baseName)
             inc body
           elif body.kind == DotToken:
@@ -677,9 +720,8 @@ proc isPackedType(c: var LLVMCode; typeSym: Cursor): bool =
           skip p
 
 proc operandStr(v: LLValue): string {.inline.} =
-  ## Typed operand text "<type> <value>" for one constant-initializer element,
-  ## whether the leaf is a scalar value (llvInt/llvGlobal/…) or a pre-rendered
-  ## aggregate (llvRawText).
+  ## Typed operand text "<type> <value>" for one constant-initializer element
+  result = ""
   operand(v, result)
 
 proc genGlobalConstr(c: var LLVMCode; n: var Cursor;
@@ -786,6 +828,21 @@ proc genGlobalConstr(c: var LLVMCode; n: var Cursor;
                                 fieldNifTypes.add fdecl.typ
                               else:
                                 skip body
+                        elif isUnionBranch(body):
+                          # Discriminated-union branch: collect its payload's
+                          # fields, same as the untagged branch above.
+                          let b = asUnionBranch(body)
+                          if b.body.typeKind == ObjectT:
+                            var inner = b.body
+                            inner.into:
+                              if inner.kind == DotToken: inc inner
+                              while inner.hasMore:
+                                if inner.substructureKind == FldU:
+                                  var fdecl = takeFieldDecl(inner)
+                                  fieldNifTypes.add fdecl.typ
+                                else:
+                                  skip inner
+                          skip body
                         else:
                           skip body
                   else:
@@ -913,7 +970,7 @@ proc genGlobalConstr(c: var LLVMCode; n: var Cursor;
         result = genGlobalConstr(c, n, declaredType)
         skip n
         while n.hasMore: skip n
-    of AddrC:
+    of AddrC, HaddrC:
       n.into:
         if n.kind == Symbol:
           let name = mangleSym(c, n.symId)

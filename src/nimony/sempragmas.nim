@@ -17,14 +17,14 @@ when defined(nimony):
   {.feature: "untyped".}
   import std / syncio
 import std / [tables, sets, hashes, assertions, strutils]
-from std/os import changeFileExt, getCurrentDir, isAbsolute, absolutePath, normalizedPath, splitFile, extractFilename, `/`
+from std/os import changeFileExt, getCurrentDir, isAbsolute, absolutePath, normalizedPath, splitFile, extractFilename, parentDir, `/`
 include ".." / lib / nifprelude
 include ".." / lib / compat2
-import ".." / lib / symparser
+import ".." / lib / [symparser, intrinsics]
 import nimony_model, builtintypes, decls, asthelpers, programs,
   magics, nifconfig, semdata, sembasics,
   semchecks, semconst, semos, renderer, features, pragmacanon, identstyle,
-  symtabs
+  symtabs, typeprops
 
 # --- thin shims forwarding into the sem core via SemContext callbacks ---
 # (const-eval entry points — semBoolExpr, semConstIntExpr, … — come directly
@@ -33,7 +33,7 @@ import nimony_model, builtintypes, decls, asthelpers, programs,
 proc semStmt(c: var SemContext; dest: var TokenBuf; n: var Cursor; isNewScope: bool) =
   c.semStmtCB(c, dest, n, isNewScope)
 
-proc declareResult(c: var SemContext; dest: var TokenBuf; info: PackedLineInfo): SymId =
+proc declareResult(c: var SemContext; dest: var TokenBuf; info: NifLineInfo): SymId =
   c.declareResultCB(c, dest, info)
 
 proc semEmit(c: var SemContext; dest: var TokenBuf; it: var Item) =
@@ -81,14 +81,29 @@ proc customPragmaSym*(c: SemContext; name: StrId): SymId =
 proc isCustomPragmaTemplate*(c: SemContext; name: StrId): bool =
   name in c.customPragmaTemplates or customPragmaSym(c, name) != NoSymId
 
+proc resolveCustomPragma(c: SemContext; n: Cursor): SymId =
+  ## The `{.pragma.}` template an annotation refers to.
+  ##
+  ## A template body is semchecked in the scope the template was *declared*
+  ## in, so an annotation written there arrives already bound and must be
+  ## taken as it is: looking its name up again where the template expands is
+  ## the hygiene bug -- `std/json` wraps `nifcore.into`, so `into`'s body ends
+  ## up expanded in a module that never imported the annotation's own module,
+  ## and the name resolves to nothing there.
+  if n.kind == Symbol and symbolIsCustomPragmaTemplate(n.symId):
+    result = n.symId
+  else:
+    let name = getIdent(n)
+    result = if name != StrId(0): c.customPragmaSym(name) else: NoSymId
+
 proc isPreservedCustomPragma(n: Cursor): bool =
   ## True when `n` is a previously-preserved custom-pragma attachment
   ## `(pragma <sym>)` (the `pragma` tag with a symbol child), as opposed to the
   ## bare `(pragma)` marker on a custom-pragma template declaration.
-  if n.kind == ParLe and n.pragmaKind == PragmaP:
+  if n.isTagLit and n.pragmaKind == PragmaP:
     var probe = n
-    inc probe
-    result = probe.kind == Symbol
+    probe = sub(probe) # bound the peek; `probe` is a copy
+    result = probe.hasMore and probe.isSymbol
   else:
     result = false
 
@@ -100,8 +115,22 @@ proc semProposition*(c: var SemContext; dest: var TokenBuf; n: var Cursor; kind:
     c.phase = SemcheckBodies
     withNewScope c:
       if kind == EnsuresP:
-        dest.add parLeToken(ExprX, n.info)
+        dest.addParLe(ExprX, n.info)
+        # An iterator's `result` is the value it yields. `declareResult` does
+        # not declare one for an iterator *body* — there is no such local — but
+        # a proposition *about* what it yields needs the name, and that is what
+        # lets `..<` state the range of a `for` loop variable.
+        #
+        # `resId` is saved because the symbol declared here belongs to the
+        # proposition, not to the routine. A proc's body re-declares its own
+        # `result` afterwards and overwrote it again, which is why this never
+        # showed; for an iterator nothing does.
+        let savedKind = c.routine.kind
+        let savedResId = c.routine.resId
+        if savedKind == IteratorY: c.routine.kind = FuncY
         discard declareResult(c, dest, n.info)
+        c.routine.kind = savedKind
+        c.routine.resId = savedResId
       #let start = dest.len
       semBoolExpr c, dest, n
       if kind == EnsuresP:
@@ -126,23 +155,31 @@ proc resolveHeaderPath*(raw: string; currentFile: string; config: NifConfig): st
   result = onRaiseQuit toAbsolutePath(result, absoluteParentDir(resolvedFile))
 
 proc semPragma*(c: var SemContext; dest: var TokenBuf; n: var Cursor; crucial: var CrucialPragma; kind: SymKind) =
-  var hasParRi = n.kind == ParLe # if false, has no arguments
+  var hasParRi = n.isTagLit # if false, has no arguments
+  var start = default(Cursor)
   if n.substructureKind == KvU:
-    inc n
+    start = n; n = sub(n)
+  template toPragmaArgs() =
+    # step past the pragma name: enter a tag-form pragma's scope, or skip
+    # the name ident inside an already entered `(kv ...)` wrapper
+    if n.isTagLit:
+      start = n; n = sub(n)
+    else:
+      inc n
   var pk = pragmaKind(n)
-  if pk == NoPragma and n.kind == Ident and IgnoreStyleFeature in c.features:
+  if pk == NoPragma and n.isIdent and IgnoreStyleFeature in c.features:
     # Under `.feature: "ignoreStyle".` accept builtin pragma names spelled in
     # any case / underscore variant (Nim's `cmpIgnoreStyle` rule). The
     # downstream case branches still emit the canonical form into `dest`, so
     # the lowering pipeline never sees the user-written spelling.
-    pk = pragmaKindByStyle(n.litId)
+    pk = pragmaKindByStyle(n.strId)
   case pk
   of NoPragma:
     if kind.isRoutine and (let cc = callConvKind(n); cc != NoCallConv):
       dest.addParLe(cc, n.info)
-      inc n
+      toPragmaArgs()
       dest.addParRi()
-    elif n.kind == ParLe and kind == TypeY and (let hk = hookKind(n.tagId); hk != NoHook):
+    elif n.isTagLit and kind == TypeY and (let hk = hookKind(n.cursorTagId); hk != NoHook):
       dest.takeTree n
       hasParRi = false
     else:
@@ -154,74 +191,187 @@ proc semPragma*(c: var SemContext; dest: var TokenBuf; n: var Cursor; crucial: v
         var read = beginRead(pragBuf[])
         while read.hasMore:
           semPragma c, dest, read, crucial, kind
-        endRead(pragBuf[])
-      elif name != StrId(0) and (let psym = c.customPragmaSym(name); psym != NoSymId):
+      elif (let psym = c.resolveCustomPragma(n); psym != NoSymId):
         # Pragma that resolves to a `template X {.pragma.}` declaration. Unlike
-        # Nim (which drops `sfCustomPragma`), preserve it as `(pragma <sym>)`
-        # so it survives into the serialized decl and plugins can introspect it
-        # (e.g. `.linear`). Arguments are not yet supported and are dropped.
+        # Nim (which drops `sfCustomPragma`), preserve it as
+        # `(pragma <sym> <args>)` so it survives into the serialized decl and
+        # can be introspected -- by a plugin (`.linear`), or by the validator,
+        # which reads `{.ensuresNif: addedExpr(dest).}` off the declaration.
+        #
+        # The arguments are preserved exactly as written, not semchecked:
+        # `{.pragma.}` declares the template's parameters `untyped`, and the
+        # arguments are routinely not expressions at all -- `addedExpr(dest)`
+        # names a predicate of the validator's own vocabulary, and semchecking
+        # it would only report that no such proc exists.
         let info = n.info
-        inc n
+        toPragmaArgs()
+        dest.addParLe(PragmaP, info)
+        dest.addSymUse(psym, info)
         if hasParRi:
-          while n.hasMore: skip n
-        dest.add parLeToken(PragmaP, info)
-        dest.add symToken(psym, info)
+          while n.hasMore: takeTree dest, n
         dest.addParRi()
       else:
         buildErr c, dest, n.info, "expected pragma"
-        inc n
+        toPragmaArgs()
         if hasParRi:
           while n.hasMore: skip n # skip optional pragma arguments
   of MagicP:
-    dest.add parLeToken(MagicP, n.info)
-    inc n
-    if hasParRi and n.kind in {StringLit, Ident}:
-      let (magicWord, bits) = magicToTag(pool.strings[n.litId], c.g.config.bits)
+    dest.addParLe(MagicP, n.info)
+    toPragmaArgs()
+    if hasParRi and n.hasMore and n.kind in {StrLit, Ident}:
+      let (magicWord, bits) = magicToTag(pool.strings[n.strId], c.g.config.bits)
       if magicWord == "":
         buildErr c, dest, n.info, "unknown `magic`"
       else:
         crucial.magic = magicWord
         crucial.bits = bits
-      takeToken dest, n
-    elif n.exprKind == ErrX:
+      takeTree dest, n
+    elif n.hasMore and n.exprKind == ErrX:
       dest.addSubtree n
     else:
       buildErr c, dest, n.info, "`magic` pragma takes a string literal"
     dest.addParRi()
+  of AssemblerP:
+    # `{.assembler.}` — every construct in the body maps one-to-one to assembler.
+    # The CHECKING is delegated to the back end (arkham), which is where the
+    # machine model lives; NIF carries precise line info, so its diagnostics are
+    # as good as a front-end pass would give. Sem only records the flag.
+    crucial.flags.incl pk
+    if not kind.isRoutine:
+      buildErr c, dest, n.info, "`assembler` pragma is only allowed on routines"
+      toPragmaArgs()
+      if hasParRi:
+        while n.hasMore: skip n
+    else:
+      dest.addParLe(pk, n.info)
+      dest.addParRi()
+      toPragmaArgs()
+      if hasParRi:
+        while n.hasMore: skip n
+  of NakedP:
+    # `{.naked.}` — no prologue, no epilogue. Like `assembler` (which it may only
+    # accompany) the machine-level checking belongs to the back end; sem records
+    # the flag and forwards the tag.
+    crucial.flags.incl pk
+    if not kind.isRoutine:
+      buildErr c, dest, n.info, "`naked` pragma is only allowed on routines"
+      toPragmaArgs()
+      if hasParRi:
+        while n.hasMore: skip n
+    else:
+      dest.addParLe(pk, n.info)
+      dest.addParRi()
+      toPragmaArgs()
+      if hasParRi:
+        while n.hasMore: skip n
+  of InterruptP:
+    # `{.interrupt: "SysTick".}` — this routine handles the named vector. WHICH
+    # names a part has is a target question, arkham's exactly as for `register`
+    # below; what sem owns is the shape, checked in `interruptSignatureError`
+    # once the params and the return type are known.
+    crucial.flags.incl pk
+    let pinfo = n.info
+    if not kind.isRoutine:
+      buildErr c, dest, pinfo, "`interrupt` pragma is only allowed on routines"
+      toPragmaArgs()
+      if hasParRi:
+        while n.hasMore: skip n
+    else:
+      dest.addParLe(pk, pinfo)
+      toPragmaArgs()
+      if hasParRi and n.hasMore:
+        semConstStrExprIgnoreTopLevel c, dest, n
+      else:
+        buildErr c, dest, pinfo, "`interrupt` pragma takes a vector name"
+      dest.addParRi()
+  of RegisterP:
+    # `{.register: "rdi".}` on a parameter, result or local. Which register names
+    # exist, and whether the annotation is consistent with the proc's ABI, is a
+    # target question — arkham's, not sem's.
+    crucial.flags.incl pk
+    let pinfo = n.info                 # the pragma NAME's info: `toPragmaArgs` moves
+    dest.addParLe(pk, pinfo)           # `n` past it, and a bare `{.register.}` has
+    toPragmaArgs()                     # nothing after it to report against
+    if hasParRi and n.hasMore:
+      semConstStrExprIgnoreTopLevel c, dest, n
+    else:
+      buildErr c, dest, pinfo, "`register` pragma takes a register name"
+    dest.addParRi()
+  of StackP:
+    crucial.flags.incl pk
+    dest.addParLe(pk, n.info)
+    dest.addParRi()
+    toPragmaArgs()
+  of InstructionP, IntrinsicP:
+    # `{.instruction: "bsf".}` / `{.intrinsic: "Ctz".}` — the argument is an opcode
+    # NAME from `lib/intrinsics`, spelled as a string literal like every other
+    # pragma that names a thing (`importc`, `register`). A string rather than an
+    # ident because the name is DATA: it is resolved by a table lookup here, never
+    # by scope or overload resolution, so an ident would only look like a symbol
+    # without being one — and would additionally have to dodge Nim's keywords,
+    # which is why the machine's `of`/`and`/`shl` needed cover names.
+    #
+    # Resolving it here, at the declaration, is what turns a typo into an error
+    # with a source location instead of an "unsupported intrinsic" assert three
+    # passes later. The signature check against the row happens in `semProcImpl`,
+    # where the params and the return type are already in `dest`.
+    crucial.flags.incl pk
+    let cls = if pk == InstructionP: icPinned else: icPortable
+    dest.addParLe(pk, n.info)
+    toPragmaArgs()
+    if not kind.isRoutine:
+      buildErr c, dest, n.info, $pk & " pragma is only allowed on routines"
+      if hasParRi and n.hasMore: skip n
+    elif hasParRi and n.hasMore and n.kind == StrLit:
+      let opName = pool.strings[n.strId]
+      let op = intrinsicOpByName(opName, cls)
+      if op == NoIntrinsicOp:
+        buildErr c, dest, n.info, "unknown " & $pk & ": " & opName
+      else:
+        crucial.intrinsic = op
+      takeTree dest, n
+    elif n.hasMore and n.exprKind == ErrX:
+      dest.addSubtree n
+    else:
+      buildErr c, dest, n.info,
+        "`" & $pk & "` pragma takes an opcode name as a string literal"
+    dest.addParRi()
   of ErrorP, ReportP, DeprecatedP:
     crucial.flags.incl pk
-    dest.add parLeToken(pk, n.info)
-    inc n
+    dest.addParLe(pk, n.info)
+    toPragmaArgs()
     if hasParRi and n.hasMore:
       semConstStrExprIgnoreTopLevel c, dest, n
     dest.addParRi()
-  of ImportcP, ImportcppP, ExportcP, HeaderP, DynlibP:
+  of ImportcP, ImportcppP, ImportjsP, ExportcP, HeaderP, DynlibP:
     crucial.flags.incl pk
     let info = n.info
-    dest.add parLeToken(pk, info)
-    inc n
+    dest.addParLe(pk, info)
+    toPragmaArgs()
     let strPos = dest.len
     if hasParRi and n.hasMore:
       semConstStrExprIgnoreTopLevel c, dest, n
     elif crucial.sym != SymId(0):
-      var name = pool.syms[crucial.sym]
-      extractBasename name
-      dest.add strToken(pool.strings.getOrIncl(name), info)
+      var name = pool.symBasename(crucial.sym)
+      dest.addStrLit(name, info)
     else:
       c.buildErr dest, info, "invalid import/export symbol"
       dest.addParRi()
       return
-    if pk in {ImportcP, ImportcppP, ExportcP} and dest[strPos].kind == StringLit:
-      crucial.externName = pool.strings[dest[strPos].litId]
+    if pk in {ImportcP, ImportcppP, ImportjsP, ExportcP} and dest[strPos].kind == StrLit:
+      crucial.externName = pool.strings[readonlyCursorAt(dest, strPos).strId]
     # Header pragma extra
     if pk == HeaderP:
-      let idx = dest.len - 1
-      let tok = dest[idx]
-      if tok.kind == StringLit:
-        let raw = pool.strings[tok.litId]
+      # not `dest.len - 1`: the string may carry a line-info suffix token
+      let idx = lastValueStart(dest)
+      if dest[idx].isStringLit:
+        # Read through a Cursor, never `dest[idx].strId`: a string of at most
+        # `StrInlineMaxLen` bytes (`"x.h"`!) is stored INSIDE the token, and the
+        # token-level `strId` would decode those packed bytes as a pool id.
+        let raw = pool.strings[readonlyCursorAt(dest, idx).strId]
         let name = resolveHeaderPath(raw, info.getFile(), c.g.config)
         if name != raw:
-          dest[idx] = strToken(pool.strings.getOrIncl(name), tok.info)
+          dest[idx] = strLitToken(pool.strings.getOrIncl(name))
       crucial.headerFileTok = dest[idx]
     # Finalize expression
     dest.addParRi()
@@ -231,62 +381,82 @@ proc semPragma*(c: var SemContext; dest: var TokenBuf; n: var Cursor; crucial: v
     # and Nimony compilers, was removed when the Nim 2 plugin path went away.)
     crucial.flags.incl pk
     let pragInfo = n.info
-    inc n
+    toPragmaArgs()
     var path = StrId(0)
     var pathInfo = n.info
     var errMsg = ""
     var alreadyErr = false
     if hasParRi:
-      if n.kind == StringLit:
-        path = n.litId
+      if n.hasMore and n.isStringLit:
+        path = n.strId
         pathInfo = n.info
         inc n
-      elif n.exprKind == ErrX:
+      elif n.hasMore and n.exprKind == ErrX:
         # Re-sem path: a previous sem pass already produced an err. Pass
         # through without re-reporting.
         alreadyErr = true
         var passBuf = createTokenBuf(8)
         passBuf.takeTree n
-        dest.add parLeToken(pk, pragInfo)
+        dest.addParLe(pk, pragInfo)
         dest.add passBuf
         dest.addParRi()
       else:
         errMsg = "plugin path must be a string literal"
         if n.hasMore: skip n
     if not alreadyErr:
-      dest.add parLeToken(pk, pragInfo)
+      dest.addParLe(pk, pragInfo)
       if errMsg.len > 0:
         buildErr c, dest, pathInfo, errMsg
       elif path != StrId(0):
-        dest.add strToken(path, pathInfo)
+        dest.addStrLit(path, pathInfo)
       dest.addParRi()
   of AlignP, BitsP, SizeP:
-    dest.add parLeToken(pk, n.info)
-    inc n
+    dest.addParLe(pk, n.info)
+    toPragmaArgs()
     let valueStart = dest.len
     if hasParRi and n.hasMore:
       semConstIntExpr(c, dest, n, SemcheckBodies)
     else:
       buildErr c, dest, n.info, "expected int literal"
     if pk == SizeP and dest[valueStart].kind == IntLit:
-      crucial.size = int(pool.integers[dest[valueStart].intId])
+      crucial.size = int(readonlyCursorAt(dest, valueStart).intVal)
     dest.addParRi()
   of NodeclP, SelectanyP, ThreadvarP, GlobalP, DiscardableP, NoreturnP, BorrowP,
-     NoSideEffectP, NodestroyP, BycopyP, ByrefP, InlineP, NoinlineP, NoinitP,
-     InjectP, GensymP, DirtyP, UntypedP, SideEffectP, BaseP, ClosureP, PassiveP, IncompleteStructP:
+     NoSideEffectP, NodestroyP, BycopyP, ByrefP, InlineP, NoinlineP,
+     AlwaysInlineP, NoinitP,
+     InjectP, GensymP, DirtyP, UntypedP, SideEffectP, BaseP, ClosureP, PassiveP, IncompleteStructP,
+     SyncP:
     crucial.flags.incl pk
-    dest.add parLeToken(pk, n.info)
+    dest.addParLe(pk, n.info)
     dest.addParRi()
-    inc n
+    toPragmaArgs()
+  of EstablishesBorrowP:
+    # Declares that the result borrows from the first parameter. The borrow
+    # checker needs this at the *call site*: a view constructor builds its
+    # result from a raw pointer, so nothing in the callee's body tells the
+    # caller that the returned value still aliases the argument.
+    if not kind.isRoutine:
+      buildErr c, dest, n.info, $pk & " pragma is only allowed on routines"
+    else:
+      crucial.flags.incl pk
+      dest.addParLe(pk, n.info)
+      dest.addParRi()
+    toPragmaArgs()
+  of EnableTraceP:
+    buildErr c, dest, n.info, "`enableTrace` is a statement in the body of `nimTraceRef`"
+    toPragmaArgs()
+    if hasParRi:
+      while n.hasMore: skip n
   of ViewP, InheritableP, PureP, FinalP, PackedP, UnionP, AcyclicP:
     var hasErr = false
     if kind != TypeY:
       buildErr c, dest, n.info, $pk & " pragma is only allowed on types"
       hasErr = true
     elif pk in {ViewP, InheritableP, FinalP, PackedP, UnionP, AcyclicP}:
+      # peek across the pragmas' close at the type decl's body slot:
       var n2 = n
       while n2.hasMore: skip n2
-      consumeParRi n2
+      n2 = peekPastEnd(n2)
       if n2.typeKind in {RefT, PtrT}:
         inc n2
       # Later passes replace the inline body of `ref object` / `ptr object`
@@ -296,9 +466,9 @@ proc semPragma*(c: var SemContext; dest: var TokenBuf; n: var Cursor; crucial: v
         buildErr c, dest, n.info, $pk & " pragma is only allowed on object types", n
         hasErr = true
     if not hasErr:
-      dest.add parLeToken(pk, n.info)
+      dest.addParLe(pk, n.info)
       dest.addParRi()
-    inc n
+    toPragmaArgs()
   of CursorP:
     if kind in {VarY, LetY, CursorY, FldY, GfldY}:
       # On object fields, `.cursor` marks the field as a non-owning alias:
@@ -306,37 +476,37 @@ proc semPragma*(c: var SemContext; dest: var TokenBuf; n: var Cursor; crucial: v
       # (no recursive destroy/dup), and `trObjConstr`/`trNewobjFields` in
       # the duplifier emit `WantNonOwner` reads for them so no `=dup` is
       # spliced around the value at construction time.
-      dest.add parLeToken(pk, n.info)
-      inc n
+      dest.addParLe(pk, n.info)
+      toPragmaArgs()
     else:
       buildErr c, dest, n.info, "pragma only allowed on local variables or object fields"
-      inc n
+      toPragmaArgs()
     dest.addParRi()
   of VarargsP:
     crucial.hasVarargs = n.info
-    dest.add parLeToken(pk, n.info)
+    dest.addParLe(pk, n.info)
     dest.addParRi()
-    inc n
+    toPragmaArgs()
   of RequiresP, EnsuresP:
     crucial.flags.incl pk
-    dest.add parLeToken(pk, n.info)
-    inc n
+    dest.addParLe(pk, n.info)
+    toPragmaArgs()
     if hasParRi and n.hasMore:
       semProposition c, dest, n, pk
     else:
       buildErr c, dest, n.info, "`requires`/`ensures` pragma takes a bool expression"
     dest.addParRi()
   of TagsP:
-    dest.add parLeToken(pk, n.info)
-    inc n
+    dest.addParLe(pk, n.info)
+    toPragmaArgs()
     if hasParRi and n.hasMore:
       takeTree dest, n
     else:
       buildErr c, dest, n.info, "expected tags/raises list"
     dest.addParRi()
   of CastP:
-    dest.add parLeToken(pk, n.info)
-    inc n
+    dest.addParLe(pk, n.info)
+    toPragmaArgs()
     if hasParRi and n.hasMore:
       takeTree dest, n
     else:
@@ -344,32 +514,51 @@ proc semPragma*(c: var SemContext; dest: var TokenBuf; n: var Cursor; crucial: v
     dest.addParRi()
   of ProfilerP, StacktraceP, GcsafeP, UsedP:
     # accepted for Nim source compatibility; semantically ignored by Nimony
-    inc n
+    toPragmaArgs()
     if hasParRi:
       while n.hasMore: skip n
   of UncheckedAssignP:
     buildErr c, dest, n.info, "`uncheckedAssign` is only valid inside `{.cast(uncheckedAssign).}:` pragma blocks"
-    inc n
+    toPragmaArgs()
     if hasParRi:
       while n.hasMore: skip n
   of UncheckedAccessP:
     buildErr c, dest, n.info, "`uncheckedAccess` is only valid inside `{.cast(uncheckedAccess).}:` pragma blocks"
-    inc n
+    toPragmaArgs()
     if hasParRi:
       while n.hasMore: skip n
+  of AssumeSyncP:
+    if kind in {VarY, GvarY}:
+      # stamped onto a global by `{.feature: "assumeSync".}`, see `semPragmas`
+      crucial.flags.incl pk
+      dest.addParLe(pk, n.info)
+      dest.addParRi()
+      toPragmaArgs()
+    else:
+      buildErr c, dest, n.info, "`assumeSync` is only valid inside `{.cast(assumeSync).}:` pragma blocks"
+      toPragmaArgs()
+      if hasParRi:
+        while n.hasMore: skip n
   of RaisesP:
     crucial.flags.incl pk
     let oldLen = dest.len
-    dest.add parLeToken(pk, n.info)
-    inc n
+    dest.addParLe(pk, n.info)
+    toPragmaArgs()
     if hasParRi and n.hasMore:
       var nn = n
       let typeStart = dest.len
       # Sem-check the type properly
+      let typeInfo = n.info
       crucial.raisesType = semLocalType(c, dest, n)
-      # TODO: validate that type supports "x != default(T)" interpretation
+      if raisesFamily(crucial.raisesType) == NotRaisable:
+        buildErr c, dest, typeInfo, "`.raises` takes `ErrorCode` or a `ref` object type, not `" &
+          typeToString(crucial.raisesType) & "`"
       dest.addParRi()
-      if nn.exprKind == BracketX and nn.firstSon.kind == ParRi:
+      var emptyRaises = false
+      if nn.exprKind == BracketX:
+        nn = sub(nn) # bound the peek; `nn` is a copy
+        emptyRaises = not nn.hasMore
+      if emptyRaises:
         # `raises: []` means "does not raise":
         crucial.flags.excl pk
         dest.shrink oldLen
@@ -377,12 +566,12 @@ proc semPragma*(c: var SemContext; dest: var TokenBuf; n: var Cursor; crucial: v
     else:
       # No type specified - default to system.ErrorCode
       let typeStart = dest.len
-      dest.addSymUse pool.syms.getOrIncl(ErrorCodeName), n.info
+      dest.addSymUse pool.symId(ErrorCodeName), n.endInfo
       crucial.raisesType = c.typeToCursor(dest, typeStart)
       dest.addParRi()
   of CallConvP:
-    inc n
-    if hasParRi and n.kind == Ident:
+    toPragmaArgs()
+    if hasParRi and n.hasMore and n.isIdent:
       let cc = callConvKind(n)
       if cc != NoCallConv:
         dest.addParLe(cc, n.info)
@@ -393,60 +582,83 @@ proc semPragma*(c: var SemContext; dest: var TokenBuf; n: var Cursor; crucial: v
         inc n
     else:
       buildErr c, dest, n.info, "`callConv` pragma takes a calling convention identifier"
-  of EmitP, BuildP, BundleP, CompileP, StringP, AssumeP, AssertP, PragmaP, PushP, PopP, PassLP, PassCP:
-    if pk == PragmaP and kind == TemplateY and crucial.sym != SymId(0):
+  of EmitP, BuildP, BundleP, CompileP, LinkP, StringP, AssumeP, AssertP, PragmaP, PushP, PopP, PassLP, PassCP:
+    if pk == PragmaP and kind == TemplateY and crucial.sym != SymId(0) and
+        not isPreservedCustomPragma(n):
       # `template X(args) {.pragma.}` declares `X` as a custom pragma. The
+      # `isPreservedCustomPragma` guard keeps a custom pragma *attached to* a
+      # template out of this branch: re-sem sees the attachment as `(pragma
+      # <sym>)`, which is shaped like a declaration marker with an argument,
+      # and this branch would reject it as "`pragma` takes no arguments". Only
+      # the bare `(pragma)` marker declares one.
       # body is not expanded at attachment sites — the annotation is
       # recorded as a known custom-pragma name that will be silently
       # accepted (and dropped) wherever it is later attached. Mirrors Nim's
       # `sfCustomPragma`.
       let info = n.info
-      inc n
+      toPragmaArgs()
       if hasParRi and n.hasMore:
         buildErr c, dest, info, "`pragma` takes no arguments"
         while n.hasMore: skip n
       else:
-        var basename = pool.syms[crucial.sym]
-        extractBasename basename
+        var basename = pool.symBasename(crucial.sym)
         c.customPragmaTemplates.incl pool.strings.getOrIncl(basename)
-        dest.add parLeToken(PragmaP, info)
+        dest.addParLe(PragmaP, info)
         dest.addParRi()
     elif pk == PragmaP and isPreservedCustomPragma(n):
       # An already-preserved custom-pragma attachment `(pragma <sym>)`, seen
       # again when a decl's pragmas are re-sem'd across phases / instantiation.
       # Re-emit it so it stays introspectable and idempotent. Consume only the
       # opening tag and the children here, leaving the pragma's own `)` for the
-      # shared `if hasParRi: ... skipParRi n` epilogue below; taking the whole
-      # tree would let that epilogue skip the *next* `)` (the enclosing
-      # `pragmas` closer) and swallow the routine body.
-      dest.add parLeToken(PragmaP, n.info)
-      inc n
+      # shared `if hasParRi:` epilogue below; taking the whole tree would let
+      # that epilogue skip the *next* `)` (the enclosing `pragmas` closer) and
+      # swallow the routine body.
+      dest.addParLe(PragmaP, n.info)
+      toPragmaArgs()
       while n.hasMore:
         takeTree dest, n
       dest.addParRi()
     else:
       buildErr c, dest, n.info, "pragma not supported"
-      inc n
+      toPragmaArgs()
       if hasParRi:
         while n.hasMore: skip n # skip optional pragma arguments
       dest.addParRi()
   of KeepOverflowFlagP:
-    dest.add parLeToken(pk, n.info)
-    inc n
+    dest.addParLe(pk, n.info)
+    toPragmaArgs()
     dest.addParRi()
+  of IntdefineP, BooldefineP, StrdefineP:
+    # `{.intdefine.}` and its siblings let the command line override the
+    # constant's initializer. Only the flag and the optional key are recorded
+    # here; `semLocal` does the substitution, where the declared type is known
+    # and the replacement can go through the ordinary const-expression path.
+    crucial.flags.incl pk
+    if kind != ConstY:
+      buildErr c, dest, n.info, "`" & $pk & "` pragma is only allowed on constants"
+      toPragmaArgs()
+      if hasParRi:
+        while n.hasMore: skip n
+    else:
+      dest.addParLe(pk, n.info)
+      toPragmaArgs()
+      if hasParRi and n.hasMore and n.kind in {StrLit, Ident}:
+        crucial.defineKey = pool.strings[n.strId]
+        takeTree dest, n
+      dest.addParRi()
   of SemanticsP:
-    dest.add parLeToken(pk, n.info)
-    inc n
-    if hasParRi and n.kind in {StringLit, Ident}:
-      takeToken dest, n
+    dest.addParLe(pk, n.info)
+    toPragmaArgs()
+    if hasParRi and n.hasMore and n.kind in {StrLit, Ident}:
+      takeTree dest, n
     else:
       buildErr c, dest, n.info, "`semantics` pragma takes a string literal"
     dest.addParRi()
   of FeatureP:
     buildErr c, dest, n.info, "`feature` pragma is only allowed as top level pragma"
   of MethodsP:
-    dest.add parLeToken(pk, n.info)
-    inc n
+    dest.addParLe(pk, n.info)
+    toPragmaArgs()
     while n.hasMore:
       dest.takeTree n
     dest.addParRi()
@@ -455,12 +667,12 @@ proc semPragma*(c: var SemContext; dest: var TokenBuf; n: var Cursor; crucial: v
       if n.exprKind != ErrX:
         buildErr c, dest, n.info, "too many arguments for pragma"
       while n.hasMore: skip n
-    skipParRi n
+    n = start; skip n
 
 proc semPragmas*(c: var SemContext; dest: var TokenBuf; n: var Cursor; crucial: var CrucialPragma; kind: SymKind) =
   var pragmaOpen = false
   let info = n.info
-  if n.kind == DotToken or n.substructureKind == PragmasU:
+  if n.isDotToken or n.substructureKind == PragmasU:
     if AutoClosuresFeature in c.features and kind in {ProcY, MethodY, FuncY, ConverterY}:
       var isAutoClosure = false
       var it = c.routine.parent
@@ -471,17 +683,17 @@ proc semPragmas*(c: var SemContext; dest: var TokenBuf; n: var Cursor; crucial: 
         it = it.parent
       if isAutoClosure:
         crucial.flags.incl ClosureP
-        dest.add parLeToken(PragmasU, info)
-        dest.add parLeToken(ClosureP, info)
+        dest.addParLe(PragmasU, info)
+        dest.addParLe(ClosureP, info)
         dest.addParRi()
         pragmaOpen = true
 
     var checkedPragmas = default(CheckedPragmas)
-    if n.kind == DotToken:
+    if n.isDotToken:
       inc n
     elif n.substructureKind == PragmasU:
       if not pragmaOpen:
-        dest.add parLeToken(PragmasU, info)
+        dest.addParLe(PragmasU, info)
         pragmaOpen = true
       n.into PragmasU:
         while n.hasMore:
@@ -516,6 +728,18 @@ proc semPragmas*(c: var SemContext; dest: var TokenBuf; n: var Cursor; crucial: 
       crucial.flags.incl UntypedP
       dest.addParLe UntypedP, info
       dest.addParRi()
+    # `{.feature: "assumeSync".}` trusts the module's own globals, too: a generic
+    # of this module is instantiated -- and checked -- under the features of
+    # the instantiating module, so the trust has to travel with the global.
+    if AssumeSyncFeature in c.features and kind == VarY and
+        AssumeSyncP notin crucial.flags and ThreadvarP notin crucial.flags and
+        (GlobalP in crucial.flags or c.currentScope.kind == ToplevelScope):
+      if not pragmaOpen:
+        dest.addParLe PragmasU, info
+        pragmaOpen = true
+      crucial.flags.incl AssumeSyncP
+      dest.addParLe AssumeSyncP, info
+      dest.addParRi()
     if pragmaOpen:
       dest.addParRi()
     else:
@@ -523,49 +747,268 @@ proc semPragmas*(c: var SemContext; dest: var TokenBuf; n: var Cursor; crucial: 
   else:
     buildErr c, dest, n.info, "expected '.' or 'pragmas'"
 
+# ── intrinsic declarations ──────────────────────────────────────────────────
+# The declaration is the typing contract: what a proc signature already
+# expresses stays in the signature, and the one thing it cannot express — the
+# operand model — is unified against the row HERE, once. After this check the
+# symbol is an ordinary typed proc, so no later pass (sigmatch, getType, hexer,
+# arkham) needs a rule per opcode.
+
+proc intBitsOf(c: var SemContext; typ: Cursor): int =
+  ## Bit width of `(i N)` / `(u N)` / `(c N)`, or -1 for anything else.
+  ## `int`/`uint` already carry the config's width here, so no resolution step.
+  result = -1
+  if typ.kind == TagLit and typ.typeKind in {IntT, UIntT, CharT}:
+    var bits = typ
+    inc bits
+    if bits.kind == IntLit: result = typebits(bits.load)
+
+proc floatBitsOf(typ: Cursor): int =
+  ## Bit width of `(f N)`, or -1 for anything else.
+  result = -1
+  if typ.kind == TagLit and typ.typeKind == FloatT:
+    var bits = typ
+    inc bits
+    if bits.kind == IntLit: result = typebits(bits.load)
+
+proc matchAtomicCell(c: var SemContext; typ: Cursor;
+                     w: var int; widths: set[uint8]): bool =
+  ## The type an atomic operates ON: `ptValW`, and the pointee of `ptPtrW`.
+  ##
+  ## Three shapes, and the third is the interesting one:
+  ##
+  ## * an INTEGER — binds `W` to its width, exactly like `ptAnyIntW`;
+  ## * a POINTER (or `bool`, an 8-bit cell) — a machine word, so it binds 64.
+  ##   These are real atomic cells that no integer pattern would admit: a
+  ##   lock-free list head, an `AtomicFlag`;
+  ## * a TYPE VARIABLE — binds nothing, and that is the point. The atomics are
+  ##   generic over the cell type (one `atomicLoadN[T]`, not one row per width),
+  ##   so the width is a property of the INSTANTIATION and is not knowable here.
+  ##   For a generic declaration this check is therefore a SHAPE check — arity,
+  ##   pointer-ness, which operand is `var`, where a memory order goes — and the
+  ##   width is read off the pointee at the call site by whichever back end lowers
+  ##   it (arkham's `atomicBits`, and the C compiler for `cBuiltinFor`). A
+  ##   CONCRETE declaration still gets the full check, because `W` does bind then.
+  result = false
+  if typ.kind == Symbol:
+    result = true                  # a type variable: nothing to bind, nothing to check
+  elif typ.kind == TagLit:
+    var bits = 0
+    case typ.typeKind
+    of PtrT, PointerT, ProctypeT: bits = 64
+    of BoolT: bits = 8
+    of IntT, UIntT, CharT: bits = intBitsOf(c, typ)
+    else: bits = 0
+    if bits > 0 and uint8(bits) in widths:
+      if w == 0: w = bits          # bind W
+      result = w == bits           # ... or match what it is already bound to
+
+proc matchPat(c: var SemContext; pat: PatKind; typ: Cursor;
+              w: var int; widths: set[uint8]): bool =
+  ## Unify one type pattern against one declared type. `w` carries the row's
+  ## single width variable `W` across the whole signature: unbound (0) on the
+  ## first `…W` pattern, then required to match.
+  case pat
+  of ptNone:
+    result = false
+  of ptVoid:
+    result = typ.kind == DotToken or (typ.kind == TagLit and typ.typeKind == VoidT)
+  of ptBool:
+    result = typ.kind == TagLit and typ.typeKind == BoolT
+  of ptInt32:
+    result = typ.kind == TagLit and typ.typeKind == IntT and intBitsOf(c, typ) == 32
+  of ptAnyInt:
+    result = intBitsOf(c, typ) > 0
+  of ptIntW, ptUIntW, ptAnyIntW:
+    if typ.kind != TagLit:
+      result = false
+    else:
+      let k = typ.typeKind
+      let kindOk =
+        if pat == ptIntW: k == IntT
+        elif pat == ptUIntW: k == UIntT
+        else: k in {IntT, UIntT, CharT}
+      let bits = intBitsOf(c, typ)
+      if not kindOk or bits <= 0 or uint8(bits) notin widths:
+        result = false
+      else:
+        if w == 0: w = bits          # bind W
+        result = w == bits           # ... or match what it is already bound to
+  of ptValW:
+    result = matchAtomicCell(c, typ, w, widths)
+  of ptPtrW:
+    if typ.kind == TagLit and typ.typeKind == PtrT:
+      var pointee = typ
+      inc pointee
+      result = matchAtomicCell(c, pointee, w, widths)
+    else:
+      result = false
+  of ptRawPtr:
+    result = typ.kind == TagLit and typ.typeKind == PointerT
+  of ptWeak:
+    result = typ.kind == TagLit and typ.typeKind == BoolT
+  of ptMemOrder:
+    # v1 accepts ANY type here because v1 reads none: both back ends emit every
+    # atomic sequence at sequential-consistency strength, so the argument is
+    # evaluated for its side effects and discarded. The two declaration sites
+    # already spell it differently — a plain `cint` in `std/atomics`, a distinct
+    # `AtomMemModel` in `system/atomintrin` — and neither is wrong while nothing
+    # consults it. A v2 that honours the order tightens this to "the memory-order
+    # enumeration" and gains a real check; today such a check would only forbid
+    # spellings that behave identically.
+    result = true
+  of ptVec128:
+    # The opaque 128-bit SIMD value, spelled `(f 128)`: a bag of bits whose lane
+    # meaning lives in the opcode. Never binds `W` — the lane width is the
+    # trailing `ptLaneBits` literal, not a property of the value's type.
+    result = floatBitsOf(typ) == 128
+  of ptFloatW:
+    let bits = floatBitsOf(typ)
+    if bits <= 0 or uint8(bits) notin widths:
+      result = false
+    else:
+      if w == 0: w = bits
+      result = w == bits
+  of ptAnyPtr:
+    # `aptr` is a Leng-level spelling; the frontend's pointer kinds are these two.
+    result = typ.kind == TagLit and typ.typeKind in {PtrT, PointerT}
+  of ptLaneBits:
+    # An int the back end reads as a LITERAL (32/64) at the call site; the
+    # declared parameter type is any integer.
+    result = intBitsOf(c, typ) > 0
+  of ptImmLit:
+    # Same shape as `ptLaneBits` and checked the same way: the DECLARATION only
+    # has to say "an integer". That the argument must be a literal is a fact
+    # about the instruction's encoding, so it is checked where the encoding is —
+    # at the call site, by the back end.
+    result = intBitsOf(c, typ) > 0
+
+proc intrinsicSignatureError*(c: var SemContext; dest: var TokenBuf;
+                              paramsAt: int; op: IntrinsicOp): string =
+  ## The mismatch message, or "" when the declaration matches the row. Reads
+  ## `dest` through cursors ONLY — the caller emits any error afterwards, once
+  ## every cursor is gone (appending to `dest` may reallocate it), and into the
+  ## routine's `effects` slot, the one slot that already accepts an `(err …)`.
+  let row = IntrinsicRows[op]
+  let opName = IntrinsicNames[op]
+  result = ""
+  var w = 0
+  var i = 0
+  var n = cursorAt(dest, paramsAt)
+  if n.substructureKind == ParamsU:
+    var p = sub(n)
+    while p.hasMore:
+      if i >= row.arity:
+        result = "`" & opName & "` takes " & $row.arity & " operand(s)"
+        break
+      let param = asLocal(p)
+      # §4.1: the roles dictate the spelling, with no author choice. An `inout`
+      # operand is read AND written, which only `var` expresses — and the `var` is
+      # what makes the call site emit `(haddr d)`, the tag that tells the back end
+      # to bind d's location instead of materialising a pointer to it.
+      var ptyp = param.typ
+      let wantsVar = row.roles[i] in {roInout, roOut}
+      let isVar = ptyp.kind == TagLit and ptyp.typeKind == MutT
+      if wantsVar and not isVar:
+        result = "operand " & $(i + 1) & " of `" & opName & "` is " &
+                 (if row.roles[i] == roOut: "written" else: "read and written") &
+                 ", so it must be declared `var`"
+        break
+      if isVar and not wantsVar:
+        result = "operand " & $(i + 1) & " of `" & opName & "` is only read, " &
+                 "so it must not be declared `var`"
+        break
+      if isVar: inc ptyp             # `(mut T)` → match the row's pattern against T
+      if not matchPat(c, row.params[i], ptyp, w, row.widths):
+        result = "operand " & $(i + 1) & " of `" & opName & "` has a type the " &
+                 "instruction cannot take"
+        break
+      inc i
+      skip p
+  if result.len == 0:
+    if i != row.arity:
+      result = "`" & opName & "` takes " & $row.arity & " operand(s), " &
+               "but " & $i & " were declared"
+    else:
+      var ret = n
+      skip ret                       # past the (params …) → the return type
+      if not matchPat(c, row.ret, ret, w, row.widths):
+        result = "the result type of `" & opName & "` does not match the " &
+                 "instruction's destination"
+  endRead n
+
+proc interruptSignatureError*(dest: var TokenBuf; paramsAt: int): string =
+  ## The mismatch message for `{.interrupt: "…".}`, or "" when the declaration
+  ## is the shape a handler must have. Read through cursors only and emitted by
+  ## the caller into the `effects` slot, for the same reason
+  ## `intrinsicSignatureError` is.
+  ##
+  ## The rule is not a target's: hardware enters a handler with no arguments and
+  ## with nowhere to put a result, on every part that has a interrupt table. A
+  ## parameter would be read from whatever the interrupted code left in r0, and a
+  ## result would be written into a register the hardware restores on the way out
+  ## — neither is a diagnosable failure at run time, so both are refused here.
+  result = ""
+  var n = cursorAt(dest, paramsAt)
+  if n.substructureKind == ParamsU:
+    var p = sub(n)
+    if p.hasMore:
+      result = "an `interrupt` handler is entered by hardware, which passes no " &
+               "arguments, so it must take no parameters"
+    endRead n
+    if result.len > 0: return
+    n = cursorAt(dest, paramsAt)
+  var ret = n
+  skip ret                           # past the (params …) → the return type
+  if not ret.isDotToken:
+    result = "an `interrupt` handler returns to the interrupted code, not to a " &
+             "caller, so it must not return a value"
+  endRead n
+
 proc semAssumeAssert*(c: var SemContext; dest: var TokenBuf; it: var Item; kind: StmtKind) =
   let info = it.n.info
-  inc it.n
   dest.addParLe(kind, info)
-  semBoolExpr c, dest, it.n
-  takeParRi dest, it.n
+  it.n.into:
+    semBoolExpr c, dest, it.n
+  dest.addParRi()
 
 proc semCastInnerPragma*(c: var SemContext; dest: var TokenBuf; n: var Cursor) =
   ## Process a single pragma item inside a `(cast (pragmas ...))` list.
-  ## Only `noSideEffect` and `uncheckedAssign` are accepted; the result is
+  ## Only `noSideEffect`, `uncheckedAssign`, `uncheckedAccess` and
+  ## `assumeSync` are accepted; the result is
   ## emitted in canonical tag form so later passes can dispatch on the kind.
   let info = n.info
   let pk = n.pragmaKind
   case pk
-  of NoSideEffectP, UncheckedAssignP, UncheckedAccessP:
-    dest.add parLeToken(pk, info)
+  of NoSideEffectP, UncheckedAssignP, UncheckedAccessP, AssumeSyncP:
+    dest.addParLe(pk, info)
     dest.addParRi()
-    if n.kind == ParLe: skip n
+    if n.isTagLit: skip n
     else: inc n
   else:
-    buildErr c, dest, info, "invalid `cast` pragma argument; expected `noSideEffect`, `uncheckedAssign` or `uncheckedAccess`"
-    if n.kind == ParLe: skip n
+    buildErr c, dest, info, "invalid `cast` pragma argument; expected `noSideEffect`, `uncheckedAssign`, `uncheckedAccess` or `assumeSync`"
+    if n.isTagLit: skip n
     else: inc n
 
 proc readPragmaStrings(c: var SemContext; dest: var TokenBuf; it: var Item): seq[string] =
   ## Collect the string-literal arguments of a statement pragma like `build`/
-  ## `compile`, advancing `it.n` past the whole `(tag …)` node.
+  ## `compile`; `it.n` is already positioned at the first argument and is left
+  ## at the end of the pragma's scope (the caller closes it).
   result = newSeq[string]()
-  inc it.n
   while it.n.hasMore:
-    if it.n.kind != StringLit:
+    if it.n.kind != StrLit:
       buildErr c, dest, it.n.info, "expected `string` but got: " & asNimCode(it.n)
       skip it.n
     else:
-      result.add pool.strings[it.n.litId]
+      result.add pool.strings[it.n.strId]
       inc it.n
-  skipParRi it.n
 
-proc addBuildTarget(c: var SemContext; dest: var TokenBuf; info: PackedLineInfo;
-                    lang, rawName, rawArgs: string) =
+proc addBuildTarget(c: var SemContext; dest: var TokenBuf; info: NifLineInfo;
+                    lang, rawName, rawArgs: string; objName = "") =
   ## Resolve a `compile` source path (relative to the pragma's own file)
-  ## and record a `(tup lang name args)` entry in `c.toBuild`. `deps.nim` reuses
-  ## these via `(build …)` to compile and link the foreign object.
+  ## and record a `(tup lang name args [objName])` entry in `c.toBuild`.
+  ## `deps.nim` reuses these via `(build …)` to compile and link the foreign
+  ## object.
   # XXX: Relative paths in makefile are relative to current working directory, not the location of the makefile.
   let curWorkDir = onRaiseQuit os.getCurrentDir()
   let currentDir = absoluteParentDir(info.getFile)
@@ -578,8 +1021,10 @@ proc addBuildTarget(c: var SemContext; dest: var TokenBuf; info: PackedLineInfo;
     c.toBuild.addStrLit lang, info
     c.toBuild.addStrLit name, info
     c.toBuild.addStrLit customArgs, info
+    if objName.len > 0:
+      c.toBuild.addStrLit objName, info
 
-proc addBackendTool(c: var SemContext; dest: var TokenBuf; info: PackedLineInfo;
+proc addBackendTool(c: var SemContext; dest: var TokenBuf; info: NifLineInfo;
                     builder, rawTool, rawArgs, rawLinkFlags: string) =
   ## Record a `{.build(builder, tool[, args[, linkflags]]).}` custom-backend entry:
   ## the module carrying this pragma has its Leng IR (`.c.nif`) piped through
@@ -614,7 +1059,7 @@ proc addBackendTool(c: var SemContext; dest: var TokenBuf; info: PackedLineInfo;
     c.toBuild.addStrLit customArgs, info
     c.toBuild.addStrLit linkFlags, info
 
-proc addBundle(c: var SemContext; dest: var TokenBuf; info: PackedLineInfo;
+proc addBundle(c: var SemContext; dest: var TokenBuf; info: NifLineInfo;
                builder, rawTool, rawArgs: string) =
   ## Record a `{.bundle(builder, tool[, args]).}` custom-linker entry: `tool` is a
   ## standalone link driver compiled on demand by the generic `builder` command
@@ -635,7 +1080,150 @@ proc addBundle(c: var SemContext; dest: var TokenBuf; info: PackedLineInfo;
     c.toBundle.addStrLit tool, info
     c.toBundle.addStrLit customArgs, info
 
+proc constPragmaString(c: var SemContext; dest: var TokenBuf; n: var Cursor; s: var string): bool =
+  ## Evaluate one pragma argument as a constant `string` expression (a literal,
+  ## a `const`, `&`, …). On failure the error is left in `dest`.
+  let start = dest.len
+  let stringType = c.types.stringType
+  let id = evalConstStrExpr(c, dest, n, stringType)
+  result = id != StrId(0)
+  if result:
+    dest.shrink start
+    s = pool.strings[id]
+
+proc addCompileTarget(c: var SemContext; dest: var TokenBuf; info: NifLineInfo;
+                      file, userArgs: string; objName = "") =
+  ## The language is inferred from the file extension and forced via `-x`
+  ## (which precedes the input in the `cc` command), so e.g. an Objective-C
+  ## `.m` file is compiled correctly regardless of the C compiler's own
+  ## extension heuristics.
+  let ext = file.splitFile.ext.toLowerAscii
+  # Plain `var`s (not a tuple-`let` bound to a `case`-expression): the
+  # self-hosted compiler's initialization analysis is conservative about the
+  # temporaries such expressions lower to.
+  var lang = "C"
+  var xflag = ""
+  case ext
+  of ".m": lang = "ObjC"; xflag = "-x objective-c"
+  of ".mm": lang = "ObjCpp"; xflag = "-x objective-c++"
+  of ".cpp", ".cc", ".cxx", ".c++": lang = "Cpp"; xflag = "-x c++"
+  else: discard
+  var customArgs = userArgs
+  if xflag.len > 0:
+    customArgs = if userArgs.len > 0: xflag & " " & userArgs else: xflag
+  addBuildTarget c, dest, info, lang, file, customArgs, objName
+
+proc semCompilePragma(c: var SemContext; dest: var TokenBuf; n: var Cursor; info: NifLineInfo) =
+  ## Nim's `.compile` in its three forms: `{.compile: "file.c".}`,
+  ## `{.compile("file.c", "flags").}` and `{.compile: ("dir/*.c", "$1.o").}`.
+  ## Every string is a constant expression. In the tuple form the first
+  ## string is a pattern whose file name may contain `*`/`?`, and `$1` in the
+  ## second is replaced by each match's file name to name its object.
+  if n.exprKind == TupX:
+    var t = n
+    skip n
+    inc t
+    var pattern = ""
+    var objPattern = ""
+    if not constPragmaString(c, dest, t, pattern): return
+    if not t.hasMore:
+      buildErr c, dest, info, "compile: expected a tuple (pattern, objectPattern)"
+      return
+    if not constPragmaString(c, dest, t, objPattern): return
+    if t.hasMore:
+      buildErr c, dest, info, "compile: expected a tuple (pattern, objectPattern)"
+      return
+    let currentDir = absoluteParentDir(info.getFile)
+    let absPattern = replaceSubs(pattern, currentDir, c.g.config).toAbsolutePath(currentDir)
+    if '*' in absPattern.parentDir or '?' in absPattern.parentDir:
+      buildErr c, dest, info, "compile: only the file name may contain wildcards: " & pattern
+      return
+    let files = globFiles(absPattern)
+    # A file added to (or removed from) the directory changes the match set:
+    # the directory's mtime reruns this module's sem next time.
+    recordFileDep c, absPattern.parentDir
+    if files.len == 0:
+      buildErr c, dest, info, "compile: no file matches: " & absPattern
+    for f in files:
+      addCompileTarget c, dest, info, f, "", objPattern.replace("$1", f.extractFilename)
+  else:
+    var args: seq[string] = @[]
+    while n.hasMore:
+      var s = ""
+      if not constPragmaString(c, dest, n, s): return
+      args.add s
+    if args.len != 1 and args.len != 2:
+      buildErr c, dest, info, "compile expected 1 or 2 parameters"
+    else:
+      addCompileTarget c, dest, info, args[0], (if args.len == 2: args[1] else: "")
+
+proc semLinkPragma(c: var SemContext; dest: var TokenBuf; n: var Cursor; info: NifLineInfo) =
+  ## Nim's `{.link: "file.o".}`: link a prebuilt object file or static library.
+  ## The path is relative to the pragma's file (`${path}` expands to its
+  ## directory); `.o` is appended when it has no extension.
+  var file = ""
+  if not constPragmaString(c, dest, n, file): return
+  if n.hasMore:
+    buildErr c, dest, info, "link expected 1 parameter"
+    return
+  if file.splitFile.ext.len == 0: file.add ".o"
+  let currentDir = absoluteParentDir(info.getFile)
+  let path = replaceSubs(file, currentDir, c.g.config).toAbsolutePath(currentDir)
+  if not semos.fileExists(path):
+    buildErr c, dest, info, "link: cannot find: " & path
+  elif path notin c.toLink:
+    c.toLink.add path
+
 proc semPragmaLine*(c: var SemContext; dest: var TokenBuf; it: var Item; isPragmaBlock: bool) =
+  # A statement pragma arrives either wrapped — `(call build "a")` /
+  # `(kv assume expr)` with the pragma name as first child — or as a bare
+  # ident / tag-form node. For wrapped forms the wrapper's scope is entered
+  # here; the branches step past the name via `toPragmaArgs` and close the
+  # scope via `closePragmaLine`.
+  var start = default(Cursor)
+  var hasScope = false
+  if not isPragmaBlock and it.n.isTagLit and
+      (it.n.stmtKind in CallKindsS or it.n.substructureKind == KvU):
+    start = it.n; it.n = sub(it.n)
+    hasScope = true
+  template toPragmaArgs() =
+    if it.n.isTagLit:
+      start = it.n; it.n = sub(it.n)
+      hasScope = true
+    else:
+      inc it.n
+  template closePragmaLine() =
+    if hasScope:
+      it.n = start; skip it.n
+    else: skipParRi it.n # degenerate bare-ident form; historical behavior
+  if c.phase == SemcheckSignatures and not isPragmaBlock and
+      it.n.pragmaKind in {CompileP, LinkP, PassCP, PassLP}:
+    # These evaluate their arguments as constant expressions, which needs the
+    # bodies phase: in the signatures phase a toplevel call like `a & "b"` is
+    # left unchecked, so it cannot be evaluated (and would come back as an
+    # expression statement). Re-emit the line for `SemcheckBodies`.
+    dest.addParLe PragmasS, it.n.info
+    if hasScope:
+      var line = start
+      dest.takeTree line
+      it.n = start; skip it.n
+    else:
+      dest.takeTree it.n
+    dest.addParRi()
+    return
+  if c.inGenericDefinition > 0 and not isPragmaBlock and it.n.pragmaKind == ErrorP:
+    # A generic's `when not supportsCopyMem(T): {.error.}`: the branch is
+    # checked at definition time, but whether it is taken is only known for a
+    # concrete `T`. Re-emit the line for the instantiation to decide.
+    dest.addParLe PragmasS, it.n.info
+    if hasScope:
+      var line = start
+      dest.takeTree line
+      it.n = start; skip it.n
+    else:
+      dest.takeTree it.n
+    dest.addParRi()
+    return
   case it.n.pragmaKind
   of BuildP:
     # Repurposed: `{.build(builder, tool[, args]).}` routes this module's Leng IR
@@ -643,7 +1231,9 @@ proc semPragmaLine*(c: var SemContext; dest: var TokenBuf; it: var Item; isPragm
     # source `.build` — that single use (mimalloc) moved to the standard
     # `.compile`.
     let info = it.n.info
+    toPragmaArgs()
     let args = readPragmaStrings(c, dest, it)
+    closePragmaLine()
     if args.len < 2 or args.len > 4:
       buildErr c, dest, info, "build expected 2 to 4 parameters: (builder, tool[, args[, linkflags]])"
     elif args[0].len == 0:
@@ -658,7 +1248,9 @@ proc semPragmaLine*(c: var SemContext; dest: var TokenBuf; it: var Item; isPragm
     # custom link driver `tool` (built by `builder`). Distinct from `.build`,
     # which routes a module's Leng IR through a backend tool.
     let info = it.n.info
+    toPragmaArgs()
     let args = readPragmaStrings(c, dest, it)
+    closePragmaLine()
     if args.len < 2 or args.len > 3:
       buildErr c, dest, info, "bundle expected 2 to 3 parameters: (builder, tool[, args])"
     elif args[0].len == 0:
@@ -668,43 +1260,45 @@ proc semPragmaLine*(c: var SemContext; dest: var TokenBuf; it: var Item; isPragm
       addBundle c, dest, info, args[0], args[1],
         (if args.len >= 3: args[2] else: "")
   of CompileP:
-    # Nim-compatible `{.compile("file"[, "flags"]).}`. Unlike `build` there is no
-    # explicit language argument: it is inferred from the file extension and
-    # forced via `-x` (which precedes the input in the `cc` command), so e.g. an
-    # Objective-C `.m` file is compiled correctly regardless of the C compiler's
-    # own extension heuristics.
     let info = it.n.info
-    let args = readPragmaStrings(c, dest, it)
-    if args.len != 1 and args.len != 2:
-      buildErr c, dest, info, "compile expected 1 or 2 parameters"
-    else:
-      let userArgs = if args.len == 2: args[1] else: ""
-      let ext = args[0].splitFile.ext.toLowerAscii
-      # Plain `var`s (not a tuple-`let` bound to a `case`-expression): the
-      # self-hosted compiler's initialization analysis is conservative about the
-      # temporaries such expressions lower to.
-      var lang = "C"
-      var xflag = ""
-      case ext
-      of ".m": lang = "ObjC"; xflag = "-x objective-c"
-      of ".mm": lang = "ObjCpp"; xflag = "-x objective-c++"
-      of ".cpp", ".cc", ".cxx", ".c++": lang = "Cpp"; xflag = "-x c++"
-      else: discard
-      var customArgs = userArgs
-      if xflag.len > 0:
-        customArgs = if userArgs.len > 0: xflag & " " & userArgs else: xflag
-      addBuildTarget c, dest, info, lang, args[0], customArgs
+    toPragmaArgs()
+    semCompilePragma c, dest, it.n, info
+    closePragmaLine()
+  of LinkP:
+    let info = it.n.info
+    toPragmaArgs()
+    semLinkPragma c, dest, it.n, info
+    closePragmaLine()
   of EmitP:
+    toPragmaArgs()
     semEmit c, dest, it
-  of AssumeP:
-    semAssumeAssert c, dest, it, AssumeS
-  of AssertP:
-    semAssumeAssert c, dest, it, AssertS
+    closePragmaLine()
+  of AssumeP, AssertP:
+    let kind = if it.n.pragmaKind == AssumeP: AssumeS else: AssertS
+    let info = it.n.info
+    toPragmaArgs()
+    dest.addParLe(kind, info)
+    semBoolExpr c, dest, it.n
+    dest.addParRi()
+    closePragmaLine()
+  of ErrorP:
+    # Statement-level `{.error: "msg".}` — distinct from `{.error.}` on a routine
+    # decl (handled in `semPragma`). Classic Nim calls `localError` here; dead
+    # branches (`when false: ... else: {.error.}`) never reach this.
+    let info = it.n.info
+    toPragmaArgs()
+    let start = dest.len
+    let stringType = c.types.stringType
+    let s = evalConstStrExpr(c, dest, it.n, stringType)
+    closePragmaLine()
+    if s != StrId(0):
+      dest.shrink start
+      buildErr c, dest, info, pool.strings[s]
   of KeepOverflowFlagP:
     if not isPragmaBlock:
       buildErr c, dest, it.n.info, "`keepOverflowFlag` pragma must be used in a pragma block"
     else:
-      dest.add parLeToken(KeepOverflowFlagP, it.n.info)
+      dest.addParLe(KeepOverflowFlagP, it.n.info)
       dest.addParRi()
     skip it.n
   of CastP:
@@ -713,21 +1307,20 @@ proc semPragmaLine*(c: var SemContext; dest: var TokenBuf; it: var Item; isPragm
       skip it.n
     else:
       let info = it.n.info
-      let hasPragmasSub = it.n.firstSon.substructureKind == PragmasU
-      dest.add parLeToken(CastP, info)
-      dest.add parLeToken(PragmasS, info)
-      inc it.n # past CastP head
-      if hasPragmasSub:
-        inc it.n # past inner PragmasS head
-      elif it.n.kind == DotToken:
-        # need because parser produces `.` with unknown-type cast expr but it
-        # is not part of the cast pragma
-        inc it.n
-      while it.n.hasMore:
-        semCastInnerPragma c, dest, it.n
-      skipParRi it.n # close (pragmas) of canonical form, or (cast) of the raw form
-      if hasPragmasSub:
-        skipParRi it.n # close (cast)
+      dest.addParLe(CastP, info)
+      dest.addParLe(PragmasS, info)
+      it.n.into: # (cast
+        if it.n.hasMore and it.n.substructureKind == PragmasU:
+          it.n.into: # inner (pragmas of the canonical form
+            while it.n.hasMore:
+              semCastInnerPragma c, dest, it.n
+        else:
+          if it.n.hasMore and it.n.isDotToken:
+            # need because parser produces `.` with unknown-type cast expr but it
+            # is not part of the cast pragma
+            inc it.n
+          while it.n.hasMore:
+            semCastInnerPragma c, dest, it.n
       dest.addParRi() # close (pragmas)
       dest.addParRi() # close (cast)
   of PluginP:
@@ -735,12 +1328,12 @@ proc semPragmaLine*(c: var SemContext; dest: var TokenBuf; it: var Item; isPragm
     # `("path", "<version>")` tuple form was removed when the Nim 2 plugin
     # compile path went away.)
     let pragInfo = it.n.info
-    inc it.n
+    toPragmaArgs()
     var path = StrId(0)
-    var pathInfo = it.n.info
+    var pathInfo = it.n.endInfo
     var errMsg = ""
-    if it.n.kind == StringLit:
-      path = it.n.litId
+    if it.n.hasMore and it.n.isStringLit:
+      path = it.n.strId
       pathInfo = it.n.info
       inc it.n
     else:
@@ -749,55 +1342,60 @@ proc semPragmaLine*(c: var SemContext; dest: var TokenBuf; it: var Item; isPragm
     if path != StrId(0) and errMsg.len == 0:
       if c.routine.inGeneric == 0 and path notin c.pluginBlacklist:
         c.pendingModulePlugins.add PluginObj(path: path, info: pathInfo)
-    skipParRi it.n                      # close the original (plugin ...)
-    dest.add parLeToken(PragmasS, pragInfo)
-    dest.add parLeToken(PluginP, pragInfo)
+    closePragmaLine()                   # close the original (plugin ...)
+    dest.addParLe(PragmasS, pragInfo)
+    dest.addParLe(PluginP, pragInfo)
     if errMsg.len > 0:
       buildErr c, dest, pathInfo, errMsg
     elif path != StrId(0):
-      dest.add strToken(path, pathInfo)
+      dest.addStrLit(path, pathInfo)
     dest.addParRi()                     # close (plugin
     dest.addParRi()                     # close (pragmas
   of PragmaP:
-    dest.add parLeToken(PragmasS, it.n.info)
-    dest.add parLeToken(PragmaP, it.n.info)
-    inc it.n
+    dest.addParLe(PragmasS, it.n.info)
+    dest.addParLe(PragmaP, it.n.info)
+    toPragmaArgs()
     let name = takeIdent(it.n)
     if name == StrId(0):
-      buildErr c, dest, it.n.info, "expected identifier for pragma"
-      takeParRi dest, it.n
+      buildErr c, dest, it.n.endInfo, "expected identifier for pragma"
+      dest.addParRi()
+      closePragmaLine()
       while it.n.hasMore:
         takeTree dest, it.n
     else:
       var buf = createTokenBuf(16)
-      dest.add identToken(name, it.n.info)
-      takeParRi dest, it.n
+      dest.addIdent(name, it.n.endInfo)
+      dest.addParRi()
+      closePragmaLine()
       # take remaining pragmas:
       while it.n.hasMore:
         buf.addSubtree it.n
         takeTree dest, it.n
-      buf.addParRi() # extra ParRi to make reading easier
+      # no closing sentinel: consumers iterate with `hasMore`
       c.userPragmas[name] = buf
     dest.addParRi()
   of PushP:
     var n = it.n
-    inc n
-    if n.kind == ParRi:
+    if n.isTagLit:
+      n = sub(n) # bound the peek; `n` is a copy
+    else:
+      inc n
+    if not n.hasMore:
       discard "empty push"
     else:
       var buf = createTokenBuf(16)
       while n.hasMore:
         buf.addSubtree n
         skip n
-      buf.addParRi() # sentinel to stop iteration
+      # no closing sentinel: consumers iterate with `hasMore`
       c.pragmaStack.add buf
     # semcheck push/pop pragmas in both SemcheckSignatures and SemcheckBodies phases
     # so that pushed pragmas works for both procs and variables
     if c.phase == SemcheckBodies:
-      skipUntilEnd it.n
+      while it.n.hasMore: skip it.n
     else:
       dest.addParLe PragmasS, it.n.info
-      dest.takeToken it.n
+      dest.takeTree it.n
       while it.n.hasMore:
         dest.takeTree it.n
       dest.addParRi
@@ -810,89 +1408,128 @@ proc semPragmaLine*(c: var SemContext; dest: var TokenBuf; it: var Item; isPragm
       inc it.n
     else:
       dest.addParLe PragmasS, it.n.info
-      dest.takeToken it.n
+      dest.takeTree it.n
       dest.addParRi
   of PassLP:
-    inc it.n
+    toPragmaArgs()
     let start = dest.len
-    let s = evalConstStrExpr(c, dest, it.n, c.types.stringType)
+    let stringType = c.types.stringType
+    let s = evalConstStrExpr(c, dest, it.n, stringType)
     if s != StrId(0):
       dest.shrink start
       c.passL.add pool.strings[s]
-    skipParRi it.n
+    closePragmaLine()
   of PassCP:
-    inc it.n
+    toPragmaArgs()
     let start = dest.len
-    let s = evalConstStrExpr(c, dest, it.n, c.types.stringType)
+    let stringType = c.types.stringType
+    let s = evalConstStrExpr(c, dest, it.n, stringType)
     if s != StrId(0):
       dest.shrink start
       c.passC.add pool.strings[s]
-    skipParRi it.n
+    closePragmaLine()
   of FeatureP:
-    inc it.n
     let info = it.n.info
-    let start = dest.len
-    let s = evalConstStrExpr(c, dest, it.n, c.types.stringType)
-    if s != StrId(0):
-      dest.shrink start
-      let features = parseFeatures(pool.strings[s])
-      if features == {}:
-        skipUntilEnd it.n
-        buildErr c, dest, info, "unknown `feature`"
-      else:
-        c.features.incl features
-        skipParRi it.n
+    if c.routine.kind != NoSym:
+      # Features are module-scoped: written in a routine body, the pragma
+      # would read as local to that routine, but change every other one (#2784).
+      buildErr c, dest, info, "`feature` pragma is only allowed at module top level"
+      if hasScope: it.n = start
+      skip it.n
     else:
-      skipUntilEnd it.n
-      buildErr c, dest, info, "`feature` pragma takes a string literal"
+      toPragmaArgs()
+      let start = dest.len
+      let stringType = c.types.stringType
+      let s = evalConstStrExpr(c, dest, it.n, stringType)
+      if s != StrId(0):
+        dest.shrink start
+        let features = parseFeatures(pool.strings[s])
+        if features == {}:
+          while it.n.hasMore: skip it.n
+          buildErr c, dest, info, "unknown `feature`"
+        else:
+          c.features.incl features
+          closePragmaLine()
+      else:
+        while it.n.hasMore: skip it.n
+        buildErr c, dest, info, "`feature` pragma takes a string literal"
+  of EnableTraceP:
+    # In the body of a runtime's `nimTraceRef`: the runtime collects cycles.
+    # A runtime shared with Nim says `when defined(nimony): {.enableTrace.}`.
+    # Nothing to do here: the driver finds it in nifler's deps file and
+    # passes `--cycles` on (`deps.processDep`).
+    let info = it.n.info
+    if c.routine.kind == NoSym:
+      buildErr c, dest, info, "`enableTrace` must be in the body of `nimTraceRef`"
+      skip it.n
+    else:
+      toPragmaArgs()
+      dest.addParLe(PragmasS, info)
+      dest.addParLe(EnableTraceP, info)
+      dest.addParRi()
+      dest.addParRi()
+      closePragmaLine()
+      producesVoid c, dest, info, it.typ
   else:
-    buildErr c, dest, it.n.info, "unsupported pragma", it.n
-    skip it.n
-    while it.n.hasMore: skip it.n
+    if (let psym = c.resolveCustomPragma(it.n); psym != NoSymId):
+      # A custom pragma as a *statement*. It marks the region it stands in
+      # rather than a declaration, which is what a wrapper template needs: the
+      # marker is written in the template's body, so every expansion carries it
+      # without the reader having to work out which template it came from.
+      #
+      # Preserved as a `(pragmas (pragma <sym> <args>))` statement. Nothing
+      # downstream has to learn anything: hexer's passes already take such a
+      # statement through untouched and lengcgen already skips it.
+      let info = it.n.info
+      toPragmaArgs()
+      dest.addParLe(PragmasS, info)
+      dest.addParLe(PragmaP, info)
+      dest.addSymUse(psym, info)
+      while it.n.hasMore: takeTree dest, it.n
+      dest.addParRi()
+      dest.addParRi()
+      closePragmaLine()
+      producesVoid c, dest, info, it.typ
+    else:
+      buildErr c, dest, it.n.info, "unsupported pragma", it.n
+      skip it.n
+      while it.n.hasMore: skip it.n
 
 proc semPragmasLine*(c: var SemContext; dest: var TokenBuf; it: var Item) =
   let info = it.n.info
   it.n.into:
     while it.n.hasMore:
-      if it.n.kind == ParLe:
-        if it.n.stmtKind in CallKindsS or
-            it.n.substructureKind == KvU:
-          inc it.n
+      # kv/call wrappers around a pragma line are entered by `semPragmaLine`
       semPragmaLine c, dest, it, false
   producesVoid c, dest, info, it.typ # in case it was not already produced
 
 proc hasCastUncheckedAccess(n: Cursor): bool =
-  ## Scan the pragma list to see if it contains `{.cast(uncheckedAccess).}`.
+  ## Scan the first pragma of the `(pragmas ...)` list at `n` to see if it
+  ## contains `{.cast(uncheckedAccess).}`.
   result = false
   var scan = n
-  var nested = 0
-  while true:
-    case scan.kind
-    of ParLe:
-      if scan.pragmaKind == UncheckedAccessP:
-        return true
-      inc nested
-      inc scan
-    of ParRi:
-      dec nested
-      if nested == 0: return false
-      inc scan
+  scan = sub(scan) # into (pragmas; bound the walk, `scan` is a copy
+  if scan.hasMore and scan.isTagLit:
+    if scan.pragmaKind == UncheckedAccessP:
+      result = true
     else:
-      inc scan
+      scan.linearScan:
+        if scan.pragmaKind == UncheckedAccessP:
+          result = true
+          break
 
 proc semPragmaExpr*(c: var SemContext; dest: var TokenBuf; it: var Item) =
   let info = it.n.info
-  dest.takeToken it.n
-  assert it.n.stmtKind == PragmasS
-  let hasUncheckedAccess = hasCastUncheckedAccess(it.n.firstSon)
-  dest.takeToken it.n
-  while it.n.hasMore:
-    semPragmaLine c, dest, it, true
-  takeParRi dest, it.n
-  if hasUncheckedAccess:
-    inc c.inUncheckedAccess
-  semStmt(c, dest, it.n, false)
-  if hasUncheckedAccess:
-    dec c.inUncheckedAccess
-  takeParRi dest, it.n
+  var hasUncheckedAccess = false
+  copyInto dest, it.n: # (pragmax
+    assert it.n.stmtKind == PragmasS
+    hasUncheckedAccess = hasCastUncheckedAccess(it.n)
+    copyInto dest, it.n: # (pragmas
+      while it.n.hasMore:
+        semPragmaLine c, dest, it, true
+    if hasUncheckedAccess:
+      inc c.inUncheckedAccess
+    semStmt(c, dest, it.n, false)
+    if hasUncheckedAccess:
+      dec c.inUncheckedAccess
   producesVoid c, dest, info, it.typ

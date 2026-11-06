@@ -49,12 +49,27 @@ proc bug*(msg: string) {.noreturn.} =
 proc isRoutine*(t: SymKind): bool {.inline.} =
   t in {ProcY, FuncY, IteratorY, MacroY, TemplateY, ConverterY, MethodY}
 
+proc isValidFnHead*(t: SymKind): bool {.inline.} =
+  ## A caller `fn` expression can resolve to any symbol except a module:
+  ## routines, but also a `TypeY`/`TypevarY` (a type conversion like `int(x)`
+  ## or `T(1)`) or a proc-typed value. Only modules are never callable, so
+  ## they must stay out of overload sym choices where a same-named proc exists
+  ## (nim-lang/nimony#2130).
+  t != ModuleY
+
 proc isLocal*(t: SymKind): bool {.inline.} =
-  t in {LetY, VarY, ResultY, ConstY, ParamY, TypevarY, StaticTypevarY, CursorY, PatternvarY, FldY, GfldY, EfldY, GletY, TletY, GvarY, TvarY}
+  t in {LetY, VarY, ResultY, ConstY, ParamY, StaticParamY, TypevarY, StaticTypevarY, CursorY, PatternvarY, FldY, GfldY, EfldY, GletY, TletY, GvarY, TvarY}
 
 proc isTypevarLike*(t: SymKind): bool {.inline.} =
   ## generic parameters: ordinary type variables and value ("static") parameters
   t in {TypevarY, StaticTypevarY}
+
+proc isParamLike*(t: SymKind): bool {.inline.} =
+  ## term parameters: ordinary parameters and constant ("static") parameters
+  t in {ParamY, StaticParamY}
+
+proc isParamLike*(t: SubstructureKind): bool {.inline.} =
+  t in {ParamU, StaticParamU}
 
 proc isNominal*(t: TypeKind): bool {.inline.} =
   ## type kinds that should stay as symbols, see sigmatch.matchSymbol
@@ -114,29 +129,37 @@ type
     typ*: Cursor
     val*: Cursor
 
-proc takeLocal*(c: var Cursor; mode: SkipMode): Local =
+proc takeLocal*(c: var Cursor; mode: SkipMode): Local {.nifReads.} =
   let kind = symKind c
   result = Local(kind: kind)
   if isLocal(kind):
-    inc c
-    result.name = c
-    skip c
-    result.exported = c
-    skip c
-    result.pragmas = c
-    skip c
-    result.typ = c
-    if mode >= SkipInclBody:
+    if mode == SkipFinalParRi:
+      c.into:
+        result.name = c
+        skip c
+        result.exported = c
+        skip c
+        result.pragmas = c
+        skip c
+        result.typ = c
+        skip c
+        result.val = c
+        skip c
+    else:
+      inc c
+      result.name = c
       skip c
-      result.val = c
+      result.exported = c
       skip c
-      if mode == SkipFinalParRi:
-        if c.kind == ParRi:
-          inc c
-        else:
-          bug "expected ')' inside (" & $result.kind
+      result.pragmas = c
+      skip c
+      result.typ = c
+      if mode >= SkipInclBody:
+        skip c
+        result.val = c
+        skip c
 
-proc asLocal*(c: Cursor; mode = SkipInclBody): Local =
+proc asLocal*(c: Cursor; mode = SkipInclBody): Local {.nifReads.} =
   var c = c
   result = takeLocal(c, mode)
 
@@ -159,35 +182,51 @@ type
 proc isGeneric*(r: Routine): bool {.inline.} =
   r.typevars.substructureKind == TypevarsU
 
-proc takeRoutine*(c: var Cursor; mode: SkipMode): Routine =
+proc takeRoutine*(c: var Cursor; mode: SkipMode): Routine {.nifReads.} =
   let kind = symKind c
   result = Routine(kind: kind)
   if isRoutine(kind):
-    inc c
-    result.name = c
-    skip c
-    result.exported = c
-    skip c
-    result.pattern = c
-    skip c
-    result.typevars = c
-    skip c
-    result.params = c
-    skip c
-    result.retType = c
-    skip c
-    result.pragmas = c
-    skip c
-    result.effects = c
-    if mode >= SkipInclBody:
+    if mode == SkipFinalParRi:
+      c.into:
+        result.name = c
+        skip c
+        result.exported = c
+        skip c
+        result.pattern = c
+        skip c
+        result.typevars = c
+        skip c
+        result.params = c
+        skip c
+        result.retType = c
+        skip c
+        result.pragmas = c
+        skip c
+        result.effects = c
+        skip c
+        result.body = c
+        skip c
+    else:
+      inc c
+      result.name = c
       skip c
-      result.body = c
+      result.exported = c
       skip c
-      if mode == SkipFinalParRi:
-        if c.kind == ParRi:
-          inc c
-        else:
-          bug "expected ')' inside (" & $result.kind
+      result.pattern = c
+      skip c
+      result.typevars = c
+      skip c
+      result.params = c
+      skip c
+      result.retType = c
+      skip c
+      result.pragmas = c
+      skip c
+      result.effects = c
+      if mode >= SkipInclBody:
+        skip c
+        result.body = c
+        skip c
 
 const
   TypevarsPos* = 3
@@ -196,7 +235,7 @@ const
   ProcPragmasPos* = 6
   BodyPos* = 8
 
-proc asRoutine*(c: Cursor; mode = SkipExclBody): Routine =
+proc asRoutine*(c: Cursor; mode = SkipExclBody): Routine {.nifReads.} =
   var c = c
   result = takeRoutine(c, mode)
 
@@ -216,23 +255,30 @@ proc takeTypeDecl*(c: var Cursor; mode: SkipMode): TypeDecl =
   let kind = symKind c
   result = TypeDecl(kind: kind)
   if kind == TypeY:
-    inc c
-    result.name = c
-    skip c
-    result.exported = c
-    skip c
-    result.typevars = c
-    skip c
-    result.pragmas = c
-    if mode >= SkipInclBody:
-      skip c
-      result.body = c
-      if mode == SkipFinalParRi:
+    if mode == SkipFinalParRi:
+      c.into:
+        result.name = c
         skip c
-        if c.kind == ParRi:
-          inc c
-        else:
-          bug "expected ')' inside (" & $result.kind
+        result.exported = c
+        skip c
+        result.typevars = c
+        skip c
+        result.pragmas = c
+        skip c
+        result.body = c
+        skip c
+    else:
+      inc c
+      result.name = c
+      skip c
+      result.exported = c
+      skip c
+      result.typevars = c
+      skip c
+      result.pragmas = c
+      if mode >= SkipInclBody:
+        skip c
+        result.body = c
 
 proc asTypeDecl*(c: Cursor): TypeDecl =
   var c = c
@@ -257,16 +303,22 @@ proc asObjectDecl*(c: Cursor): ObjectDecl =
 
 type ObjFieldIter* = object
   nested: int
+  scopes: seq[Cursor]
 
 proc initObjFieldIter*(): ObjFieldIter =
   result = ObjFieldIter(nested: 1)
 
 proc nextField*(iter: var ObjFieldIter, n: var Cursor, keepCase = false): bool =
+  ## Resumable walk over an object body's fields. The caller must have
+  ## entered the object scope (e.g. via `into`/`peekInto`) so that the
+  ## outermost scope is bounded; nested case/when/of scopes are managed
+  ## here via `sub`/`skip`.
   result = false
   while iter.nested != 0:
-    if n.kind == ParRi:
+    if not n.hasMore:
       dec iter.nested
-      if iter.nested != 0: inc n
+      if iter.nested != 0:
+        n = iter.scopes.pop(); skip n
     else:
       case n.substructureKind
       of CaseU:
@@ -275,13 +327,13 @@ proc nextField*(iter: var ObjFieldIter, n: var Cursor, keepCase = false): bool =
           break
         else:
           inc iter.nested
-          inc n
+          iter.scopes.add n; n = sub(n)
       of WhenU, StmtsU, NilU, ElseU:
         inc iter.nested
-        inc n
+        iter.scopes.add n; n = sub(n)
       of ElifU, OfU:
         inc iter.nested
-        inc n
+        iter.scopes.add n; n = sub(n)
         skip n
       of FldU, GfldU:
         result = true

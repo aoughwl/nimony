@@ -1,6 +1,6 @@
 # It supports overwriting tested results using `--overwrite`
 
-import std / [os]
+import std / [os, strutils]
 import "../src/lib" / [nifbuilder]
 
 const
@@ -91,10 +91,9 @@ proc checkGenTags() =
 checkGenTags()
 
 proc hasturTests(overwrite: bool) =
-  # CI sets NIMONY_CC=clang on Windows so tests exercise the clang-on-MinGW
-  # path (faster cc step + native PE TLS). Locally the env var is unset
-  # and the gcc default kicks in. On Windows + clang we also force LLD as
-  # the linker: clang emits native PE TLS by default but ld.bfd lays out
+  # NIMONY_CC selects the C compiler the tests forward to nimony; unset
+  # means the gcc default. On Windows + clang we also force LLD as the
+  # linker: clang emits native PE TLS by default but ld.bfd lays out
   # `.tls$` incorrectly, producing binaries that segfault on first TLS
   # access; LLD's layout matches what the loader expects.
   var args = "--jobs:auto"
@@ -104,6 +103,13 @@ proc hasturTests(overwrite: bool) =
     when defined(windows):
       if cc == "clang":
         args.add " --forward:--passL:-fuse-ld=lld"
+  # HASTUR_SKIP is a `;`-separated list of suites this invocation must leave
+  # alone. CI sets it to `tests/boot` so the bootstrap runs on its own runner
+  # in parallel with everything else (see .github/workflows/ci.yml); unset
+  # locally, so a plain `nim c -r tools/tester.nim` still covers the whole tree.
+  for dir in os.getEnv("HASTUR_SKIP").split(';'):
+    if dir.len > 0:
+      args.add " --skip:" & dir
   if overwrite:
     args.add " --overwrite"
   # GitHub Actions (and most CI) set `CI=true`. Release-built host tools
@@ -111,17 +117,15 @@ proc hasturTests(overwrite: bool) =
   if os.getEnv("CI").len > 0:
     args = "--release " & args
   # Build hastur once into `bin/` as a dedicated step, then drive the suite
-  # with the compiled binary. Previously `nim c -r src/hastur … all` fused
-  # the compile and the run, so a hastur *compile* error surfaced as a bogus
-  # test failure, and hastur's parallel runner re-exec'd itself via a
+  # with the compiled binary. Previously `nim c -r src/hastur/hastur … all`
+  # fused the compile and the run, so a hastur *compile* error surfaced as a
+  # bogus test failure, and hastur's parallel runner re-exec'd itself via a
   # nimcache temp binary (`getAppFilename`) instead of a stable `bin/hastur`.
-  # `--warningAsError:{ProveInit,Uninit}:off` mirrors hastur's own
-  # `nimcPrefix`: `src/config.nims` promotes those to errors, which Nim
-  # 2.2.10's `typedthreads` (`createThread`, used by the parallel runner)
-  # trips.
+  # `src/hastur/nim.cfg` carries the `--outdir` and the
+  # `--warningAsError:{ProveInit,Uninit}:off` overrides Nim 2.2.10's
+  # `typedthreads` needs, so the command line only has to name the output.
   let hastur = ("bin" / "hastur").addFileExt(ExeExt)
-  exec "nim c --warningAsError:ProveInit:off --warningAsError:Uninit:off " &
-       "-o:" & hastur & " src/hastur"
+  exec "nim c -o:" & hastur & " src/hastur/hastur"
   exec hastur & " " & args & " all"
 
 hasturTests(overwrite)

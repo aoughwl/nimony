@@ -15,6 +15,11 @@
 ## objects so identity is pointer-equality. Values are tagged unions so the
 ## serializer switches on `kind` instead of parsing string prefixes.
 
+when defined(nimony):
+  # `nil` is the model's "type not known / not applicable" marker -- it travels
+  # through `LLType` fields, params and locals all over the LLVM backend.
+  {.feature: "lenientnils".}
+
 type
   LLTypeKind* = enum
     llVoid, llInt, llFloat, llPtr, llArray, llStruct, llUnion, llFunc
@@ -96,10 +101,10 @@ type
       discard
 
   LLInstrKind* = enum
-    llAdd, llSub, llMul, llSDiv, llUDiv, llSRem, llURem,
-    llShl, llAShr, llLShr, llAnd, llOr, llXor,
+    llBinOp,
     llIcmp, llFcmp,
-    llZext, llSext, llTrunc, llFpext, llFptrunc, llSitofp, llFptosi,
+    llZext, llSext, llTrunc, llFpext, llFptrunc,
+    llSitofp, llUitofp, llFptosi, llFptoui,
     llBitcast, llInttoptr, llPtrtoint,
     llAlloca, llLoad, llStore, llGep,
     llCall, llExtractValue, llInsertValue,
@@ -112,7 +117,7 @@ type
     result*: LLValue                       # result register; llvNone when void
     dbgLoc*: string                        # ", !dbg !N" suffix, empty if none
     case kind*: LLInstrKind
-    of llAdd..llXor:
+    of llBinOp:
       binOp*: string                       # "add", "sub", ... (allows nuw/nsw via flags)
       binLhs*: LLValue
       binRhs*: LLValue
@@ -340,16 +345,8 @@ proc newLLFuncType*(retType: LLType; params: seq[LLType];
 
 # ---- Instruction constructors ----
 
-proc newLLBinInstr*(kind: LLInstrKind; res: LLValue; binOp: string;
+proc newLLBinInstr*(res: LLValue; binOp: string;
                      binLhs, binRhs: LLValue; dbgLoc = ""): LLInstr =
-  ## Construct a binary-op instruction whose `kind` is determined at runtime.
-  ## The `case` inside the proc lets the Nim compiler verify that `binOp`,
-  ## `binLhs`, `binRhs` — which only exist in the `llAdd..llXor` branch — are
-  ## always valid for the value of `kind` passed by the caller.
-  case kind
-  of llAdd..llXor:
-    LLInstr(kind: kind, result: res, dbgLoc: dbgLoc,
-            binOp: binOp, binLhs: binLhs, binRhs: binRhs)
-  else:
-    raise newException(ValueError, "newLLBinInstr: kind " & $kind &
-        " is not in the llAdd..llXor range")
+  ## Construct a binary-op instruction.
+  LLInstr(result: res, dbgLoc: dbgLoc, kind: llBinOp,
+          binOp: binOp, binLhs: binLhs, binRhs: binRhs)

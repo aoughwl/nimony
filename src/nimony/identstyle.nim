@@ -20,8 +20,11 @@
 ##   including the first character. Used for builtin pragma names (Nim has
 ##   always matched those case-insensitively all the way down).
 
+when defined(nimony):
+  {.feature: "assumeSync".}  # compiler-internal globals; single threaded
+
 import std / tables
-import ".." / lib / [bitabs, nifstreams]
+import ".." / lib / [bitabs, nifpools]
 import ".." / models / [tags, nimony_tags]
 
 var
@@ -96,7 +99,7 @@ proc ensurePragmaStyleIndex*() {.sideEffect.} =
     let raw = cast[TagEnum](tagIdInt)
     if not rawTagIsNimonyPragma(raw): continue
     let p = cast[NimonyPragma](raw)
-    let canonicalName = pool.tags[TagId(tagIdInt)]
+    let canonicalName = globalTags.tags[TagId(tagIdInt)]
     let norm = pool.strings.getOrIncl(normalizeStyleFull(canonicalName))
     pragmaStyleIndex[norm] = p
 

@@ -21,7 +21,7 @@
 
 import std / [tables, strutils, assertions, sets, syncio]
 include ".." / lib / nifprelude
-import ".." / models / [tags, nimony_tags, leng_tags, callconv_tags]
+import ".." / models / [tags, nimony_tags, leng_tags, callconv_tags, finalir_tags]
 import ".." / nimony / nimony_model
 import tags_grammar
 import ".." / nimony / reporters  # infoToStr
@@ -45,6 +45,7 @@ let
 type
   PhaseKind* = enum
     phasePostSem        ## after `src/nimony/sem.nim`
+    phasePostFinalIr    ## after the lowering to the Final IR (`doc/final_ir.md`)
     phasePostLengcgen   ## after hexer -> Leng
 
   Phase* = object
@@ -61,6 +62,11 @@ proc postSemAllowed(raw: TagEnum): bool =
     rawTagIsNimonySym(raw) or rawTagIsNimonyPragma(raw) or
     rawTagIsCallConv(raw)
 
+proc postFinalIrAllowed(raw: TagEnum): bool =
+  ## Post-sem tags plus the Final IR's control flow. Generic routines,
+  ## templates and macros are published unlowered, so `if`/`while` stay legal.
+  postSemAllowed(raw) or rawTagIsFinalIrKind(raw)
+
 proc postLengcgenAllowed(raw: TagEnum): bool =
   rawTagIsLengExpr(raw) or rawTagIsLengStmt(raw) or
     rawTagIsLengType(raw) or rawTagIsLengOther(raw) or
@@ -69,6 +75,9 @@ proc postLengcgenAllowed(raw: TagEnum): bool =
 
 proc postSemPhase*(): Phase =
   Phase(name: "post-sem", kind: phasePostSem, allowed: postSemAllowed)
+
+proc postFinalIrPhase*(): Phase =
+  Phase(name: "post-final-ir", kind: phasePostFinalIr, allowed: postFinalIrAllowed)
 
 proc postLengcgenPhase*(): Phase =
   Phase(name: "post-lengcgen", kind: phasePostLengcgen, allowed: postLengcgenAllowed)
@@ -79,7 +88,7 @@ proc postLengcgenPhase*(): Phase =
 
 type
   Violation* = object
-    info*: PackedLineInfo
+    info*: NifLineInfo
     tag*: string
     msg*: string
     parents*: string   ## "/"-joined parent tag chain (root first)
@@ -112,6 +121,11 @@ const
     "low", "high", "add", "sub", "mul", "div", "mod", "shr", "shl", "ashr",
     "bitand", "bitor", "bitxor", "bitnot", "eq", "neq", "le", "lt", "conv",
     "cast", "deref", "pat", "tupat", "arrat",
+    # template expansion in a static type slot: `(expr … value)`
+    "expr",
+    # a qualified type `module.T` in an untyped template body, which sem
+    # leaves unresolved until the template expands
+    "dot",
     # decl kinds that may appear nullary as kind markers
     "const"
   ]
@@ -126,13 +140,13 @@ proc classifyCursor(c: Cursor; preferStmt: bool; inType: bool): ChildKind =
   case c.kind
   of DotToken:
     ckDot
-  of IntLit, UIntLit, FloatLit, CharLit, StringLit:
+  of IntLit, UIntLit, FloatLit, CharLit, StrLit:
     ckLit
   of SymbolDef:
     ckD
   of Symbol, Ident:
     ckY
-  of ParLe:
+  of TagLit:
     let raw = tagEnum(c)
     let isExpr = rawTagIsNimonyExpr(raw) or rawTagIsLengExpr(raw)
     let isStmt = rawTagIsNimonyStmt(raw) or rawTagIsLengStmt(raw)
@@ -140,7 +154,7 @@ proc classifyCursor(c: Cursor; preferStmt: bool; inType: bool): ChildKind =
     if inType:
       if isType:
         return ckT
-      let tagStr = pool.tags[c.tag]
+      let tagStr = globalTags.tags[c.cursorTagId]
       for t in typeCtxTagsLiteral:
         if t == tagStr: return ckT
     if isExpr and isStmt:
@@ -163,8 +177,8 @@ proc classifyCursor(c: Cursor; preferStmt: bool; inType: bool): ChildKind =
     ckAny
 
 proc tagName(c: Cursor): string =
-  if c.kind == ParLe:
-    result = pool.tags[c.tag]
+  if c.isTagLit:
+    result = globalTags.tags[c.cursorTagId]
   else:
     result = ""
 
@@ -177,9 +191,8 @@ proc collectChildKinds(parent: Cursor; preferStmtContext: bool;
                        outKinds: var seq[ChildKind]) =
   ## Walks the children of `parent` (which must point at ParLe) and appends
   ## their classifications to `outKinds`. Does not recurse into children.
-  assert parent.kind == ParLe
-  var c = parent
-  inc c  # past the ParLe
+  assert parent.isTagLit
+  var c = sub(parent) # past the ParLe; bound the walk to the children
   var idx = 0
   while c.hasMore:
     let inTypeSlot = allKidsType or (idx in typeSlots)
@@ -316,7 +329,7 @@ proc matchesPragmaContext(tag: string; kinds: openArray[ChildKind];
     return true
   false
 
-proc addViolation(ctx: var ValidatorCtx; info: PackedLineInfo;
+proc addViolation(ctx: var ValidatorCtx; info: NifLineInfo;
                   tag, msg: string) =
   if ctx.violations.len >= ctx.maxViolations: return
   ctx.violations.add Violation(
@@ -328,7 +341,7 @@ proc checkTree(ctx: var ValidatorCtx; c: var Cursor;
 
 proc checkParLe(ctx: var ValidatorCtx; c: var Cursor;
                 parentTag: string; childIdx: int; inType: bool) =
-  assert c.kind == ParLe
+  assert c.isTagLit
   let raw = tagEnum(c)
   let tag = tagName(c)
   let info = c.info
@@ -382,8 +395,7 @@ proc checkParLe(ctx: var ValidatorCtx; c: var Cursor;
 
   # Recurse into children:
   ctx.parents.add tag
-  var child = c
-  inc child
+  var child = sub(c) # bound the walk to this subtree's children
   var idx = 0
   while child.hasMore:
     let childInType = kidsTypeByThisTag or (idx in typeSlots)
@@ -394,13 +406,11 @@ proc checkParLe(ctx: var ValidatorCtx; c: var Cursor;
 
 proc checkTree(ctx: var ValidatorCtx; c: var Cursor;
                parentTag: string; childIdx: int; inType: bool) =
-  case c.kind
-  of ParLe:
+  if c.isTagLit:
     checkParLe(ctx, c, parentTag, childIdx, inType)
-  of ParRi:
-    discard
   else:
-    inc c
+    if c.hasMore:
+      inc c
 
 # ---------------------------------------------------------------------------
 # Public API
@@ -413,7 +423,7 @@ proc validate*(buf: var TokenBuf; phase: Phase;
   var ctx = ValidatorCtx(phase: phase, maxViolations: maxViolations)
   var c = beginRead(buf)
   let info = c.info
-  if c.kind == ParLe:
+  if c.isTagLit:
     checkTree(ctx, c, "", 0, false)
   # After the root subtree has been consumed, the cursor must be exhausted.
   # Anything remaining is content that a pass walking the IR with nested
@@ -426,7 +436,6 @@ proc validate*(buf: var TokenBuf; phase: Phase;
     ctx.addViolation info, "",
       "trailing content after root subtree: " &
       "the pass would silently drop these tokens"
-  endRead(buf)
   result = move ctx.violations
 
 proc reportViolations*(phaseName: string; vs: openArray[Violation]): bool =

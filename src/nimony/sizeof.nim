@@ -83,7 +83,7 @@ proc parseTypePragmas(n: Cursor): TypePragmas =
           skip n
         else:
           skip n
-  elif n.kind != DotToken:
+  elif not n.isDotToken:
     error "illformed AST inside type section: ", n
 
 proc `<`(x: xint; b: int64): bool = x < createXint(b)
@@ -144,9 +144,10 @@ proc getSizeObject(c: var SizeofValue; cache: var Table[SymId, SizeofValue]; ite
 proc getSize(c: var SizeofValue; cache: var Table[SymId, SizeofValue]; n: Cursor; ptrSize: int) =
   var counter = 20
   var n = n
-  let cacheKey = if n.kind == Symbol: n.symId else: NoSymId
+  let cacheKey = if n.isSymbol: n.symId else: NoSymId
   var pragmas = default(TypePragmas)
-  while counter > 0 and n.kind == Symbol:
+  while counter > 0 and n.isSymbol:
+    dec counter
     if cache.hasKey(n.symId):
       # `hasKey` just returned true, so `getOrQuit` will not quit.
       let c2 = cache.getOrQuit(n.symId)
@@ -160,23 +161,29 @@ proc getSize(c: var SizeofValue; cache: var Table[SymId, SizeofValue]; n: Cursor
         if n.kind != Symbol:
           pragmas = parseTypePragmas local.pragmas
     else:
-      bug "could not load: " & pool.syms[n.symId]
+      bug "could not load: " & pool.symString(n.symId)
 
   case n.typeKind
   of IntT, UIntT, FloatT:
-    let n = n.firstSon
-    assert n.kind == IntLit
-    let s = int(if pool.integers[n.intId] != -1:
-        pool.integers[n.intId] div 8
-      else:
-        ptrSize)
+    let bits = typebits(n.childCursor.load)
+    let s = int(if bits != -1: bits div 8 else: ptrSize)
     update c, s, s
   of CharT, BoolT:
     update c, 1, 1
-  of RefT, PtrT, MutT, OutT, RoutineTypes, NiltT, CstringT, PointerT, LentT:
+  of RoutineTypes:
+    # A closure is a {fn, env} pair: two pointers. Sizing it as one made the
+    # module that lowers it and the module that imports the still-unlowered
+    # type disagree about whether an object holding it is "big", so constparams
+    # gave the object's `=destroy` a pointer parameter on one side while the
+    # other side passed the value. See `tclosure_xmod_destroy`.
+    if procHasPragma(n, ClosureP):
+      update c, 2 * ptrSize, ptrSize
+    else:
+      update c, ptrSize, ptrSize
+  of RefT, PtrT, MutT, OutT, NiltT, CstringT, PointerT, LentT:
     update c, ptrSize, ptrSize
-  of SinkT, DistinctT:
-    getSize c, cache, n.firstSon, ptrSize
+  of SinkT, OwnedT, DistinctT:
+    getSize c, cache, n.childCursor, ptrSize
   of EnumT, HoleyEnumT, AnumT:
     let b = enumBounds(n)
     if b.lo < 0:
@@ -195,9 +202,9 @@ proc getSize(c: var SizeofValue; cache: var Table[SymId, SizeofValue]; n: Cursor
       # mark as invalid as we pretend to not to know the alignment the backend ends up using etc.
       c.overflow = true
     var n = n
-    inc n
+    n = sub(n) # bound the field walk, `n` is a copy
     var c2 = createSizeofValue(c.strict, PackedP in pragmas.pragmas)
-    if n.kind != DotToken:  # base type
+    if not n.isDotToken:  # base type
       getSize(c2, cache, n, ptrSize)
     elif InheritableP in pragmas.pragmas:
       # No explicit base, but inheritable: account for the RTTI pointer in
@@ -217,7 +224,7 @@ proc getSize(c: var SizeofValue; cache: var Table[SymId, SizeofValue]; n: Cursor
 
   of ArrayT:
     var elem = createSizeofValue(c.strict)
-    getSize(elem, cache, n.firstSon, ptrSize)
+    getSize(elem, cache, n.childCursor, ptrSize)
     let al1 = asSigned(getArrayLen(n), c.overflow)
     var arr = createSizeofValue(c.strict)
     if elem.overflow or elem.size <= 0 or al1 >= high(int) div elem.size:
@@ -229,9 +236,18 @@ proc getSize(c: var SizeofValue; cache: var Table[SymId, SizeofValue]; n: Cursor
     combine c, arr
 
   of SetT:
-    let size0 = bitsetSizeInBytes(n.firstSon)
+    let size0 = bitsetSizeInBytes(n.childCursor)
     let size1 = int asSigned(size0, c.overflow)
     update c, size1, 1
+  of ClosureTupleT:
+    # The lowered (fn, env) pair. Its fn slot keeps the `closure` pragma but is
+    # a bare function pointer (`closuretypes.addClosureTuple`), so walking the
+    # slot as a `.closure` proctype would count the pair as three words and
+    # disagree with the still-unlowered spelling (two words) that an importing
+    # module sees: the defining module would pass an object holding the pair
+    # to its `=destroy` by pointer and the importer by value.
+    if c.strict: c.overflow = true
+    update c, 2 * ptrSize, ptrSize
   of TupleT:
     if c.strict:
       # mark as invalid as we pretend to not to know the alignment the backend ends up using etc.
@@ -246,10 +262,11 @@ proc getSize(c: var SizeofValue; cache: var Table[SymId, SizeofValue]; n: Cursor
     if cacheKey != NoSymId: cache[cacheKey] = c2
     combine c, c2
   of RangetypeT:
-    getSize c, cache, n.firstSon, ptrSize
+    getSize c, cache, n.childCursor, ptrSize
   of NoType, ErrT, VoidT, VarargsT, OrT, AndT, NotT,
      ConceptT, StaticT, InvokeT, UarrayT,
-     AutoT, SymkindT, TypekindT, TypedescT, UntypedT, TypedT, OrdinalT:
+     AutoT, SymkindT, TypekindT, TypedescT, UntypedT, TypedT, OrdinalT,
+     PluginCallT:
     c.overflow = true
 
 type
@@ -283,7 +300,8 @@ proc typeIsBig*(n: Cursor; ptrSize: int): bool {.inline.} =
 proc typeSectionMode(n: Cursor): PragmaKind =
   var n = n
   var counter = 20
-  while counter > 0 and n.kind == Symbol:
+  while counter > 0 and n.isSymbol:
+    dec counter
     let sym = tryLoadSym(n.symId)
     if sym.status == LacksNothing:
       var local = asTypeDecl(sym.decl)
@@ -317,16 +335,16 @@ when isMainModule:
       var n = beginRead srcBuf
       assert n.stmtKind == TypeS
       inc n
-      assert n.kind == SymbolDef
+      assert n.isSymbolDef
       let result = n.symId
-      endRead srcBuf
+      endRead n
       publish result, srcBuf, SemcheckBodies
       result
     var symBuf = createTokenBuf(1)
-    symBuf.add symToken(symId, NoLineInfo)
-    let n = beginRead symBuf
+    symBuf.add symToken(symId)
+    var n = beginRead symBuf
     var sz = getSize(n, 8)
-    endRead symBuf
+    endRead n
     var err = false
     let size = sz.asSigned(err)
     assert size == expectedSize, "expected " & $expectedSize & " but got " & $size
@@ -336,91 +354,91 @@ when isMainModule:
    (type :IntObj.0.mod123abc . . .
     (object .
      (fld :x.0.mod123abc . .
-      (i +64) .)))""", 8)
+      (i 64) .)))""", 8)
 
   testSizeof("""
    (type :IntIntObj.0.mod123abc . . .
     (object .
      (fld :x.0.mod123abc . .
-      (i +64) .)
+      (i 64) .)
      (fld :y.0.mod123abc . .
-      (i +64) .)))""", 16)
+      (i 64) .)))""", 16)
 
   testSizeof("""
    (type :CharObj.0.mod123abc . . .
     (object .
      (fld :x.0.mod123abc . .
-      (c +8) .)))""", 1)
+      (c 8) .)))""", 1)
 
   testSizeof("""
    (type :CharIntObj.0.mod123abc . . .
     (object .
      (fld :x.0.mod123abc . .
-      (c +8) .)
+      (c 8) .)
      (fld :y.0.mod123abc . .
-      (i +64) .)))""", 16)
+      (i 64) .)))""", 16)
 
   testSizeof("""
    (type :IntCharObj.0.mod123abc . . .
     (object .
      (fld :x.0.mod123abc . .
-      (i +64) .)
+      (i 64) .)
      (fld :y.0.mod123abc . .
-      (c +8) .)))""", 16)
+      (c 8) .)))""", 16)
 
   testSizeof("""
-   (type ~24 :IntIntObjPacked.0.mod123abc . .
+   (type :IntIntObjPacked.0.mod123abc . .
     (pragmas
      (packed))
     (object .
      (fld :x.1.mod123abc . .
-      (i +64) .)
+      (i 64) .)
      (fld :y.1.mod123abc . .
-      (i +64) .)))""", 16)
+      (i 64) .)))""", 16)
 
   testSizeof("""
-   (type ~24 :IntCharObjPacked.0.mod123abc . .
+   (type :IntCharObjPacked.0.mod123abc . .
     (pragmas
      (packed))
     (object .
      (fld :x.1.mod123abc . .
-      (i +64) .)
+      (i 64) .)
      (fld :y.1.mod123abc . .
-      (c +8) .)))""", 9)
+      (c 8) .)))""", 9)
 
   testSizeof("""
-   (type ~24 :CharIntObjPacked.0.mod123abc . .
+   (type :CharIntObjPacked.0.mod123abc . .
     (pragmas
      (packed))
     (object .
      (fld :x.1.mod123abc . .
-      (c +8) .)
+      (c 8) .)
      (fld :y.1.mod123abc . .
-      (i +64) .)))""", 9)
+      (i 64) .)))""", 9)
 
   testSizeof("""
-   (type ~24 :CharPackedFieldObj.0.mod123abc . . .
+   (type :CharPackedFieldObj.0.mod123abc . . .
     (object .
      (fld :x.1.mod123abc . .
-      (c +8) .)
+      (c 8) .)
      (fld :y.1.mod123abc . .
       IntIntObjPacked.0.mod123abc .)))""", 17)
 
   testSizeof("""
-   (type ~24 :PackedFieldCharObj.0.mod123abc . . .
+   (type :PackedFieldCharObj.0.mod123abc . . .
     (object .
      (fld :x.1.mod123abc . .
       IntIntObjPacked.0.mod123abc .)
      (fld :y.1.mod123abc . .
-      (c +8) .)))""", 17)
+      (c 8) .)))""", 17)
 
   testSizeof("""
-   (type ~24 :CharIntObjPacked.0.mod123abc . .
+   (type :CharIntObjPackedNested.0.mod123abc . .
     (pragmas
      (packed))
     (object .
      (fld :x.1.mod123abc . .
-      (c +8) .)
+      (c 8) .)
      (fld :y.1.mod123abc . .
       IntIntObj.0.mod123abc .)))""", 17)
 
@@ -430,7 +448,7 @@ when isMainModule:
      (union))
     (object .
      (fld :y.0.mod123abc . .
-      (i +64) .)))""", 8)
+      (i 64) .)))""", 8)
 
   testSizeof("""
    (type :CharIntUnion.0.mod123abc . .
@@ -438,9 +456,9 @@ when isMainModule:
      (union))
     (object .
      (fld :x.0.mod123abc . .
-      (c +8) .)
+      (c 8) .)
      (fld :y.0.mod123abc . .
-      (i +64) .)))""", 8)
+      (i 64) .)))""", 8)
 
   testSizeof("""
    (type :IntObjFloatUnion.0.mod123abc . .
@@ -448,20 +466,20 @@ when isMainModule:
      (union))
     (object .
      (fld :x.0.mod123abc . .
-      (i +64) .)
+      (i 64) .)
      (fld :y.0.mod123abc . .
       IntIntObj.0.mod123abc .)
      (fld :z.0.mod123abc . .
-      (f +32) .)))""", 16)
+      (f 32) .)))""", 16)
 
   testSizeof("""
    (type :XYEnum.0.mod123abc . . .
     (enum
-     (u +8)
+     (u 8)
      (efld :X.0.mod123abc . . E.0.mod123abc
-      (tup +0 "X"))
+      (tup 0 "X"))
      (efld :Y.0.mod123abc . . E.0.mod123abc
-      (tup +1 "Y"))))""", 1)
+      (tup 1 "Y"))))""", 1)
 
   testSizeof("""
    (type :CharCharCaseObj.0.mod123abc . . .
@@ -472,12 +490,12 @@ when isMainModule:
        (ranges X.0.mod123abc)
        (stmts
         (fld :c.0.mod123abc . .
-         (c +8) .)))
+         (c 8) .)))
       (of
        (ranges Y.0.mod123abc)
        (stmts
         (fld :x.0.mod123abc . .
-         (c +8) .))))))""", 2)
+         (c 8) .))))))""", 2)
 
   testSizeof("""
    (type :IntCharCaseObj.0.mod123abc . . .
@@ -488,9 +506,9 @@ when isMainModule:
        (ranges X.0.mod123abc)
        (stmts
         (fld :c.0.mod123abc . .
-         (i +64) .)))
+         (i 64) .)))
       (of
        (ranges Y.0.mod123abc)
        (stmts
         (fld :x.0.mod123abc . .
-         (c +8) .))))))""", 16)
+         (c 8) .))))))""", 16)

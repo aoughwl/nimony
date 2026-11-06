@@ -58,40 +58,61 @@ type
     WantForwarding
 
   RoutineProp = enum
-    CanRaise, IsNoSideEffect, IsClosure
+    IsNoSideEffect, IsClosure
+
+  RaisedType = object
+    family: RaisesFamily
+    typ: Cursor
+
+  TryFrame = object
+    ## What the `except` arms of one `try` catch, and what reached them.
+    catchAll, catchesCode: bool
+    refArms: seq[Cursor]       # the type of every typed `ref` arm
+    reachesRef: bool           # a `ref` raise arrives at this `try`
+    toCatchAll: seq[RaisedType] # what only the catch-all takes
 
   CurrentRoutine = object
     returnExpects: Expects
+    returnType: Cursor  # so `(ret (nil))` knows what the `nil` is
     firstParamKind: TypeKind
     props: set[RoutineProp]
     firstParam: SymId
     resultSym: SymId
-    dangerousLocations: Table[SymId, PackedLineInfo]
+    dangerousLocations: Table[SymId, NifLineInfo]
+    raisesType: Cursor  # nil unless the routine is `.raises`
+    tries: seq[TryFrame] # the `try` bodies being translated, innermost last
+    armRaises: seq[seq[RaisedType]] # what a bare `raise` re-raises in each
+                                    # `except` arm being translated
 
   Context = object
     dest: TokenBuf
     r: CurrentRoutine
     typeCache: TypeCache
-    hooks: Table[SymId, HooksPerType]
+    hooks: ref Table[SymId, HooksPerType]
+      ## The frontend hook table: this module's own, or the shared one of its
+      ## `{.cyclic.}` group. The lifter both reads it and caches forged hooks
+      ## there, so a hook is generated once per table, not once per module.
     classes: semdata.Classes # class entries with methods for vtables
     lifter: ref LiftingCtx
     typeSymBufs: seq[TokenBuf] # keeps Symbol cursors alive for lifter
     tmpCounter: int  # for fresh symbols in exception lowering
+    errorCodeType: TokenBuf # `ErrorCode`, what a bare `(raises)` raises
     handlerStack: seq[tuple[errSym, eSym: SymId]]
       # stack of (`err`, `_e`) syms for synthesized ref-exception handlers; used to
       # rewrite bare `raise` into `exc = err; raise _e` so the original error code
       # is preserved when propagating past the handler.
 
-proc takeToken(c: var Context; n: var Cursor) {.inline.} =
-  c.dest.add n
-  inc n
+proc takeTree(c: var Context; n: var Cursor) {.inline.} =
+  c.dest.takeTree n
 
-proc takeParRi(c: var Context; n: var Cursor) =
-  if n.kind == ParRi:
-    c.dest.add n
-    consumeParRi n
-  else:
-    bug "expected ')', but got: ", n
+proc endsWithOpenHderef(dest: TokenBuf): bool =
+  ## True when the buffer's last value is a freshly opened `(hderef` head.
+  ## The head may be followed by line-info suffix tokens, so a raw
+  ## `dest[dest.len-1].tag` read would compare suffix payload bits.
+  result = false
+  if dest.len > 0:
+    let t = dest[lastValueStart(dest)]
+    result = t.kind == TagLit and t.tagId == TagId(HderefTagId)
 
 proc rootOf(n: Cursor; allowIndirection = false): SymId =
   var n = n
@@ -142,7 +163,7 @@ proc isAddressable*(n: Cursor): bool =
     let res = tryLoadSym(s)
     assert res.status == LacksNothing
     let local = asLocal(res.decl)
-    result = local.kind in {ParamY, LetY, ResultY, VarY, CursorY, PatternvarY, ConstY, GletY, TletY, GvarY, TvarY}
+    result = local.kind in {ParamY, StaticParamY, LetY, ResultY, VarY, CursorY, PatternvarY, ConstY, GletY, TletY, GvarY, TvarY}
     # Assignments to `ConstY` are prevented later.
   else:
     # A path rooted at a call returning `var T` / `lent T` is addressable,
@@ -167,16 +188,72 @@ proc isAddressable*(n: Cursor): bool =
       else:
         break
 
-proc tr(c: var Context; n: var Cursor; e: Expects)
+proc tr(c: var Context; n: var Cursor; e: Expects; expected: Cursor = default(Cursor))
 
-proc trSons(c: var Context; n: var Cursor; e: Expects) =
-  if n.kind != ParLe:
-    takeToken c, n
+proc trSons(c: var Context; n: var Cursor; e: Expects; expected: Cursor = default(Cursor)) =
+  if not n.isTagLit:
+    takeTree c, n
   else:
-    takeToken c, n
-    while n.hasMore:
-      tr c, n, e
-    takeParRi c, n
+    takeInto c.dest, n:
+      while n.hasMore:
+        tr c, n, e, expected
+
+const
+  NilableTypes = {PtrT, RefT, PointerT, CstringT}
+    ## Data pointers only. A `nil` of a proc/iterator type is deliberately left
+    ## bare: the CPS transform rewrites a passive proc's type *after* the
+    ## frontend is done, so a type stamped here would name the pre-transform
+    ## signature and disagree with the local it initializes. `sigmatch` already
+    ## writes `(nil <proctype> (nil))` where a closure needs its environment.
+
+proc resolvedTypeKind(typ: Cursor): TypeKind =
+  ## `typ.typeKind`, but a type alias (`type PNode = ptr Node`) is followed to
+  ## the type it names. Bounded so a broken cycle cannot hang the compiler.
+  var t = skipModifier(typ)
+  var counter = 20
+  while counter > 0 and t.isSymbol:
+    dec counter
+    let res = tryLoadSym(t.symId)
+    if res.status != LacksNothing: return NoType
+    let decl = asTypeDecl(res.decl)
+    if decl.kind != TypeY: return NoType
+    t = skipModifier(decl.body)
+  result = t.typeKind
+
+proc typeForNil*(typ: Cursor): Cursor =
+  ## The type a bare `(nil)` sitting in a slot declared as `typ` should carry,
+  ## or a nil cursor when `typ` is nothing a `nil` can be typed with (`.`, an
+  ## unresolved typevar, `nilt` itself, a non-pointer).
+  result = default(Cursor)
+  if cursorIsNil(typ) or typ.kind in {DotToken, UnknownToken, EofToken}:
+    return
+  var t = skipModifier(typ)
+  if t.typeKind == VarargsT:
+    t = t.childCursor
+    if not t.hasMore: return
+  if resolvedTypeKind(t) in NilableTypes:
+    result = t
+
+proc trNil(c: var Context; n: var Cursor; expected: Cursor) =
+  ## `nil` is the language's one type-polymorphic literal, and this is the last
+  ## place that still knows what it was written for: give it its type here so
+  ## no later pass has to reconstruct one. A `(nil)` that gets *moved* — the
+  ## intra-module inliner splices a literal argument at each use instead of
+  ## binding it to a `(var :p T arg)` copy — otherwise arrives at the backend
+  ## untyped, and `(dot (deref (nil)) f)` is `(*NIM_NIL).f` there. See
+  ## nimony#2317.
+  if n.childCursor.hasMore:
+    # already typed: sigmatch writes `(nil <proctype> (nil))` for a closure.
+    takeTree c, n
+  else:
+    let t = typeForNil(expected)
+    if cursorIsNil(t):
+      takeTree c, n
+    else:
+      c.dest.addParLe(NilX, n.info)
+      c.dest.addSubtree t
+      c.dest.addParRi()
+      skip n
 
 proc validBorrowsFrom(c: var Context; n: Cursor): bool =
   # --------------------------------------------------------------------------
@@ -200,12 +277,12 @@ proc validBorrowsFrom(c: var Context; n: Cursor): bool =
       skip n # skip type
       skip n # skip intlit
     of ExprX:
-      inc n
+      n = sub(n)
       while true:
         if isLastSon(n): break
         skip n
     of CallKinds:
-      inc n
+      n = sub(n)
       let fn = n
       skip n # skip the `fn`
       if n.hasMore:
@@ -213,7 +290,7 @@ proc validBorrowsFrom(c: var Context; n: Cursor): bool =
         assert fnType.isParamsTag
         inc fnType
         let firstParam = asLocal(fnType)
-        if firstParam.kind == ParamY:
+        if isParamLike(firstParam.kind):
           let mightForward = firstParam.typ.typeKind in {MutT, OutT, LentT}
           if not mightForward:
             someIndirection = true
@@ -223,8 +300,8 @@ proc validBorrowsFrom(c: var Context; n: Cursor): bool =
         break
     else:
       break
-  if n.kind == Symbol:
-    if c.typeCache.fetchSymKind(n.symId) == ParamY and n.symId == c.r.firstParam:
+  if n.isSymbol:
+    if isParamLike(c.typeCache.fetchSymKind(n.symId)) and n.symId == c.r.firstParam:
       # There is a difference between
       # proc forward(x: var int): var int = x
       # and
@@ -250,7 +327,7 @@ proc skipToRoot(n: Cursor): Cursor =
       skip n # skip intlit
       skip n # skip type
     of CallKinds:
-      inc n
+      n = sub(n)
       skip n # skip the `fn`
       if n.hasMore:
         # borrowing only work from first parameters:
@@ -261,10 +338,42 @@ proc skipToRoot(n: Cursor): Cursor =
       break
   result = n
 
+proc mutatesThroughPointer(c: var Context; n: Cursor): bool =
+  ## Is the location `n` reached through a `ref`/`ptr` dereference? Allowed
+  ## nonetheless when the head of the access path is of type `var T`
+  ## (a `var` parameter or a call returning `var T`).
+  result = false
+  var n = n
+  while true:
+    case n.exprKind
+    of DerefX, DdotX, PatX:
+      result = true
+      inc n
+    of DotX, AtX, ArratX, TupatX, ParX, HderefX:
+      inc n
+    of DconvX:
+      inc n
+      skip n # skip the type
+    of BaseobjX:
+      inc n
+      skip n # skip intlit
+      skip n # skip type
+    else: break
+  if result and getType(c.typeCache, n).typeKind in {MutT, OutT}:
+    result = false
+
+proc checkPointerMutation(c: var Context; n: Cursor): bool =
+  ## A `.noSideEffect` routine must not mutate state behind a `ref`/`ptr`;
+  ## `{.cast(noSideEffect).}` lifts the restriction.
+  result = IsNoSideEffect in c.r.props and mutatesThroughPointer(c, n)
+  if result:
+    buildLocalErr c.dest, n.info, "cannot mutate " & asNimCode(n) &
+      " through a ref/ptr in a `.noSideEffect` context", n
+
 proc borrowsFromReadonly(c: var Context; n: Cursor; allowLet = false): bool =
   result = false
   let n = skipToRoot(n)
-  if n.kind == Symbol:
+  if n.isSymbol:
     # Use the type cache rather than `tryLoadSym` so that local symbols
     # (anonymous ones like `n.2` lack a module suffix) cannot collide
     # across modules through the shared `pool.syms` interning.
@@ -292,12 +401,12 @@ proc borrowsFromReadonly(c: var Context; n: Cursor; allowLet = false): bool =
     of PatternvarY:
       if not cursorIsNil(local.val):
         result = borrowsFromReadonly(c, local.val)
-    of ParamY:
+    of ParamY, StaticParamY:
       result = local.typ.typeKind notin {MutT, OutT, LentT, SinkT}
     else:
       result = false
-  elif n.kind in {StringLit, IntLit, UIntLit, FloatLit, CharLit} or
-       n.exprKind in {SufX, OconstrX, NewobjX, AconstrX}:
+  elif n.hasMore and (n.kind in {StrLit, IntLit, UIntLit, FloatLit, CharLit} or
+       n.exprKind in {SufX, OconstrX, NewobjX, AconstrX}):
     result = true
   else:
     result = false
@@ -311,7 +420,7 @@ type
 proc checkTupleConstrBorrowing(c: var Context; n: Cursor): LvalueStatus =
   result = Valid
   var n = n
-  inc n
+  n = sub(n)
 
   var typ = n
   assert typ.typeKind == TupleT
@@ -321,8 +430,9 @@ proc checkTupleConstrBorrowing(c: var Context; n: Cursor): LvalueStatus =
     let fieldType = getTupleFieldType(typ)
     skip typ
     let isKv = n.substructureKind == KvU
+    var kvStart = default(Cursor)
     if isKv:
-      inc n
+      kvStart = n; n = sub(n)
       skip n # skip key
     if fieldType.typeKind in {MutT, LentT, OutT}:
       if not validBorrowsFrom(c, n):
@@ -332,41 +442,41 @@ proc checkTupleConstrBorrowing(c: var Context; n: Cursor): LvalueStatus =
     skip n
 
     if isKv:
-      skipParRi(n)
+      n = kvStart; skip n
 
 proc isResultUsage(c: Context; n: Cursor): bool {.inline.} =
   result = false
-  if n.kind == Symbol:
+  if n.isSymbol:
     result = n.symId == c.r.resultSym
 
 proc trReturn(c: var Context; n: var Cursor) =
-  takeToken c, n
-  if isResultUsage(c, n):
-    takeTree c.dest, n
-  else:
-    var err = c.r.returnExpects == WantVarTResult and not validBorrowsFrom(c, n)
-    if err:
-      buildLocalErr(c.dest, n.info, "cannot borrow from " & asNimCode(n))
+  takeInto c.dest, n:
+    if isResultUsage(c, n):
+      takeTree c.dest, n
     else:
-      if n.exprKind == TupconstrX:
-        if checkTupleConstrBorrowing(c, n) != Valid:
-          err = true
-      if not err:
-        tr c, n, c.r.returnExpects
-      else:
+      var err = c.r.returnExpects == WantVarTResult and not validBorrowsFrom(c, n)
+      if err:
+        buildLocalErr(c.dest, n.info, "cannot borrow from " & asNimCode(n))
         skip n
-  takeParRi c, n
+      else:
+        if n.exprKind == TupconstrX:
+          if checkTupleConstrBorrowing(c, n) != Valid:
+            err = true
+        if not err:
+          let returnType = c.r.returnType
+          tr c, n, c.r.returnExpects, returnType
+        else:
+          skip n
 
 proc wantMutable(e: Expects): bool {.inline.} =
   e in {WantVarT, WantVarTResult, WantMutableT}
 
 proc trYield(c: var Context; n: var Cursor) =
-  takeToken c, n
-  if wantMutable(c.r.returnExpects):
-    tr c, n, c.r.returnExpects
-  else:
-    tr c, n, WantForwarding # c.r.returnExpects
-  takeParRi c, n
+  takeInto c.dest, n:
+    if wantMutable(c.r.returnExpects):
+      tr c, n, c.r.returnExpects
+    else:
+      tr c, n, WantForwarding # c.r.returnExpects
 
 proc mightBeDangerous(c: var Context; n: Cursor) =
   let root = rootOf(n)
@@ -379,158 +489,229 @@ proc checkForDangerousLocations(c: var Context; n: var Cursor) =
   template recurse =
     while n.hasMore:
       checkForDangerousLocations c, n
-    skipParRi n
 
   case n.kind
-  of Symbol, UnknownToken, EofToken, DotToken, Ident, SymbolDef, StringLit, CharLit, IntLit, UIntLit, FloatLit:
+  of Symbol, UnknownToken, EofToken, ParLe, ParRi, ExtendedSuffix, LineInfoLit, DotToken, Ident, SymbolDef, StrLit, CharLit, IntLit, UIntLit, FloatLit:
     inc n
-  of ParLe:
-    if isDeclarative(n):
+  of TagLit:
+    if isDeclarative(n) or n.symKind in RoutineKinds:
+      # a routine's body is checked on its own, in `trProcDecl`; a generic
+      # one is not instantiated and must not be checked at all:
       skip n
     elif n.stmtKind == AsgnS:
-      inc n
-      mightBeDangerous(c, n)
-      recurse()
+      n.into:
+        mightBeDangerous(c, n)
+        recurse()
     elif n.exprKind in CallKinds:
-      inc n # skip `(call)`
-      let orig = n
-      var fnType = skipProcTypeToParams(getType(c.typeCache, n))
-      skip n # skip `fn`
-      assert fnType.isParamsTag
-      inc fnType
-      while n.hasMore:
-        let previousFormalParam = fnType
-        let param = takeLocal(fnType, SkipFinalParRi)
-        let pk = param.typ.typeKind
-        if pk in {MutT, OutT, LentT}:
-          mightBeDangerous(c, n)
-        elif pk == VarargsT:
-          # do not advance formal parameter:
-          fnType = previousFormalParam
-        skip n
-      n = orig
-      recurse()
+      n.into:
+        let orig = n
+        var fnType = skipProcTypeToParams(getType(c.typeCache, n))
+        skip n # skip `fn`
+        assert fnType.isParamsTag
+        inc fnType
+        while n.hasMore:
+          let previousFormalParam = fnType
+          let param = takeLocal(fnType, SkipFinalParRi)
+          let pk = param.typ.typeKind
+          if pk in {MutT, OutT, LentT}:
+            mightBeDangerous(c, n)
+          elif pk == VarargsT:
+            # do not advance formal parameter:
+            fnType = previousFormalParam
+          skip n
+        n = orig
+        recurse()
     else:
-      inc n
-      recurse()
-  of ParRi:
+      n.into:
+        recurse()
+  else:
     bug "checkForDangerousLocations: ParRi"
+
+proc raisesTypeOf(c: var Context; value: Cursor): Cursor
 
 proc trProcPragmas(c: var Context; n: var Cursor) =
   # we also need to traverse the `requires` pragmas!
-  if n.kind == DotToken:
-    takeToken c, n
+  if n.isDotToken:
+    takeTree c, n
   else:
-    takeToken c, n # pragmas
-    while n.hasMore:
-      let pk = n.pragmaKind
-      if pk == RequiresP:
-        tr c, n, WantT
-      elif pk == RaisesP:
-        c.r.props.incl CanRaise
-        takeTree c.dest, n
-      elif pk == NoSideEffectP:
-        c.r.props.incl IsNoSideEffect
-        takeTree c.dest, n
-      elif pk == SideEffectP:
-        c.r.props.excl IsNoSideEffect
-        takeTree c.dest, n
-      elif pk == ClosureP:
-        c.r.props.incl IsClosure
-        takeTree c.dest, n
-      else:
-        takeTree c.dest, n
-    takeParRi c, n
+    takeInto c.dest, n: # pragmas
+      while n.hasMore:
+        let pk = n.pragmaKind
+        if pk == RequiresP:
+          tr c, n, WantT
+        elif pk == RaisesP:
+          var value = n
+          inc value, SkipTag
+          c.r.raisesType = c.raisesTypeOf(value)
+          takeTree c.dest, n
+        elif pk == NoSideEffectP:
+          c.r.props.incl IsNoSideEffect
+          takeTree c.dest, n
+        elif pk == SideEffectP:
+          c.r.props.excl IsNoSideEffect
+          takeTree c.dest, n
+        elif pk == ClosureP:
+          c.r.props.incl IsClosure
+          takeTree c.dest, n
+        else:
+          takeTree c.dest, n
 
 proc trProcDecl(c: var Context; n: var Cursor) =
   let decl = n
   c.typeCache.openScope(ProcScope)
-  takeToken c, n
-  let symId = n.symId
-  var isGeneric = false
   let props = if decl.stmtKind in {FuncS, IteratorS, ConverterS}: {IsNoSideEffect} else: {}
   var r = CurrentRoutine(returnExpects: WantT, props: props)
   swap c.r, r
-  for i in 0..<BodyPos:
-    if i == TypevarsPos:
-      isGeneric = n.substructureKind == TypevarsU
-      takeTree c.dest, n
-    elif i == ParamsPos:
-      c.typeCache.registerParams(symId, decl, n)
-      var params = n
-      inc params
-      let firstParam = asLocal(params)
-      if firstParam.kind == ParamY:
-        c.r.firstParam = firstParam.name.symId
-        c.r.firstParamKind = firstParam.typ.typeKind
-      takeTree c.dest, n
-    elif i == ProcPragmasPos and not isGeneric:
-      trProcPragmas(c, n)
-    elif i == ReturnTypePos and n.typeKind in {MutT, OutT, LentT}:
-      c.r.returnExpects = WantVarTResult
+  takeInto c.dest, n:
+    let symId = n.symId
+    var isGeneric = false
+    for i in 0..<BodyPos:
+      if i == TypevarsPos:
+        isGeneric = n.substructureKind == TypevarsU
+        takeTree c.dest, n
+      elif i == ParamsPos:
+        c.typeCache.registerParams(symId, decl, n)
+        var params = n
+        inc params
+        let firstParam = asLocal(params)
+        if isParamLike(firstParam.kind):
+          c.r.firstParam = firstParam.name.symId
+          c.r.firstParamKind = firstParam.typ.typeKind
+        takeTree c.dest, n
+      elif i == ProcPragmasPos and not isGeneric:
+        trProcPragmas(c, n)
+      elif i == ReturnTypePos:
+        c.r.returnType = n
+        if n.typeKind in {MutT, OutT, LentT}:
+          c.r.returnExpects = WantVarTResult
+        takeTree c.dest, n
+      else:
+        takeTree c.dest, n
+
+    if isGeneric:
       takeTree c.dest, n
     else:
-      takeTree c.dest, n
-
-  if isGeneric:
-    takeTree c.dest, n
-    takeParRi c, n
-  else:
-    var body = n
-    tr c, n, c.r.returnExpects
-    if c.r.dangerousLocations.len > 0:
-      # NOTE(nifcore port): reopens the body `(stmts)` just emitted by `tr` to
-      # append the deferred dangerous-location checks. Relies on the closing `)`
-      # being the last physical token in `c.dest`. Under virtual ParRi that token
-      # is elided (folded into the matching ParLe's jump field), so `len - 1`
-      # no longer points at it. Rework before flipping `-d:virtualParRi`: have
-      # `tr` leave the body open, or rebuild the stmts subtree explicitly.
-      c.dest.shrink c.dest.len - 1
-      checkForDangerousLocations c, body
-      c.dest.addParRi()
-    takeParRi c, n
+      var body = n
+      let bodyStart = c.dest.len
+      tr c, n, c.r.returnExpects
+      if c.r.dangerousLocations.len > 0:
+        # reopen the body `(stmts)` just emitted by `tr` to append the
+        # deferred dangerous-location checks:
+        c.dest.reopenLastTree bodyStart
+        checkForDangerousLocations c, body
+        c.dest.addParRi()
   swap c.r, r
   c.typeCache.closeScope()
 
-proc callCanRaise(c: var Context; info: PackedLineInfo) {.inline.} =
-  if CanRaise notin c.r.props:
-    buildLocalErr c.dest, info, "cannot call a routine marked as `.raises` outside of a `try`..`except` block"
+proc objKeyOf(s: SymId): SymId =
+  ## The object type behind a `ref` exception type: `E = ref object of B`
+  ## is its own key, `ref Exception` and an alias of either lead to theirs.
+  var s = s
+  for _ in 0 ..< 20:
+    let res = tryLoadSym(s)
+    if res.status != LacksNothing or res.decl.stmtKind != TypeS: return s
+    var body = asTypeDecl(res.decl).body
+    if body.typeKind == RefT: inc body
+    if body.isSymbol: s = body.symId
+    else: return s
+  result = s
 
-proc trCallArgs(c: var Context; n: var Cursor; fnType: Cursor) =
-  let info = n.info
+proc objKeyOf(t: Cursor): SymId =
+  var t = t
+  if t.typeKind == RefT: inc t
+  result = if t.isSymbol: objKeyOf(t.symId) else: NoSymId
+
+proc isRefSubtype(x, t: Cursor): bool =
+  ## Whether every value of the `ref` type `x` is also a `t`.
+  let xs = objKeyOf(x)
+  let ts = objKeyOf(t)
+  if xs == NoSymId or ts == NoSymId: return true # a generic instance: sem's call
+  if xs == ts: return true
+  for p in inheritanceChain(xs):
+    if objKeyOf(p) == ts: return true
+  result = false
+
+proc raisesTypeOf(c: var Context; value: Cursor): Cursor =
+  ## The type a `(raises T)` pragma names, given its value position (what
+  ## `extractPragma` returns); a bare `(raises)` is `ErrorCode`.
+  result = if value.hasMore: value else: cursorAt(c.errorCodeType, 0)
+
+proc checkRaise(c: var Context; x: RaisedType; info: NifLineInfo; reachesRoutine: bool) =
+  ## `x` is raised here. The innermost `try` with an arm for it catches it; an
+  ## `ErrorCode` arm takes only `ErrorCode`, a `ref` arm only its subtypes and
+  ## the catch-all everything. What no arm catches leaves the routine, and must
+  ## be what the routine raises: nothing translates one kind of error into the
+  ## other. `reachesRoutine` is false for a `raise` statement, which sem has
+  ## already compared with the routine.
+  if x.family notin {CodeRaises, RefRaises}: return
+  var i = c.r.tries.len - 1
+  while i >= 0:
+    if x.family == RefRaises:
+      c.r.tries[i].reachesRef = true
+      for t in c.r.tries[i].refArms:
+        if isRefSubtype(x.typ, t): return
+    elif c.r.tries[i].catchesCode:
+      return
+    if c.r.tries[i].catchAll:
+      c.r.tries[i].toCatchAll.add x
+      return
+    dec i
+  if not reachesRoutine: return
+  if cursorIsNil(c.r.raisesType):
+    if c.r.tries.len == 0 and c.r.armRaises.len == 0:
+      buildLocalErr c.dest, info, "cannot call a routine marked as `.raises` outside of a `try`..`except` block"
+    else:
+      buildLocalErr c.dest, info, "`" & typeToString(x.typ) &
+        "` raised here is not caught by any `except` arm, and the routine is not `.raises`"
+  else:
+    let rf = raisesFamily(c.r.raisesType)
+    if rf == UnknownRaises: return
+    if rf != x.family or (rf == RefRaises and not isRefSubtype(x.typ, c.r.raisesType)):
+      buildLocalErr c.dest, info, "`" & typeToString(x.typ) &
+        "` raised here cannot leave a routine that raises `" &
+        typeToString(c.r.raisesType) & "`, and nothing converts one into the other"
+
+proc callCanRaise(c: var Context; raisesValue: Cursor; info: NifLineInfo) =
+  let t = c.raisesTypeOf(raisesValue)
+  checkRaise c, RaisedType(family: raisesFamily(t), typ: t), info, true
+
+proc trCallArgs(c: var Context; n: var Cursor; fnType: Cursor; info: NifLineInfo) =
   var fnType = skipProcTypeToParams(fnType)
   assert fnType.isParamsTag
-  inc fnType
-  while n.hasMore:
-    var e = WantT
-    let previousFormalParam = fnType
-    let param = takeLocal(fnType, SkipFinalParRi)
-    var pk = param.typ.typeKind
-    if pk in {MutT, LentT}:
-      var elemType = param.typ
-      inc elemType
-      if isViewType(elemType):
-        e = WantMutableT
-      else:
+  fnType.into:
+    while n.hasMore:
+      var e = WantT
+      let previousFormalParam = fnType
+      let param = takeLocal(fnType, SkipFinalParRi)
+      var pk = param.typ.typeKind
+      if pk in {MutT, LentT}:
+        var elemType = param.typ
+        inc elemType
+        if isViewType(elemType):
+          e = WantMutableT
+        else:
+          e = WantVarT
+      elif pk == OutT:
         e = WantVarT
-    elif pk == OutT:
-      e = WantVarT
-    elif pk == VarargsT:
-      # do not advance formal parameter:
-      fnType = previousFormalParam
-    tr c, n, e
-  while fnType.hasMore: skip fnType
-  skipParRi fnType
+      elif pk == VarargsT:
+        # do not advance formal parameter:
+        fnType = previousFormalParam
+      if pk in {MutT, OutT} and checkPointerMutation(c, n):
+        skip n
+      else:
+        tr c, n, e, param.typ
+    while fnType.hasMore: skip fnType
   # skip return type:
   skip fnType
   # now at the pragmas position:
-  if hasPragma(fnType, RaisesP):
-    callCanRaise(c, info)
+  let raisesValue = extractPragma(fnType, RaisesP)
+  if not cursorIsNil(raisesValue):
+    callCanRaise(c, raisesValue, info)
 
 proc firstArgIsMutable(c: var Context; n: Cursor): bool =
   assert n.exprKind in CallKinds
   var n = n
-  inc n
+  n = sub(n)
   assert n.hasMore
   skip n
   if n.hasMore:
@@ -538,7 +719,7 @@ proc firstArgIsMutable(c: var Context; n: Cursor): bool =
   else:
     result = false
 
-proc cannotPassToVar(dest: var TokenBuf; info: PackedLineInfo; arg: Cursor) =
+proc cannotPassToVar(dest: var TokenBuf; info: NifLineInfo; arg: Cursor) =
   let msg = "cannot pass " & asNimCode(arg) & " to var/out T parameter"
   when defined(debug):
     writeStackTrace()
@@ -546,39 +727,40 @@ proc cannotPassToVar(dest: var TokenBuf; info: PackedLineInfo; arg: Cursor) =
     quit msg
   dest.buildTree ErrT, info:
     dest.addSubtree arg
-    dest.add strToken(pool.strings.getOrIncl(msg), info)
+    dest.addStrLit(msg, info)
 
 proc trPragmaBlock(c: var Context; n: var Cursor) =
-  c.dest.takeToken n # pragmax
-  c.dest.takeToken n # pragmas
-  if n.pragmaKind == KeepOverflowFlagP:
-    c.dest.takeTree n # keepOverflowFlag
-    c.dest.takeParRi n # pragmas
-    tr(c, n, WantT)
-  elif n.pragmaKind == CastP:
-    # Look at the inner pragma list of `(cast (pragmas X*))` to decide which
-    # routine props to suppress. Only `noSideEffect` clears `IsNoSideEffect`;
-    # other recognized cast pragmas (e.g. `uncheckedAssign`) are passed through
-    # without touching props.
+  takeInto c.dest, n: # pragmax
+    var isCast = false
     var disableNoSideEffect = false
-    var inner = n
-    inc inner # past `cast`
-    if inner.substructureKind == PragmasU:
-      inc inner
-      while inner.hasMore:
-        if inner.pragmaKind == NoSideEffectP:
-          disableNoSideEffect = true
-        skip inner
-    c.dest.takeTree n # cast pragma
-    c.dest.takeParRi n # outer pragmas
-    let oldProps = c.r.props
-    if disableNoSideEffect:
-      c.r.props.excl IsNoSideEffect
-    tr(c, n, WantT)
-    c.r.props = oldProps
-  else:
-    bug "unknown pragma block: " & toString(n, false)
-  c.dest.takeParRi n # pragmax
+    takeInto c.dest, n: # pragmas
+      if n.pragmaKind == KeepOverflowFlagP:
+        c.dest.takeTree n # keepOverflowFlag
+      elif n.pragmaKind == CastP:
+        # Look at the inner pragma list of `(cast (pragmas X*))` to decide which
+        # routine props to suppress. Only `noSideEffect` clears `IsNoSideEffect`;
+        # other recognized cast pragmas (e.g. `uncheckedAssign`) are passed through
+        # without touching props.
+        isCast = true
+        var inner = n
+        inner = sub(inner) # past `cast`
+        if inner.substructureKind == PragmasU:
+          inner = sub(inner)
+          while inner.hasMore:
+            if inner.pragmaKind == NoSideEffectP:
+              disableNoSideEffect = true
+            skip inner
+        c.dest.takeTree n # cast pragma
+      else:
+        bug "unknown pragma block: " & toString(n, false)
+    if isCast:
+      let oldProps = c.r.props
+      if disableNoSideEffect:
+        c.r.props.excl IsNoSideEffect
+      tr(c, n, WantT)
+      c.r.props = oldProps
+    else:
+      tr(c, n, WantT)
 
 proc trCall(c: var Context; n: var Cursor; e: Expects; dangerous: var bool) =
   let info = n.info
@@ -588,35 +770,48 @@ proc trCall(c: var Context; n: var Cursor; e: Expects; dangerous: var bool) =
 
   swap c.dest, callBuf
   let head = n.load()
-  inc n
+  let callStart = n
+  n = sub(n)
+  template bailCannotPassToVar() =
+    while n.hasMore: skip n
+    n = callStart; skip n # leave the call without emitting into callBuf
+    swap c.dest, callBuf # restore original dest; discard partial callBuf
+    cannotPassToVar c.dest, info, callExpr
+    return
+
   let tt = getType(c.typeCache, n)
-  let calleeKind = tt.stmtKind
   let fnType = skipProcTypeToParams(tt.skipModifier)
-  assert fnType.isParamsTag
+  if not fnType.isParamsTag:
+    bug "derefs trCall: callee type not params at " & infoToStr(n.info)
+  # Declared here (not up top) so its body can see `fnType`: Nimony resolves
+  # template-body identifiers eagerly, so a template referencing a
+  # later-declared local fails to self-host.
+  template finishCallArgs() =
+    trCallArgs(c, n, fnType, info)
+    c.dest.addParRi(n.endInfo)
+    n = callStart; skip n
   var retType = fnType
   skip retType
   var pragmas = retType
   skip pragmas
   if IsNoSideEffect in c.r.props:
-    if whichEffect(calleeKind, pragmas) == HasSideEffect:
+    if calleeEffect(tt.skipModifier, pragmas) == HasSideEffect:
       swap c.dest, callBuf
       buildLocalErr c.dest, n.info, "cannot call a routine with side effects from a `.noSideEffect` context"
       n = callExpr
       skip n
       return
 
-  c.dest.add head # (call)
+  c.dest.addParLe(head.tagId, n.info) # (call)
   tr c, n, WantT # `fn` part of the call
 
   var needHderef = false
   if retType.typeKind in {MutT, LentT}:
     if e in {WantT, WantForwarding}:
       needHderef = true
-      trCallArgs(c, n, fnType)
-      takeParRi c, n
+      finishCallArgs()
     elif e in {WantVarTResult, WantTButSkipDeref} or firstArgIsMutable(c, callExpr):
-      trCallArgs(c, n, fnType)
-      takeParRi c, n
+      finishCallArgs()
     elif not dangerous:
       # DANGER-ZONE HERE! Consider: `for d in items(a)` where `a` is immutable.
       # Which is turned to `var d: var T = a[i]`.
@@ -624,37 +819,27 @@ proc trCall(c: var Context; n: var Cursor; e: Expects; dangerous: var bool) =
       # Thus we mark the binding as "dangerous". In a second pass we then look for the pattern
       # `passedToVar(d)` or `d[] = value` and flag them as errornous.
       dangerous = true
-      trCallArgs(c, n, fnType)
-      takeParRi c, n
+      finishCallArgs()
     else:
-      while n.hasMore: skip n
-      skipParRi n # skip ')' without emitting into callBuf
-      swap c.dest, callBuf # restore original dest; discard partial callBuf
-      cannotPassToVar c.dest, info, callExpr
-      return
+      bailCannotPassToVar()
   elif e.wantMutable:
     if isViewType(retType) and firstArgIsMutable(c, callExpr):
-      trCallArgs(c, n, fnType)
-      takeParRi c, n
+      finishCallArgs()
     else:
-      while n.hasMore: skip n
-      skipParRi n # skip ')' without emitting into callBuf
-      swap c.dest, callBuf # restore original dest; discard partial callBuf
-      cannotPassToVar c.dest, info, callExpr
-      return
+      bailCannotPassToVar()
   else:
-    trCallArgs(c, n, fnType)
-    takeParRi c, n
+    finishCallArgs()
 
   swap c.dest, callBuf
-  if needHderef and c.dest[c.dest.len-1].tag != TagId(HderefTagId):
+  if needHderef and not endsWithOpenHderef(c.dest):
     c.dest.addParLe(HderefX, info)
     c.dest.add callBuf
     c.dest.addParRi()
   else:
     c.dest.add callBuf
 
-proc trAsgnRhs(c: var Context; le: Cursor; ri: var Cursor; e: Expects) =
+proc trAsgnRhs(c: var Context; le: Cursor; ri: var Cursor; e: Expects;
+               expected: Cursor = default(Cursor)) =
   if ri.exprKind in CallKinds:
     var dangerous = false
     trCall c, ri, e, dangerous
@@ -663,61 +848,79 @@ proc trAsgnRhs(c: var Context; le: Cursor; ri: var Cursor; e: Expects) =
       if s != NoSymId:
         c.r.dangerousLocations[s] = ri.info
   else:
-    tr c, ri, e
+    tr c, ri, e, expected
+
+proc trIncDec(c: var Context; n: var Cursor) =
+  ## `(inc T x y?)` mutates the location `x` in place, as the call it used to
+  ## be did through its `var` parameter: the same checks apply, a `let` or a
+  ## `ref` reached from a `.noSideEffect` routine cannot be stepped.
+  takeInto c.dest, n:
+    takeTree c.dest, n # the type
+    if checkPointerMutation(c, n):
+      skip n # the error stands in for the location
+    elif borrowsFromReadonly(c, n):
+      cannotPassToVar c.dest, n.info, n
+      skip n
+    else:
+      tr c, n, WantT
+    while n.hasMore:
+      tr c, n, WantT # the step
 
 proc trAsgn(c: var Context; n: var Cursor) =
-  takeToken c, n
-  var e = WantT
-  var err = Valid
-  let le = n
-  if isResultUsage(c, le):
-    e = c.r.returnExpects
-    if e == WantVarTResult:
-      tr c, n, e
-      if not validBorrowsFrom(c, n):
-        err = InvalidBorrow
+  takeInto c.dest, n:
+    var e = WantT
+    var err = Valid
+    var errAlreadyEmitted = false
+    let le = n
+    if isResultUsage(c, le):
+      e = c.r.returnExpects
+      if e == WantVarTResult:
+        tr c, n, e
+        if not validBorrowsFrom(c, n):
+          err = InvalidBorrow
+      else:
+        tr c, n, e
+        if n.exprKind == TupconstrX:
+          if checkTupleConstrBorrowing(c, n) != Valid:
+            # already emitted an error:
+            errAlreadyEmitted = true
+            skip n
+    elif checkPointerMutation(c, le):
+      errAlreadyEmitted = true
+      skip n
+      tr c, n, WantT
+    elif borrowsFromReadonly(c, n, allowLet = le.isSymbol):
+      # A bare-symbol destination is a whole-variable (re)assignment, handled by
+      # the definite-assignment pass in contracts_fir; a projection (`a.field`,
+      # `a[i]`) of a `let` mutates its contents and must be rejected here.
+      err = LocationIsConst
     else:
       tr c, n, e
-      if n.exprKind == TupconstrX:
-        if checkTupleConstrBorrowing(c, n) != Valid:
-          # already emitted an error:
-          skip n
-          takeParRi c, n
-          return
-  elif borrowsFromReadonly(c, n, allowLet = le.kind == Symbol):
-    # A bare-symbol destination is a whole-variable (re)assignment, handled by
-    # the definite-assignment pass in contracts_fir; a projection (`a.field`,
-    # `a[i]`) of a `let` mutates its contents and must be rejected here.
-    err = LocationIsConst
-  else:
-    tr c, n, e
-  case err
-  of InvalidBorrow:
-    buildLocalErr c.dest, n.info, "cannot borrow from " & asNimCode(n)
-    skip n
-  of LocationIsConst:
-    buildLocalErr c.dest, n.info, "cannot mutate expression " & asNimCode(n)
-    tr c, n, e
-    skip n
-    #tr c, n, e
-  else:
-    trAsgnRhs c, le, n, e
-  takeParRi c, n
+    if not errAlreadyEmitted:
+      case err
+      of InvalidBorrow:
+        buildLocalErr c.dest, n.info, "cannot borrow from " & asNimCode(n)
+        skip n
+      of LocationIsConst:
+        buildLocalErr c.dest, n.info, "cannot mutate expression " & asNimCode(n)
+        tr c, n, e
+        skip n
+        #tr c, n, e
+      else:
+        trAsgnRhs c, le, n, e, getType(c.typeCache, le)
 
 proc trSonsLocation(c: var Context; n: var Cursor; e: Expects) =
-  if n.kind != ParLe:
-    takeToken c, n
+  if not n.isTagLit:
+    takeTree c, n
   elif n.exprKind in {DotX, DdotX}:
-    takeToken c, n
-    tr c, n, e
-    while n.hasMore:
-      takeTree c.dest, n
-    takeParRi c, n
-  else:
-    takeToken c, n
-    while n.hasMore:
+    takeInto c.dest, n:
       tr c, n, e
-    takeParRi c, n
+      while n.hasMore:
+        takeTree c.dest, n
+  else:
+    takeInto c.dest, n:
+      while n.hasMore:
+        tr c, n, e
 
 proc trLocation(c: var Context; n: var Cursor; e: Expects) =
   # Idea: A variable like `x` does not own its value as it can be read multiple times.
@@ -732,8 +935,8 @@ proc trLocation(c: var Context; n: var Cursor; e: Expects) =
       else:
         trSonsLocation c, n, WantT
     else:
-      if (k in {MutT, LentT} and not isViewType(typ.firstSon)) or k == OutT:
-        if c.dest[c.dest.len-1].tag == TagId(HderefTagId):
+      if (k in {MutT, LentT} and not isViewType(typ.childCursor)) or k == OutT:
+        if endsWithOpenHderef(c.dest):
           trSonsLocation c, n, WantT
         else:
           c.dest.addParLe(HderefX, n.info)
@@ -744,14 +947,17 @@ proc trLocation(c: var Context; n: var Cursor; e: Expects) =
   elif e.wantMutable:
     if e == WantVarTResult:
       c.dest.addParLe(HaddrX, n.info)
-      if n.kind == Symbol:
-        takeToken c, n
+      if n.isSymbol:
+        takeTree c, n
       else:
         trSonsLocation c, n, WantT
       c.dest.addParRi()
     elif borrowsFromReadonly(c, n):
       cannotPassToVar c.dest, n.info, n
       skip n
+    elif e == WantMutableT:
+      # a `var openArray` is passed by value, like the view it is
+      trSonsLocation c, n, WantT
     else:
       c.dest.addParLe(HaddrX, n.info)
       trSonsLocation c, n, WantT
@@ -761,32 +967,37 @@ proc trLocation(c: var Context; n: var Cursor; e: Expects) =
 
 proc trLocal(c: var Context; n: var Cursor) =
   let kind = n.symKind
-  takeToken c, n
-  let name = n
-  if kind == ResultY:
-    c.r.resultSym = name.symId
-  for i in 0..<LocalTypePos:
+  takeInto c.dest, n:
+    let name = n
+    if kind == ResultY:
+      c.r.resultSym = name.symId
+    for i in 0..<LocalTypePos:
+      takeTree c.dest, n
+    let typ = n
     takeTree c.dest, n
-  let typ = n
-  takeTree c.dest, n
-  c.typeCache.registerLocal(name.symId, kind, typ, n)
-  if kind == PatternvarY:
-    c.dest.addParLe(HaddrX, n.info)
-    tr c, n, WantT
-    c.dest.addParRi()
-  else:
-    let e = if typ.typeKind in {OutT, MutT, LentT}: WantVarT else: WantT
-    trAsgnRhs c, name, n, e
-  takeParRi c, n
-
-proc trStmtListExpr(c: var Context; n: var Cursor; outerE: Expects) =
-  takeToken c, n
-  while n.hasMore:
-    if isLastSon(n):
-      tr c, n, outerE
-    else:
+    c.typeCache.registerLocal(name.symId, kind, typ, n)
+    if kind == PatternvarY:
+      c.dest.addParLe(HaddrX, n.info)
       tr c, n, WantT
-  takeParRi c, n
+      c.dest.addParRi()
+    else:
+      let e = if typ.typeKind in {OutT, MutT, LentT}: WantVarT else: WantT
+      trAsgnRhs c, name, n, e, typ
+    when defined(debugSigmatch):
+      if n.hasMore:
+        let u = n.info
+        echo "LOCAL LEFTOVER kind=", n.kind,
+          (if n.isTagLit: " tag=" & globalTags.tags[n.tagId] else: ""),
+          " at ", realFile(pool.filenames[u.file]), ":", u.line, ":", u.col
+
+proc trStmtListExpr(c: var Context; n: var Cursor; outerE: Expects;
+                    expected: Cursor = default(Cursor)) =
+  takeInto c.dest, n:
+    while n.hasMore:
+      if isLastSon(n):
+        tr c, n, outerE, expected
+      else:
+        tr c, n, WantT
 
 proc fieldMode(k: TypeKind; outerE: Expects): Expects {.inline.} =
   if k in {MutT, OutT, LentT}:
@@ -795,56 +1006,52 @@ proc fieldMode(k: TypeKind; outerE: Expects): Expects {.inline.} =
     WantT
 
 proc trObjConstr(c: var Context; n: var Cursor; outerE: Expects) =
-  takeToken c, n
-  let objType = n
-  takeTree c.dest, n # type
-  while n.hasMore:
-    assert n.substructureKind == KvU
-    takeToken c, n
-    # Look up the *field's declared type* before consuming the key, so
-    # `tr` knows whether to insert HderefX/HaddrX coercions for fields
-    # that legitimately carry `lent`/`var`/`out`/`mut` qualifiers.
-    # `tryLoadSym` does not reliably resolve field symbols (they live
-    # inside the owning type decl), so use `typenav.lookupField` which
-    # walks the object body.
-    var fieldKind: TypeKind = NoType
-    if n.kind == Symbol:
-      let fieldType = lookupField(c.typeCache, objType, n.symId)
-      if not cursorIsNil(fieldType):
-        fieldKind = fieldType.typeKind
-    takeTree c.dest, n # key
-    tr c, n, fieldMode(fieldKind, outerE)
-    if n.hasMore:
-      # optional inheritance
-      takeTree c.dest, n
-    takeParRi c, n
-  takeParRi c, n
+  takeInto c.dest, n:
+    let objType = n
+    takeTree c.dest, n # type
+    while n.hasMore:
+      assert n.substructureKind == KvU
+      takeInto c.dest, n:
+        # Look up the *field's declared type* before consuming the key, so
+        # `tr` knows whether to insert HderefX/HaddrX coercions for fields
+        # that legitimately carry `lent`/`var`/`out`/`mut` qualifiers.
+        # `tryLoadSym` does not reliably resolve field symbols (they live
+        # inside the owning type decl), so use `typenav.lookupField` which
+        # walks the object body.
+        var fieldKind: TypeKind = NoType
+        var fieldType = default(Cursor)
+        if n.isSymbol:
+          fieldType = lookupField(c.typeCache, objType, n.symId)
+          if not cursorIsNil(fieldType):
+            fieldKind = fieldType.typeKind
+        takeTree c.dest, n # key
+        tr c, n, fieldMode(fieldKind, outerE), fieldType
+        if n.hasMore:
+          # optional inheritance
+          takeTree c.dest, n
 
 proc trTupleConstr(c: var Context; n: var Cursor; outerE: Expects) =
-  takeToken c, n
-  var typ = n
-  assert typ.typeKind == TupleT
-  inc typ
-  takeTree c.dest, n # type
-  while n.hasMore:
-    let fieldType = getTupleFieldType(typ)
-    skip typ
-    let e = fieldMode(fieldType.typeKind, outerE)
-    if n.substructureKind == KvU:
-      takeToken c, n
-      takeTree c.dest, n # skip key
-      tr c, n, e
-      takeParRi c, n
-    else:
-      tr c, n, e
-  takeParRi c, n
+  takeInto c.dest, n:
+    var typ = n
+    assert typ.typeKind == TupleT
+    inc typ
+    takeTree c.dest, n # type
+    while n.hasMore:
+      let fieldType = getTupleFieldType(typ)
+      skip typ
+      let e = fieldMode(fieldType.typeKind, outerE)
+      if n.substructureKind == KvU:
+        takeInto c.dest, n:
+          takeTree c.dest, n # skip key
+          tr c, n, e, fieldType
+      else:
+        tr c, n, e, fieldType
 
 proc trVarHook(c: var Context; n: var Cursor) =
-  takeToken c, n
-  tr c, n, WantVarT
-  if n.hasMore:
-    tr c, n, WantT
-  takeParRi c, n
+  takeInto c.dest, n:
+    tr c, n, WantVarT
+    if n.hasMore:
+      tr c, n, WantT
 
 proc isRefTypeFollow(t: Cursor): bool =
   ## Walk type aliases and report whether `t` resolves to a ref type.
@@ -873,7 +1080,7 @@ type
 proc parseExceptArm(armCur: Cursor): ExceptArm =
   ## armCur points just inside `(except ...`, at the type/decl/dot.
   var n = armCur
-  if n.kind == DotToken:
+  if n.isDotToken:
     var bodyN = n
     inc bodyN
     return ExceptArm(isCatchAll: true, bodyStart: bodyN)
@@ -881,7 +1088,7 @@ proc parseExceptArm(armCur: Cursor): ExceptArm =
     var inner = n
     inc inner  # past `(let`
     var bindSym = NoSymId
-    if inner.kind == SymbolDef:
+    if inner.isSymbolDef:
       bindSym = inner.symId
     skip inner  # name
     skip inner  # export marker
@@ -897,59 +1104,63 @@ proc parseExceptArm(armCur: Cursor): ExceptArm =
   return ExceptArm(isCatchAll: false, isRef: isRefTypeFollow(typ),
                    declType: typ, bindSym: NoSymId, bodyStart: bodyN)
 
-proc shouldCollapseTry(c: var Context; tryAfterTag: Cursor): bool =
-  ## Decide whether to do the ref-exception collapsing lowering. Yes iff
-  ## at least one `(except ...)` arm declares a ref-typed exception AND no
-  ## arm uses a non-ref non-catchall type (we leave such legacy tries alone).
-  var n = tryAfterTag
-  skip n  # body
-  var anyRef = false
-  while n.substructureKind == ExceptU:
-    var arm = n
-    inc arm  # past 'except' tag
-    let info = parseExceptArm(arm)
-    if info.isCatchAll:
-      discard
-    elif info.isRef:
-      anyRef = true
-    else:
-      return false
-    skip n  # past the whole `(except ...)`
-  result = anyRef
-
-proc emitRefExceptionType(dest: var TokenBuf; info: PackedLineInfo) =
+proc emitRefExceptionType(dest: var TokenBuf; info: NifLineInfo) =
   ## Emits `(ref Exception)` into `dest`.
   dest.copyIntoKind RefT, info:
-    dest.addSymUse pool.syms.getOrIncl(ExceptionName), info
+    dest.addSymUse pool.symId(ExceptionName), info
 
-proc trTryCollapsed(c: var Context; n: var Cursor) =
-  ## Lower a try with ref-typed except arms into a single catchall
-  ## `(except . (stmts (let :err ...) (if ...)))`, leaving any `(fin ...)`
-  ## clause intact. The if-chain dispatches via `(of err T)`; for non-Failure
-  ## error codes `exc` is nil and every arm falls through to the else, where
-  ## we re-raise so the original `errorTracker` value is preserved.
-  let info = n.info
-  takeToken c, n  # take '(try' tag
+proc trArmBody(c: var Context; body: Cursor) =
+  var bodyCur = body
+  if bodyCur.isTagLit and bodyCur.stmtKind == StmtsS:
+    bodyCur.into:
+      while bodyCur.hasMore:
+        tr c, bodyCur, WantT
+  else:
+    while bodyCur.hasMore:
+      tr c, bodyCur, WantT
 
-  # Allow raises inside the try body — there is at least one except arm:
-  let oldProps = c.r.props
-  c.r.props.incl CanRaise
+proc armRaise(arm: ExceptArm; frame: TryFrame): seq[RaisedType] =
+  ## What a bare `raise` in `arm` re-raises.
+  if arm.isCatchAll: frame.toCatchAll
+  else: @[RaisedType(family: raisesFamily(arm.declType), typ: arm.declType)]
 
-  # Body
-  tr c, n, WantT
+proc errIsNil(c: var Context; kind: ExprKind; errSym: SymId; info: NifLineInfo) =
+  ## `(eq err nil)` or `(neq err nil)`.
+  c.dest.copyIntoKind kind, info:
+    emitRefExceptionType(c.dest, info)
+    c.dest.addSymUse errSym, info
+    c.dest.copyIntoKind NilX, info:
+      discard
 
-  c.r.props = oldProps
-
-  # Mint a fresh symbol for `err` (moved-out exc).
+proc emitDispatcher(c: var Context; arms: seq[ExceptArm]; frame: TryFrame;
+                    info: NifLineInfo) =
+  ## The `except` arms of a `try` that a `ref` raise can reach, as the one
+  ## catch-all arm the eraiser lowers:
+  ##
+  ##   (except (let :`code ErrorCode)      # every raise lands here
+  ##     (let `err = exc) (asgn exc nil)
+  ##     (if (elif (and (neq err nil) (instanceof err T1)) <arm 1>) …
+  ##         (elif (eq err nil) <the ErrorCode arm>)
+  ##         (else <the catch-all, or the re-raise>)))
+  ##
+  ## A `ref` raise signals `Failure` and leaves the exception in `exc`; an
+  ## `ErrorCode` raise leaves `exc` nil. That is all it takes to tell them apart,
+  ## so a plain code never reaches an `of` test (#2679).
   inc c.tmpCounter
-  let errSym = pool.syms.getOrIncl("`err." & $c.tmpCounter)
-  let excSym = pool.syms.getOrIncl(ExcThreadVarName)
+  let errSym = pool.symId("`err." & $c.tmpCounter)
+  let codeSym = pool.symId("`code." & $c.tmpCounter)
+  let excSym = pool.symId(ExcThreadVarName)
+  let errorCode = cursorAt(c.errorCodeType, 0)
 
-  # Open the synthesized `(except . (stmts ...))`
   c.dest.addParLe ExceptU, info
-  c.dest.addDotToken()  # catchall: no type / no binding
-
-  c.dest.addParLe StmtsS, info  # arm body stmts
+  c.typeCache.registerLocal(codeSym, LetY, errorCode)
+  c.dest.copyIntoKind LetS, info:
+    c.dest.addSymDef codeSym, info
+    c.dest.addDotToken()
+    c.dest.addDotToken()
+    c.dest.addSubtree errorCode
+    c.dest.addDotToken()
+  c.dest.addParLe StmtsS, info
 
   # `let err = exc` followed by `exc = nil` — equivalent to a move but
   # expressed without `(emove ...)` so the duplifier does not have to reason
@@ -968,121 +1179,138 @@ proc trTryCollapsed(c: var Context; n: var Cursor) =
   # Push handler stack so that bare `raise` inside arm bodies restores `exc = err`.
   c.handlerStack.add (errSym: errSym, eSym: NoSymId)
 
-  # Open if-chain
-  c.dest.addParLe IfS, info
-
-  # Iterate arms, collecting any catchall body.
-  var catchallBody: Cursor = default(Cursor)
-  var hasCatchall = false
-
-  while n.substructureKind == ExceptU:
-    var armCur = n
-    inc armCur  # past `(except`
-    let arm = parseExceptArm(armCur)
+  var catchAll = -1
+  var branches = 0
+  for i in 0 ..< arms.len:
+    let arm = arms[i]
     if arm.isCatchAll:
-      catchallBody = arm.bodyStart
-      hasCatchall = true
-      # We will consume this arm later; for now skip the cursor past it.
-      skip n
+      if catchAll < 0: catchAll = i
       continue
-
-    # Ref arm — emit `(elif (instanceof err T) <body>)`.
+    let fam = raisesFamily(arm.declType)
+    if fam notin {RefRaises, CodeRaises}: continue
+    if branches == 0: c.dest.addParLe IfS, info
+    inc branches
     c.dest.addParLe ElifU, info
-    c.dest.copyIntoKind InstanceofX, info:
-      c.dest.addSymUse errSym, info
-      c.dest.addSubtree arm.declType  # type cursor
-    # Branch body
+    if fam == RefRaises:
+      c.dest.copyIntoKind AndX, info:
+        errIsNil(c, NeqX, errSym, info)
+        c.dest.copyIntoKind InstanceofX, info:
+          c.dest.addSymUse errSym, info
+          c.dest.addSubtree arm.declType
+    else:
+      errIsNil(c, EqX, errSym, info)
     c.dest.addParLe StmtsS, info
     if arm.bindSym != NoSymId:
-      # `cursor e = (hconv T err)` — non-owning view of `err` typed as the
-      # user's declared T. The dynamic type was just proven by the
-      # surrounding `(instanceof err T)` check, so the narrowing is sound.
-      # `cursor` keeps `err` as the sole owner of the in-flight exception
-      # so that a bare `raise` inside the body can faithfully restore
-      # `exc = err` without the duplifier turning the read into a move.
-      c.typeCache.registerLocal(arm.bindSym, CursorY, arm.declType)
-      c.dest.copyIntoKind CursorS, info:
-        c.dest.addSymDef arm.bindSym, info
-        c.dest.addDotToken()
-        c.dest.addDotToken()
-        c.dest.addSubtree arm.declType
-        c.dest.copyIntoKind HconvX, info:
+      if fam == RefRaises:
+        # `cursor e = (hconv T err)` — non-owning view of `err` typed as the
+        # user's declared T. The dynamic type was just proven by the
+        # surrounding `(instanceof err T)` check, so the narrowing is sound.
+        # `cursor` keeps `err` as the sole owner of the in-flight exception
+        # so that a bare `raise` inside the body can faithfully restore
+        # `exc = err` without the duplifier turning the read into a move.
+        c.typeCache.registerLocal(arm.bindSym, CursorY, arm.declType)
+        c.dest.copyIntoKind CursorS, info:
+          c.dest.addSymDef arm.bindSym, info
+          c.dest.addDotToken()
+          c.dest.addDotToken()
           c.dest.addSubtree arm.declType
-          c.dest.addSymUse errSym, info
-    # Recursively transform the original arm body
-    var bodyCur = arm.bodyStart
-    if bodyCur.kind == ParLe and bodyCur.stmtKind == StmtsS:
-      bodyCur.into:
-        while bodyCur.hasMore:
-          tr c, bodyCur, WantT
+          c.dest.copyIntoKind HconvX, info:
+            c.dest.addSubtree arm.declType
+            c.dest.addSymUse errSym, info
+      else:
+        c.typeCache.registerLocal(arm.bindSym, LetY, arm.declType)
+        c.dest.copyIntoKind LetS, info:
+          c.dest.addSymDef arm.bindSym, info
+          c.dest.addDotToken()
+          c.dest.addDotToken()
+          c.dest.addSubtree arm.declType
+          c.dest.addSymUse codeSym, info
+    c.r.armRaises.add armRaise(arm, frame)
+    trArmBody c, arm.bodyStart
+    discard c.r.armRaises.pop()
+    c.dest.addParRi() # stmts
+    c.dest.addParRi() # elif
+
+  # What no typed arm took: the catch-all, or on to the next handler. Without
+  # one to reach — no enclosing `try` and a routine that does not raise — the
+  # checks at the raise sites have proven this path dead.
+  let reraise = catchAll < 0 and
+    (c.r.tries.len > 0 or c.r.armRaises.len > 0 or not cursorIsNil(c.r.raisesType))
+  if catchAll >= 0 or reraise:
+    if branches > 0:
+      c.dest.addParLe ElseU, info
+    c.dest.addParLe StmtsS, info
+    if catchAll >= 0:
+      c.r.armRaises.add armRaise(arms[catchAll], frame)
+      trArmBody c, arms[catchAll].bodyStart
+      discard c.r.armRaises.pop()
     else:
-      while bodyCur.hasMore:
-        tr c, bodyCur, WantT
-    c.dest.addParRi()  # close inner stmts
-    c.dest.addParRi()  # close elif
-
-    # Advance n past this whole `(except ...)`.
-    skip n
-
-  # Else branch: catchall body, or re-raise.
-  c.dest.addParLe ElseU, info
-  c.dest.addParLe StmtsS, info
-  if hasCatchall:
-    var bodyCur = catchallBody
-    if bodyCur.kind == ParLe and bodyCur.stmtKind == StmtsS:
-      bodyCur.into:
-        while bodyCur.hasMore:
-          tr c, bodyCur, WantT
-    else:
-      while bodyCur.hasMore:
-        tr c, bodyCur, WantT
-  else:
-    # `(asgn exc err)`
-    c.dest.copyIntoKind AsgnS, info:
-      c.dest.addSymUse excSym, info
-      c.dest.addSymUse errSym, info
-    # Bare re-raise: `(raise .)`. njvl is expected to lower this into
-    # propagation that preserves the current `errorTracker` value.
-    c.dest.copyIntoKind RaiseS, info:
-      c.dest.addDotToken()
-  c.dest.addParRi()  # close else stmts
-  c.dest.addParRi()  # close else
-
-  c.dest.addParRi()  # close if
-  c.dest.addParRi()  # close arm body stmts
-  c.dest.addParRi()  # close synthesized except
+      c.dest.copyIntoKind AsgnS, info:
+        c.dest.addSymUse excSym, info
+        c.dest.addSymUse errSym, info
+      # Bare re-raise: the eraiser re-raises `code`, the code that got here.
+      c.dest.copyIntoKind RaiseS, info:
+        c.dest.addDotToken()
+    c.dest.addParRi() # stmts
+    if branches > 0:
+      c.dest.addParRi() # else
+  if branches > 0:
+    c.dest.addParRi() # if
 
   discard c.handlerStack.pop()
-
-  # Pass through `(fin ...)` if present.
-  if n.substructureKind == FinU:
-    tr c, n, WantT
-
-  takeParRi c, n  # close try
+  c.dest.addParRi() # arm body stmts
+  c.dest.addParRi() # except
 
 proc trTry(c: var Context; n: var Cursor) =
-  var prescan = n
-  inc prescan  # past `(try` tag
-  if shouldCollapseTry(c, prescan):
-    trTryCollapsed(c, n)
-    return
-  takeToken c, n
-  var nn = n
-  skip nn
-  let oldProps = c.r.props
-  # Only an `except` clause catches and thus permits raising calls in the body.
-  # A bare `finally` (e.g. from `defer`) does NOT catch — a raise still escapes —
-  # so a try/finally must not grant `CanRaise`, otherwise a raising call slips
-  # through in a proc not declared `.raises`. `except` always precedes `fin` in
-  # the NIF, so the first post-body clause being `ExceptU` means "has an except".
-  if nn.substructureKind == ExceptU:
-    c.r.props.incl CanRaise
-  # now can raise in the `try` block:
-  tr c, n, WantT
-  c.r.props = oldProps
-  while n.hasMore:
-    tr c, n, WantT
-  takeParRi c, n
+  ## The body is translated first: the raises that reach this `try` decide its
+  ## lowering. Only `ErrorCode` arms, and only `ErrorCode` raises reaching
+  ## them, keep their shape; the eraiser jumps to the first arm. Otherwise the
+  ## arms become one dispatcher (see `emitDispatcher`).
+  let info = n.info
+  var frame = TryFrame()
+  var arms: seq[ExceptArm] = @[]
+  var probe = n
+  probe = sub(probe) # past `(try`
+  skip probe         # the body
+  while probe.substructureKind == ExceptU:
+    var a = probe
+    a = sub(a)
+    let arm = parseExceptArm(a)
+    if arm.isCatchAll:
+      frame.catchAll = true
+    else:
+      case raisesFamily(arm.declType)
+      of RefRaises: frame.refArms.add arm.declType
+      of CodeRaises: frame.catchesCode = true
+      of NotRaisable, UnknownRaises: discard # sem reported it
+    arms.add arm
+    skip probe
+
+  c.dest.addParLe(n.cursorTagId, info)
+  n.into:
+    # A `try` without `except` (what `defer` lowers to) catches nothing.
+    if arms.len > 0:
+      c.r.tries.add frame
+      tr c, n, WantT # the body
+      frame = c.r.tries.pop()
+    else:
+      tr c, n, WantT
+    if frame.refArms.len > 0 or frame.reachesRef:
+      emitDispatcher c, arms, frame, info
+      while n.substructureKind == ExceptU: skip n
+    else:
+      var i = 0
+      while n.substructureKind == ExceptU:
+        takeInto c.dest, n:
+          tr c, n, WantT # the `E as e` binding, the type, or `.`
+          c.r.armRaises.add armRaise(arms[i], frame)
+          while n.hasMore:
+            tr c, n, WantT
+          discard c.r.armRaises.pop()
+        inc i
+    if n.substructureKind == FinU:
+      tr c, n, WantT
+    c.dest.addParRi(n.endInfo) # close try
 
 proc trRaise(c: var Context; n: var Cursor) =
   ## Lowers `(raise <ref-expr>)` to `(stmts (asgn exc <expr>) (raise Failure))`
@@ -1094,10 +1322,14 @@ proc trRaise(c: var Context; n: var Cursor) =
   var lookahead = n
   inc lookahead  # past `(raise` tag
 
-  if lookahead.kind == DotToken:
+  if lookahead.isDotToken:
+    if c.r.armRaises.len > 0:
+      let reraised = c.r.armRaises[^1]
+      for x in reraised:
+        checkRaise c, x, info, true
     if c.handlerStack.len > 0:
       let h = c.handlerStack[^1]
-      let excSym = pool.syms.getOrIncl(ExcThreadVarName)
+      let excSym = pool.symId(ExcThreadVarName)
       c.dest.copyIntoKind StmtsS, info:
         c.dest.copyIntoKind AsgnS, info:
           c.dest.addSymUse excSym, info
@@ -1105,20 +1337,19 @@ proc trRaise(c: var Context; n: var Cursor) =
         c.dest.copyIntoKind RaiseS, info:
           c.dest.addDotToken()
       # consume the original `(raise .)`
-      inc n  # past `(raise`
-      inc n  # past `.`
-      skipParRi n
+      n.into:
+        inc n  # past `.`
       return
     # No active handler — pass through unchanged.
-    takeToken c, n  # `(raise`
-    takeToken c, n  # `.`
-    takeParRi c, n
+    takeInto c.dest, n:  # `(raise`
+      takeTree c, n  # `.`
     return
 
   let opType = getType(c.typeCache, lookahead, {SkipAliases})
+  checkRaise c, RaisedType(family: raisesFamily(opType), typ: opType), info, false
   if opType.typeKind == RefT:
-    let excSym = pool.syms.getOrIncl(ExcThreadVarName)
-    let failureSym = pool.syms.getOrIncl(FailureName)
+    let excSym = pool.symId(ExcThreadVarName)
+    let failureSym = pool.symId(FailureName)
     c.dest.copyIntoKind StmtsS, info:
       c.dest.addParLe AsgnS, info
       c.dest.addSymUse excSym, info
@@ -1127,31 +1358,45 @@ proc trRaise(c: var Context; n: var Cursor) =
       # writing it into the threadvar.
       c.dest.addParLe CastX, info
       emitRefExceptionType(c.dest, info)
-      inc n  # past `(raise` tag
-      tr c, n, WantT  # transform and consume operand
+      n.into:  # the original `(raise ...)`
+        tr c, n, WantT  # transform and consume operand
       c.dest.addParRi()  # close cast
       c.dest.addParRi()  # close asgn
-      skipParRi n  # close original `(raise ...)`
       c.dest.copyIntoKind RaiseS, info:
         c.dest.addSymUse failureSym, info
     return
 
   # Legacy enum/value-typed raise — pass through unchanged.
-  takeToken c, n  # `(raise`
-  while n.hasMore:
-    tr c, n, WantT
-  takeParRi c, n
+  takeInto c.dest, n:  # `(raise`
+    while n.hasMore:
+      tr c, n, WantT
 
 proc trForHelper(c: var Context; n: var Cursor; dangerous: seq[SymId]) =
-  takeToken c, n
-  if dangerous.len > 0:
-    if borrowsFromReadonly(c, n, allowLet=true):
-      for s in dangerous:
-        c.r.dangerousLocations[s] = n.info
-  tr c, n, WantT # iterator call
-  trSons c, n, WantT # decls
-  trSons c, n, WantT # loop body
-  takeParRi c, n
+  takeInto c.dest, n:
+    if dangerous.len > 0:
+      if borrowsFromReadonly(c, n, allowLet=true):
+        for s in dangerous:
+          c.r.dangerousLocations[s] = n.info
+    tr c, n, WantT # iterator call
+    trSons c, n, WantT # decls
+    trSons c, n, WantT # loop body
+
+proc collectDangerousLoopVars(nn: var Cursor; dangerous: var seq[SymId]) =
+  ## `nn` sits at an `(unpackflat …)`/`(unpacktup …)` node whose children are
+  ## local decls — or, for `for i, (a, b) in …`, nested unpack nodes.
+  nn.into:
+    while nn.hasMore:
+      if substructureKind(nn) in {UnpackflatU, UnpacktupU}:
+        collectDangerousLoopVars nn, dangerous
+      else:
+        nn.into: # LetS etc.
+          let s = nn.symId
+          for i in 0..<LocalTypePos:
+            skip nn
+          if nn.typeKind in {OutT, MutT, LentT}:
+            dangerous.add(s)
+          skip nn, SkipType # type
+          skip nn, SkipValue # value
 
 proc trFor(c: var Context; n: var Cursor) =
   #[
@@ -1162,21 +1407,12 @@ proc trFor(c: var Context; n: var Cursor) =
     (unpackflat
      (let :p.0 . .
       (mut string.0.sysvq0asl) .)) ]#
-  var nn = n.firstSon
+  var nn = n.childCursor
   skip nn # iterator
   case substructureKind(nn)
   of UnpackflatU, UnpacktupU:
-    inc nn
     var dangerous: seq[SymId] = @[]
-    while nn.hasMore:
-      inc nn # LetS etc.
-      let s = nn.symId
-      for i in 0..<LocalTypePos:
-        skip nn
-      if nn.typeKind in {OutT, MutT, LentT}:
-        dangerous.add(s)
-      skip nn, SkipType # type
-      skip nn, SkipValue # value
+    collectDangerousLoopVars nn, dangerous
     # now work with `n`, not `nn`
     trForHelper c, n, dangerous
   else:
@@ -1205,92 +1441,243 @@ proc trType(c: var Context; n: var Cursor) =
   ## For types with custom hooks (from sem), use those.
   ## For non-generic nominal types (objects/distincts), generate hooks via lifter.
   let info = n.info
-  takeToken c.dest, n # (type
-  var s = SymId(0)
-  if n.kind == SymbolDef:
-    s = n.symId
-  c.dest.takeTree n # the symbol definition
-  c.dest.takeTree n # exported
-  let isGeneric = n.substructureKind == TypevarsU
-  c.dest.takeTree n # typevars
+  c.dest.addParLe(n.cursorTagId, n.info)
+  n.into: # (type
+    var s = SymId(0)
+    if n.isSymbolDef:
+      s = n.symId
+    c.dest.takeTree n # the symbol definition
+    c.dest.takeTree n # exported
+    let isGeneric = n.substructureKind == TypevarsU
+    c.dest.takeTree n # typevars
 
-  # Check if this is a non-generic nominal type that needs hooks generated
-  var needsForgedHooks = false
-  if not isGeneric and s != SymId(0):
-    # Check if it's a nominal type (object, distinct)
-    var checkBody = n
-    skip checkBody # skip pragmas
-    let bk = checkBody.typeKind
-    needsForgedHooks = bk in {ObjectT, DistinctT, RefT}
+    # Check if this is a non-generic nominal type that needs hooks generated
+    var needsForgedHooks = false
+    if not isGeneric and s != SymId(0):
+      # Check if it's a nominal type (object, distinct)
+      var checkBody = n
+      skip checkBody # skip pragmas
+      let bk = checkBody.typeKind
+      needsForgedHooks = bk in {ObjectT, DistinctT, RefT}
 
-  # Check if type has methods (for vtables)
-  # Use the new c.classes table for method information
-  var hasMethods = false
-  var methodsToAdd: seq[(string, SymId)] = @[]
-  if s != SymId(0) and s in c.classes:
-    hasMethods = true
-    # Convert MethodIndexEntry to (string, SymId) format for addMethodsDecl
-    for entry in c.classes.getOrQuit(s).methods:
-      let sig = pool.strings[entry.signature]
-      methodsToAdd.add (sig, entry.fn)
+    # Check if type has methods (for vtables)
+    # Use the new c.classes table for method information
+    var hasMethods = false
+    var methodsToAdd: seq[(string, SymId)] = @[]
+    if s != SymId(0) and s in c.classes:
+      hasMethods = true
+      # Convert MethodIndexEntry to (string, SymId) format for addMethodsDecl
+      for entry in c.classes.getOrQuit(s).methods:
+        let sig = pool.strings[entry.signature]
+        methodsToAdd.add (sig, entry.fn)
 
-  # pragmas:
-  if s != SymId(0) and (c.hooks.hasKey(s) or hasMethods):
-    # Type has custom hooks or methods from semantic analysis
-    if n.kind == DotToken:
-      c.dest.addParLe PragmasU, info
-      inc n
+    # pragmas:
+    if s != SymId(0) and (c.hooks[].hasKey(s) or hasMethods):
+      # Type has custom hooks or methods from semantic analysis
+      if n.isDotToken:
+        c.dest.addParLe PragmasU, info
+        inc n
+      else:
+        c.dest.addParLe(n.cursorTagId, n.info) # existing pragma tag
+        n.into:
+          while n.hasMore:
+            c.dest.takeTree n # existing individual pragmas
+      if c.hooks[].hasKey(s):
+        addHookDecls c.dest, c.hooks[].getOrQuit(s)
+      # RTTI classes: the object-level `=destroy` hook is virtual (generated as a
+      # method, see lifter.genMissingHooks). It must live in the exported
+      # `(methods)` vtable AND be discoverable as a `(destroy)` hook pragma —
+      # otherwise a foreign consumer that materializes a destroy of this class
+      # forges its OWN module-suffixed hook, which is not in the class's vtable
+      # ("method `=destroy_...` not found in class"). Publishing the owner's
+      # symbol lets the consumer reuse it (via loadHook/tryLoadHook) so the
+      # dispatched method IS in the vtable.
+      #
+      # `=trace` joins it only under `--mm:orc`, where the cycle collector
+      # traces a cell through its static type's `=trace` and so needs the
+      # dynamic type's one in the vtable. Otherwise nothing calls it.
+      if hasMethods and not isGeneric and hasRtti(s):
+        var buf = createTokenBuf(1)
+        buf.addSymUse s, info
+        let typeCursor = cursorAt(buf, 0)
+        c.typeSymBufs.add buf
+        let existing = if c.hooks[].hasKey(s): c.hooks[].getOrQuit(s)
+                       else: default(HooksPerType)
+        for op in [attachedDestroy, attachedTrace]:
+          if op == attachedTrace and not c.lifter.cycles: continue
+          let hookProc = getHook(c.lifter[], op, typeCursor, info)
+          if hookProc != SymId(0):
+            if existing.a[op] == SymId(0):
+              # not already emitted from c.hooks above
+              c.dest.addParLe hookToTag(op), NoLineInfo
+              c.dest.addSymUse hookProc, NoLineInfo
+              c.dest.addParRi()
+            let key = if op == attachedDestroy: destroyMethodKey() else: traceMethodKey()
+            var dup = false
+            for (k, _) in methodsToAdd:
+              if k == key: dup = true; break
+            if not dup:
+              methodsToAdd.add (key, hookProc)
+      if hasMethods:
+        addMethodsDecl c.dest, methodsToAdd
+      c.dest.addParRi()
+    elif needsForgedHooks:
+      # Non-generic nominal type - generate hooks via lifter
+      if n.isDotToken:
+        c.dest.addParLe PragmasU, info
+        inc n
+      else:
+        c.dest.addParLe(n.cursorTagId, n.info) # existing pragma tag
+        n.into:
+          while n.hasMore:
+            c.dest.takeTree n # existing individual pragmas
+      # Generate hooks via lifter - create Symbol buffer that stays alive:
+      var buf = createTokenBuf(1)
+      buf.addSymUse s, info
+      let typeCursor = cursorAt(buf, 0)
+      c.typeSymBufs.add buf
+      # Collect methods for RTTI types (destroy/trace need to be methods)
+      let isRtti = hasRtti(s)
+      var rttiMethods = default seq[(string, SymId)]
+      for op in low(AttachedOp)..high(AttachedOp):
+        let hookProc = getHook(c.lifter[], op, typeCursor, info)
+        if hookProc != SymId(0):
+          c.dest.addParLe hookToTag(op), NoLineInfo
+          c.dest.addSymUse hookProc, NoLineInfo
+          c.dest.addParRi()
+          # For RTTI types, destroy/trace are methods - add them with known signature
+          if isRtti and op in {attachedDestroy, attachedTrace}:
+            let key = case op
+              of attachedDestroy: destroyMethodKey()
+              of attachedTrace: traceMethodKey()
+              else: ""
+            rttiMethods.add((key, hookProc))
+      # Emit methods pragma for RTTI types
+      if rttiMethods.len > 0:
+        addMethodsDecl c.dest, rttiMethods
+      c.dest.addParRi() # close pragmas
     else:
-      c.dest.takeToken n # existing pragma tag
-      while n.hasMore:
-        c.dest.takeTree n # existing individual pragmas
-      skipParRi n
-    if c.hooks.hasKey(s):
-      addHookDecls c.dest, c.hooks.getOrQuit(s)
-    if hasMethods:
-      addMethodsDecl c.dest, methodsToAdd
-    c.dest.addParRi()
-  elif needsForgedHooks:
-    # Non-generic nominal type - generate hooks via lifter
-    if n.kind == DotToken:
-      c.dest.addParLe PragmasU, info
-      inc n
-    else:
-      c.dest.takeToken n # existing pragma tag
-      while n.hasMore:
-        c.dest.takeTree n # existing individual pragmas
-      skipParRi n
-    # Generate hooks via lifter - create Symbol buffer that stays alive:
-    var buf = createTokenBuf(1)
-    buf.addSymUse s, info
-    let typeCursor = cursorAt(buf, 0)
-    c.typeSymBufs.add buf
-    # Collect methods for RTTI types (destroy/trace need to be methods)
-    let isRtti = hasRtti(s)
-    var rttiMethods = default seq[(string, SymId)]
-    for op in low(AttachedOp)..high(AttachedOp):
-      let hookProc = getHook(c.lifter[], op, typeCursor, info)
-      if hookProc != SymId(0):
-        c.dest.addParLe hookToTag(op), NoLineInfo
-        c.dest.addSymUse hookProc, NoLineInfo
-        c.dest.addParRi()
-        # For RTTI types, destroy/trace are methods - add them with known signature
-        if isRtti and op in {attachedDestroy, attachedTrace}:
-          let key = case op
-            of attachedDestroy: destroyMethodKey()
-            of attachedTrace: traceMethodKey()
-            else: ""
-          rttiMethods.add((key, hookProc))
-    # Emit methods pragma for RTTI types
-    if rttiMethods.len > 0:
-      addMethodsDecl c.dest, rttiMethods
-    c.dest.addParRi() # close pragmas
-  else:
-    c.dest.takeTree n # pragmas
-  c.dest.takeTree n # body
-  c.dest.takeParRi n
+      c.dest.takeTree n # pragmas
+    c.dest.takeTree n # body
+    c.dest.addParRi(n.endInfo)
 
-proc tr(c: var Context; n: var Cursor; e: Expects) =
+proc isChainedStringConcatCall(n: Cursor): bool =
+  ## A `string.&` with a `string.&` for an operand: at least three leaves. A
+  ## single `a & b` is left to `&` itself.
+  result = false
+  if isStringConcatCall(n):
+    var c = n
+    inc c                       # past the call tag
+    skip c                      # the callee
+    if isStringConcatCall(c):
+      result = true
+    else:
+      skip c                    # the first operand
+      result = isStringConcatCall(c)
+
+proc collectConcatLeaves(n: var Cursor; leaves: var seq[Cursor]) =
+  ## The operands of a nested `string.&` chain that are not `&` themselves,
+  ## left to right.
+  n.into:
+    skip n                      # the callee
+    for _ in 0..1:
+      if isStringConcatCall(n):
+        collectConcatLeaves(n, leaves)
+      else:
+        leaves.add n
+        skip n
+
+proc emitLenSum(dest: var TokenBuf; intType: Cursor; lenSym: SymId;
+                leaves: seq[TokenBuf]; hi: int; info: NifLineInfo) =
+  ## `len(leaves[0]) + … + len(leaves[hi])`, left-associated.
+  if hi > 0:
+    dest.addParLe AddX, info
+    dest.addSubtree intType
+    emitLenSum(dest, intType, lenSym, leaves, hi-1, info)
+  dest.copyIntoKind CallX, info:
+    dest.addSymUse lenSym, info
+    dest.add leaves[hi]
+  if hi > 0:
+    dest.addParRi()
+
+proc trStringConcatChain(c: var Context; n: var Cursor) =
+  ## `a & b & c & d`, a chain of `string.&`, becomes one allocation:
+  ##
+  ##   (expr
+  ##     (var :t0 . . string a)          # only a leaf that is not a plain
+  ##     …                               # location: it is read twice below
+  ##     (var :s . . string (call newStringOfCap (add len(a) … len(d))))
+  ##     (call add (haddr s) a) … (call add (haddr s) d)
+  ##     s)
+  ##
+  ## Done here rather than in the backend because this is Nimony IR with
+  ## `derefs`' spelling already known — the `(haddr s)` a `var string`
+  ## parameter wants — and so the lowering meets ordinary statements instead
+  ## of a nested call it would have to keep nested for someone else to fold.
+  let info = n.info
+  var leaves: seq[Cursor] = @[]
+  collectConcatLeaves(n, leaves)
+  let stringType = c.typeCache.builtins.stringType
+  # Forged symbol names — indices match declaration order across the system
+  # module's includes (setops/seqimpl/stringimpl/openarrays). If an overload
+  # with the same identifier is inserted earlier in system, these numbers must
+  # shift. (`len(string)` is `len.4`, not `.5`: object fields no longer share
+  # the global per-name counter.)
+  let newStrSym = pool.symId("newStringOfCap.0." & SystemModuleSuffix)
+  let lenSym    = pool.symId("len.4."           & SystemModuleSuffix)
+  let addSym    = pool.symId("add.2."           & SystemModuleSuffix)
+  c.dest.addParLe ExprX, info
+  var uses: seq[TokenBuf] = @[]
+  for leaf in leaves:
+    var l = leaf
+    var translated = createTokenBuf(16)
+    swap c.dest, translated
+    tr c, l, WantT
+    swap c.dest, translated
+    var use = createTokenBuf(4)
+    if needsTemp(beginRead(translated)):
+      inc c.tmpCounter
+      let tmp = pool.symId("`dc." & $c.tmpCounter)
+      c.dest.copyIntoKind VarS, info:
+        c.dest.addSymDef tmp, info
+        c.dest.addDotToken() # not exported
+        c.dest.addDotToken() # no pragmas
+        c.dest.addSubtree stringType
+        c.dest.add translated
+      use.addSymUse tmp, info
+    else:
+      use = ensureMove translated
+    uses.add ensureMove use
+  inc c.tmpCounter
+  let s = pool.symId("`dc." & $c.tmpCounter)
+  c.dest.copyIntoKind VarS, info:
+    c.dest.addSymDef s, info
+    c.dest.addDotToken() # not exported
+    c.dest.addDotToken() # no pragmas
+    c.dest.addSubtree stringType
+    c.dest.copyIntoKind CallX, info:
+      c.dest.addSymUse newStrSym, info
+      emitLenSum(c.dest, c.typeCache.builtins.intType, lenSym, uses, uses.len-1, info)
+  for u in uses:
+    c.dest.copyIntoKind CallS, info:
+      c.dest.addSymUse addSym, info
+      c.dest.copyIntoKind HaddrX, info:
+        c.dest.addSymUse s, info
+      c.dest.add u
+  c.dest.addSymUse s, info
+  c.dest.addParRi()
+
+const
+  ValueExprs = {InfX, NeginfX, NanX, FalseX, TrueX, AndX, OrX, XorX, NotX, NegX,
+    SizeofX, AlignofX, OffsetofX, AconstrX, BracketX, CurlyX, SetconstrX,
+    AddX, SubX, MulX, DivX, ModX, ShrX, ShlX, AshrX, BitandX, BitorX, BitxorX, BitnotX,
+    EqX, NeqX, LeX, LtX, PlussetX, MinussetX, MulsetX, XorsetX, EqsetX, LesetX,
+    LtsetX, InsetX, CardX, SuccX, PredX, IsX, InstanceofX, EnumtostrX,
+    HighX, LowX, DefaultobjX, DefaulttupX, DefaultdistinctX, AddrX}
+    ## Expressions that produce a value, never a location: they cannot be
+    ## passed to a `var`/`out` parameter.
+
+proc tr(c: var Context; n: var Cursor; e: Expects; expected: Cursor = default(Cursor)) =
   case n.kind
   of Symbol:
     # Closures are now implemented
@@ -1307,22 +1694,39 @@ proc tr(c: var Context; n: var Cursor; e: Expects) =
         skip n
         return
     trLocation c, n, e
-  of IntLit, UIntLit, FloatLit, CharLit, StringLit:
+  of IntLit, UIntLit, FloatLit, CharLit, StrLit:
     if e.wantMutable:
       # Consider `fvar(returnsVar(someLet))`: We must not allow this.
       cannotPassToVar c.dest, n.info, n
       inc n
     else:
-      takeToken c, n
-  of UnknownToken, ParRi, EofToken, DotToken, Ident, SymbolDef:
-    takeToken c, n
-  of ParLe:
+      takeTree c, n
+  of TagLit:
+    if e.wantMutable and n.exprKind in ValueExprs:
+      # `bump(1 + 2)`: an arithmetic, logical or constructor expression is a
+      # value, not a location; a `var`/`out` parameter would write into a
+      # temporary and the write would be lost (nimony#2906).
+      cannotPassToVar c.dest, n.info, n
+      skip n
+      return
     case n.exprKind
     of CallKinds:
-      var disallowDangerous = true
-      trCall c, n, e, disallowDangerous
+      if not e.wantMutable and isChainedStringConcatCall(n):
+        trStringConcatChain c, n
+      else:
+        var disallowDangerous = true
+        trCall c, n, e, disallowDangerous
     of PragmaxX:
       trPragmaBlock c, n
+    of CanFormCyclesX:
+      # `canFormCycles(T)`: answered here, where the lifter can say it
+      let info = n.info
+      var t = n
+      inc t
+      let traced = needsTraceOf(c.lifter[], t)
+      skip n
+      c.dest.addParLe(if traced: TrueX else: FalseX, info)
+      c.dest.addParRi()
     of DotX, DdotX, AtX, ArratX, TupatX, PatX:
       trLocation c, n, e
     of OconstrX, NewobjX:
@@ -1338,12 +1742,14 @@ proc tr(c: var Context; n: var Cursor; e: Expects) =
       else:
         trTupleConstr c, n, e
     of ExprX:
-      trStmtListExpr c, n, e
+      trStmtListExpr c, n, e, expected
+    of NilX:
+      trNil c, n, expected
     of DconvX:
-      takeToken c, n
-      takeTree c.dest, n # takes the type as it is
-      tr c, n, e
-      takeParRi c, n
+      takeInto c.dest, n:
+        let target = n
+        takeTree c.dest, n # takes the type as it is
+        tr c, n, e, target
     of BaseobjX:
       if e.wantMutable:
         # Passing a derived location to a `var Base` parameter: take the
@@ -1361,7 +1767,9 @@ proc tr(c: var Context; n: var Cursor; e: Expects) =
       else:
         trSons c, n, WantT
     of ParX:
-      trSons c, n, e
+      trSons c, n, e, expected
+    of EmoveX:
+      trSons c, n, WantT, expected
     of CopyX, WasmovedX, SinkhX, TraceX:
       trVarHook c, n
     of DupX, DestroyX:
@@ -1371,7 +1779,12 @@ proc tr(c: var Context; n: var Cursor; e: Expects) =
         cannotPassToVar c.dest, n.info, n
         skip n
       else:
-        trSons c, n, WantT
+        # `(conv T X)`: the target type is what a bare `nil` operand is.
+        takeInto c.dest, n:
+          let target = n
+          takeTree c.dest, n # the type slot is a type, never an expression
+          while n.hasMore:
+            tr c, n, WantT, target
     of DerefX:
       if e.wantMutable:
         # allows ptr indirection: e.g. `inc x.id[]` for `id: ptr int`
@@ -1386,9 +1799,37 @@ proc tr(c: var Context; n: var Cursor; e: Expects) =
         cannotPassToVar c.dest, n.info, n
         skip n
       else:
-        trSons c, n, e
+        trSons c, n, e, expected
+
+    of EqX, NeqX, LeX, LtX:
+      # `(eq T X X)` and friends carry the operand type up front: that is what
+      # tells the `nil` in `p == nil` which pointer it is.
+      takeInto c.dest, n:
+        let opType = n
+        takeTree c.dest, n
+        while n.hasMore:
+          tr c, n, WantT, opType
+
+    of AconstrX:
+      # `(aconstr (array E N) X*)`
+      takeInto c.dest, n:
+        var elemType = n
+        if elemType.typeKind == ArrayT:
+          elemType = elemType.childCursor
+        else:
+          elemType = default(Cursor)
+        takeTree c.dest, n
+        while n.hasMore:
+          tr c, n, WantT, elemType
 
     else:
+      if e.wantMutable and n.stmtKind in {IfS, CaseS, TryS, BlockS}:
+        # An `if`/`case`/`try`/`block` expression yields a value, not a
+        # location: passing it to a `var`/`out` parameter would mutate a
+        # temporary.
+        cannotPassToVar c.dest, n.info, n
+        skip n
+        return
       case n.stmtKind
       of RetS:
         trReturn(c, n)
@@ -1396,6 +1837,8 @@ proc tr(c: var Context; n: var Cursor; e: Expects) =
         trYield(c, n)
       of AsgnS:
         trAsgn c, n
+      of IncS, DecS:
+        trIncDec c, n
       of LocalDecls:
         trLocal c, n
       of ForS:
@@ -1423,24 +1866,36 @@ proc tr(c: var Context; n: var Cursor; e: Expects) =
           takeTree c.dest, n
         else:
           trSons c, n, WantT
+  else:
+    # atoms (UnknownToken/EofToken/DotToken/Ident/SymbolDef) plus, in the
+    # classic model, a real ParRi scope-close: copy the token verbatim.
+    takeTree c, n
 
-proc injectDerefs*(n: Cursor; hooks: sink Table[SymId, HooksPerType];
+proc injectDerefs*(n: Cursor; hooks: ref Table[SymId, HooksPerType];
                    classes: sink Classes;
-                   thisModuleSuffix: string; bits: int): TokenBuf =
-  var c = Context(typeCache: createTypeCache(),
-    r: CurrentRoutine(returnExpects: WantT, firstParam: NoSymId), dest: TokenBuf(),
-    hooks: ensureMove(hooks),
+                   thisModuleSuffix: string; bits: int; cycles = false): TokenBuf =
+  ## `cycles`: the runtime collects cycles (`NifConfig.cycles`).
+  ## `hooks`: the frontend hooks the lifter consults. A `{.cyclic.}` group
+  ## hands every member the same table; anything else hands its own.
+  let inputWidth = subtreeWidth(n)
+  var c = Context(typeCache: createTypeCache(bits),
+    r: CurrentRoutine(returnExpects: WantT, firstParam: NoSymId),
+    dest: createTokenBuf(inputWidth + inputWidth div 4), # about 1.12x the input
+    hooks: hooks,
     classes: ensureMove(classes),
-    lifter: nil) # set below after hooks is moved
-  # Pass address of hooks to lifter so it can look up hooks from current module
-  c.lifter = createLiftingCtx(thisModuleSuffix, bits, addr c.hooks)
+    lifter: nil) # set below
+  c.errorCodeType = createTokenBuf(1)
+  c.errorCodeType.addSymUse pool.symId(ErrorCodeName), NoLineInfo
+  # the lifter shares the hook table: it reads it and caches forged hooks there
+  c.lifter = createLiftingCtx(thisModuleSuffix, bits, c.hooks, cycles = cycles)
   c.typeCache.openScope()
   var n2 = n
   var n3 = n
-  c.takeToken n2
+  c.dest.addParLe(n2.cursorTagId, n2.info)
+  n2 = sub(n2)
   while n2.hasMore:
     # clean up dots that sem might have introduced for moving inner generic instances:
-    if n2.kind == DotToken: inc n2
+    if n2.isDotToken: inc n2
     else: tr(c, n2, WantT)
   genMissingHooks c.lifter[], c.dest
   if c.r.dangerousLocations.len > 0:

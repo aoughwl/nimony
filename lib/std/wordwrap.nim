@@ -9,16 +9,28 @@
 
 ## This module contains an algorithm to wordwrap a Unicode string.
 
+{.feature: "staticContracts".}
+
 import std/[strutils, unicode, assertions]
 
 
-func olen(s: string; start, lastExclusive: int): int =
+func olen(s: string; start: Natural; lastExclusive: int): int =
   var i = start
   result = 0
-  while i < lastExclusive:
+  # `i < s.len`: every caller passes `lastExclusive <= s.len`; said here, it
+  # bounds the step below
+  while i < lastExclusive and i < s.len:
     inc result
     let L = graphemeLen(s, i)
+    {.assume: L <= s.len.} # a grapheme lies inside `s`
     inc i, L
+
+func runEnd(s: string; start: Natural; seps: set[char]; isSep: bool): Natural {.
+    ensures: result <= s.len.} =
+  ## Where the run of separators (or of non-separators) starting at `start` ends.
+  result = s.len
+  for j in start ..< s.len:
+    if (s[j] in seps) != isSep: return j
 
 func wrapWords*(s: string, maxLineWidth = 80,
                splitLongWords = true,
@@ -34,11 +46,11 @@ func wrapWords*(s: string, maxLineWidth = 80,
   var spaceLeft = maxLineWidth
   var lastSep = ""
 
-  var i = 0
+  var i: Natural = 0
   while true:
-    var j = i
-    let isSep = j < s.len and s[j] in seps
-    while j < s.len and (s[j] in seps) == isSep: inc(j)
+    var isSep = false
+    if i < s.len: isSep = s[i] in seps
+    let j = runEnd(s, i, seps, isSep)
     if j <= i: break
     #yield (substr(s, i, j-1), isSep)
     if isSep:
@@ -54,14 +66,20 @@ func wrapWords*(s: string, maxLineWidth = 80,
       let wlen = olen(s, i, j)
       if wlen > spaceLeft:
         if splitLongWords and wlen > maxLineWidth:
-          var k = 0
+          var k = 0 # an `int`: `p` below is what has to be in range
           while k < j - i:
             if spaceLeft <= 0:
               spaceLeft = maxLineWidth
               result.add newLine
             dec spaceLeft
-            let L = graphemeLen(s, k+i)
-            for m in 0 ..< L: result.add s[i+k+m]
+            var p = i + k
+            # `k < j - i`: `p` lies inside `i ..< j`
+            {.assume: 0 <= p.}
+            let L = graphemeLen(s, p)
+            for m in 0 ..< L:
+              if p >= s.len: break
+              result.add s[p]
+              inc p
             inc k, L
         else:
           spaceLeft = maxLineWidth - wlen

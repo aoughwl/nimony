@@ -9,13 +9,17 @@
 ## See `doc/plugins.md` for the full guide.
 
 {.feature: "untyped".}
+{.feature: "assumeSync".}  # compiler-internal globals; single threaded
 
-import std / [assertions, hashes, syncio, cmdline]
+import std / [assertions, hashes, syncio, cmdline, os]
 import ".." / ".." / "lib" / nifcore except symId, `$`, addSymUse, addSymDef
 import ".." / ".." / "lib" / nifcoreparse except symId, `$`, addSymUse, addSymDef
-import ".." / ".." / "lib" / [bitabs, nifbuilder, symparser]
+from ".." / ".." / "lib" / bif import isBifFile, load, store, UnusedNameTag, DependencyTag
+import ".." / ".." / "lib" / [bitabs, symparser]
 import ".." / ".." / "models" / [tags, nimony_tags]
 import ".." / nif_annotations
+import ".." / ".." / "lib" / nifroles
+export nifroles
 export NimonyType, NimonyExpr, NimonyStmt, NimonyPragma, NimonyOther
 export NifKind, SymId, TagId
 export DotToken, CharLit, StrLit, IntLit, UIntLit, FloatLit
@@ -50,11 +54,62 @@ let
   pluginPool = newPool()
   pluginTags = createPluginTags()
 
+# A plugin process shares ONE pool world across every buffer in it, which is
+# exactly the case `nifcore.fallbackPool`/`fallbackTags` exist for — and they
+# now exist for it ALONE: nifcore declares them only under `-d:nimonyPlugin`,
+# the define every plugin sub-compile carries, because the compiler side has
+# been purged of them (nim-lang/nimony#2456). This is the global the plugin
+# system is allowed to keep, and this is where it is installed.
+#
+# `NifBuilder` is an alias for `TokenBuf`, so a builder
+# `createTree` did not mint (an object field, `default(...)`, a `seq` slot) has
+# nil pools; `nifcore.ensurePools` then minted a PRIVATE pool, and the first
+# `withTree` died in `openTagEscaped` — a fresh pool declares no escape tag —
+# as a bare `[Assertion Failure]` with no file and no line. Kind queries
+# dispatch on `pluginTags` *identity* too, so such a builder also read back as
+# `NoStmt`/`NoExpr` throughout.
+#
+# Stating it here is what makes the API total: every shape of `NifBuilder`
+# lands in the plugin's own pools, not in a private one. The compiler side
+# instead threads its pools into every buffer it mints and has no fallback at
+# all, which is why the two globals below are the plugin build's alone — the
+# `when` matches nifcore's own, so that `import plugins` from ordinary code
+# (tests of the `ensuresNif` annotations, say) still compiles.
+when defined(nimonyPlugin):
+  nifcore.fallbackPool = pluginPool
+  nifcore.fallbackTags = pluginTags
+
 var
   unusedNameBase = ""
   nextUnusedName = 0
+  fileDependencies: seq[string] = @[]
 
-proc appendInfo(buf: var NifBuilder; info: LineInfo) {.inline.} =
+proc dependsOn*(path: string) =
+  ## Records that this plugin run READ `path`, so that a later build reruns the
+  ## plugin when the file changes. Without it a plugin that reads outside its
+  ## input is memoized forever: the compiler keys its cache on the input tree,
+  ## which did not change (nim-lang/nimony#1378).
+  ##
+  ## Call it for every file the plugin opens. The path is made absolute against
+  ## the plugin's working directory, which is the compiler's.
+  ##
+  ## Two limits worth knowing:
+  ## * Only a path that exists is recorded: a file cannot be watched before it
+  ##   is there, and a stale entry would force a rerun on every build. So
+  ##   *creating* a file the plugin looked for and did not find invalidates
+  ##   nothing, while deleting a recorded one does.
+  ## * Naming a *directory* tracks add/remove of its direct entries and nothing
+  ##   else, because that is all a directory mtime says; to follow the contents
+  ##   of a tree, name each file.
+  var full = ""
+  try:
+    full = absolutePath(path)
+  except:
+    discard "no working directory to resolve against: nothing to record"
+  if (fileExists(full) or dirExists(full)) and full notin fileDependencies:
+    fileDependencies.add full
+
+proc appendInfo(buf: var NifBuilder; info: LineInfo) {.inline, nifEmits: "None".} =
   buf.appendLineInfo(info)
 
 proc isEmpty*(tree: NifBuilder): bool {.inline.} =
@@ -79,7 +134,11 @@ proc symText*(n: NifCursor): string {.inline.} =
 
 proc symText*(s: SymId): string {.inline.} =
   ## Resolves a plugin-pool symbol handle to its name.
-  pluginPool.syms[s]
+  pluginPool.symString(s)
+
+proc symBasename*(s: SymId): string {.inline.} =
+  ## Source identifier of `s` without module suffix (Nim spellings for error messages).
+  pluginPool.symBasename(s)
 
 proc identText*(n: NifCursor): string {.inline.} =
   ## Returns the current `Ident` text.
@@ -173,6 +232,7 @@ template withTree*(
     kind: NimonyType|NimonyExpr|NimonyStmt|NimonyOther|NimonyPragma;
     info: LineInfo;
     body: untyped) =
+  {.nifWrap.}
   ## Emits a tagged tree around the values produced by `body`.
   t.openTag(cast[TagId](kind))
   appendInfo(t, info)
@@ -180,22 +240,22 @@ template withTree*(
   t.closeTag()
 
 proc openTree*(t: var NifBuilder; tag: TagId;
-               info: LineInfo = NoLineInfo) =
+               info: LineInfo = NoLineInfo) {.nifOpens.} =
   ## Opens a tree using an existing plugin-pool tag handle.
   t.openTag(tag)
   appendInfo(t, info)
 
 proc openTree*(t: var NifBuilder; tag: string;
-               info: LineInfo = NoLineInfo) =
+               info: LineInfo = NoLineInfo) {.nifOpens.} =
   ## Opens a tree using a textual tag, interning it when necessary.
   t.openTag(pluginTags.tags.getOrIncl(tag))
   appendInfo(t, info)
 
-proc closeTree*(t: var NifBuilder) =
+proc closeTree*(t: var NifBuilder) {.nifCloses.} =
   ## Seals the most recently opened tree.
   t.closeTag()
 
-proc takeTree*(t: var NifBuilder; n: var NifCursor) =
+proc takeTree*(t: var NifBuilder; n: var NifCursor) {.nifBalanced.} =
   ## Copies the current value or subtree into `t` and advances `n`.
   t.addSubtree(n)
   n.skip()
@@ -207,6 +267,7 @@ proc leavePluginScope(n: var NifCursor; scope: nifcore.CursorScope) =
   nifcore.leaveScope(n, scope)
 
 template copyInto*(t: var NifBuilder; n: var NifCursor; body: untyped) =
+  {.nifWrap.}
   ## Copies `n`'s tag, transforms its children with `body`, and advances `n`.
   assert n.kind == TagLit, "copyInto requires cursor at TagLit"
   t.openTree(n.tagId, n.info)
@@ -215,30 +276,30 @@ template copyInto*(t: var NifBuilder; n: var NifCursor; body: untyped) =
   leavePluginScope(n, inputScope)
   t.closeTree()
 
-proc addTree*(t: var NifBuilder; child: NifBuilder) =
+proc addTree*(t: var NifBuilder; child: NifBuilder) {.nifEmits: "Any".} =
   ## Appends every complete top-level value from `child`.
   t.addBufferSamePool(child)
 
 proc addSymUse*(t: var NifBuilder; s: SymId;
-                info: LineInfo = NoLineInfo) =
+                info: LineInfo = NoLineInfo) {.nifEmits: "Y".} =
   ## Appends a symbol use from a plugin-pool symbol handle.
   nifcore.addSymUse(t, s)
   appendInfo(t, info)
 
 proc addSymUse*(t: var NifBuilder; s: string;
-                info: LineInfo) =
+                info: LineInfo) {.nifEmits: "Y".} =
   ## Appends a symbol use from its textual name with source information.
   nifcore.addSymUse(t, s)
   appendInfo(t, info)
 
 proc addSymDef*(t: var NifBuilder; s: SymId;
-                info: LineInfo = NoLineInfo) =
+                info: LineInfo = NoLineInfo) {.nifEmits: "D".} =
   ## Appends a symbol definition from a plugin-pool symbol handle.
   nifcore.addSymDef(t, s)
   appendInfo(t, info)
 
 proc addSymDef*(t: var NifBuilder; s: string;
-                info: LineInfo = NoLineInfo) =
+                info: LineInfo = NoLineInfo) {.nifEmits: "D".} =
   ## Appends a symbol definition from its textual name.
   nifcore.addSymDef(t, s)
   appendInfo(t, info)
@@ -249,7 +310,9 @@ proc genSym*(): SymId =
   ## Pass the result to the regular `addSymDef` and `addSymUse` operations.
   assert unusedNameBase.len > 0,
     "genSym requires plugin input with an .unusedname directive"
-  result = pluginPool.syms.getOrIncl(
+  # Qualified: this module imports nifcore `except symId` (it has its own
+  # `symId(Replacer)`), so the pool accessor has to be named through nifcore.
+  result = nifcore.symId(pluginPool,
     unusedNameBase & "." & $nextUnusedName)
   inc nextUnusedName
 
@@ -270,6 +333,53 @@ proc buildErrorTree(info: LineInfo; msg: string): NifBuilder =
   result.addDotToken()
   result.addErrorMessage(msg, info)
   result.closeTree()
+
+proc needTypes*(syms: openArray[SymId]): NifBuilder =
+  ## Return this as a template plugin's *entire* output to ask the compiler for
+  ## the declarations of `syms`. The compiler appends them to the second input
+  ## and runs the plugin again, so the next `loadTypeDefinitions()` has them.
+  ##
+  ## This is how a plugin resolves a nominal type. Object, enum, distinct and
+  ## generic-instance types arrive in the main input as a bare `Symbol`, and a
+  ## plugin — a separate process — has no way to look one up. Structural types
+  ## (`ptr`, `array`, `tuple`, …) already arrive expanded and need no request.
+  ##
+  ## Ask for everything missing in one go: rounds cost a re-run, so a plugin
+  ## walking a type graph should batch each level rather than ask one at a time.
+  ## Asking again for something already provided is a compile-time error, which
+  ## is what keeps the exchange finite.
+  ##
+  ## .. code-block:: nim
+  ##   var missing: seq[SymId] = @[]
+  ##   collectUnknownSyms(defs, arg, missing)
+  ##   if missing.len > 0:
+  ##     return needTypes(missing)
+  result = createTree()
+  result.withTree NeedtypesU, NoLineInfo:
+    for s in syms:
+      result.addSymUse s
+
+proc needTypes*(s: SymId): NifBuilder =
+  ## Single-symbol overload of `needTypes`.
+  needTypes([s])
+
+proc deferExpansion*(): NifBuilder =
+  ## Return this as a template plugin's *entire* output to say: "I cannot answer
+  ## while the arguments still contain type variables — ask me again once they
+  ## are concrete."
+  ##
+  ## The compiler then leaves the sem-checked call in place instead of replacing
+  ## it with an expansion. Generic instantiation substitutes into that call and
+  ## re-checks it, which runs the plugin again with the instantiated types. It is
+  ## an error to defer when no argument contains a generic parameter — that
+  ## request could never be satisfied.
+  ##
+  ## .. code-block:: nim
+  ##   if mentionsTypevar(arg):
+  ##     return deferExpansion()
+  result = createTree()
+  result.withTree DeferexpansionU, NoLineInfo:
+    discard
 
 proc errorTree*(msg: string): NifBuilder =
   ## Builds a compiler error tree with no original expression attached.
@@ -335,7 +445,7 @@ proc bindSym*(t: var NifBuilder; name: string;
   ##
   ## `name` must be a string literal — sem rejects non-literal arguments.
 
-proc addEmptyNode*(t: var NifBuilder; info: LineInfo = NoLineInfo) =
+proc addEmptyNode*(t: var NifBuilder; info: LineInfo = NoLineInfo) {.nifEmits: "Dot".} =
   ## Appends a single empty placeholder node (`.`) to `t`.
   t.addDotToken()
   appendInfo(t, info)
@@ -363,10 +473,129 @@ proc firstChild*(n: NifCursor): NifCursor {.inline.} =
   ## itself is unchanged.
   result = nifcore.childCursor(n)
 
+iterator children*(n: NifCursor): NifCursor {.sideEffect.} =
+  ## Yields a cursor at each child of the compound node `n`, in order. Yields
+  ## nothing for an atom. `n` itself is unchanged.
+  if n.kind == TagLit:
+    var c = firstChild(n)
+    while c.hasMore:
+      yield c
+      skip c
+
+# ── Typed views of declarations ──────────────────────────────────────────
+# A declaration is read by name instead of by child position: `asRoutine(n)`
+# returns an object whose fields are cursors at the named parts, so the slot
+# numbers live here and nowhere else. The objects and their fields follow
+# `decls.nim`, which does the same inside the compiler. A view holds copies of
+# cursors; the node it was made from does not move.
+
+proc slot(n: NifCursor; i: int): NifCursor =
+  ## Cursor at child `i` of the compound node `n`.
+  assert n.kind == TagLit, "a typed view needs a compound node"
+  result = firstChild(n)
+  var k = 0
+  while k < i:
+    skip result
+    inc k
+
+type
+  Local* = object
+    ## `(let name export pragmas type value)`. The same layout is used by `var`,
+    ## `const`, `param`, `fld` and the other local-like declarations.
+    name*, exported*, pragmas*, typ*, val*: NifCursor
+
+  Routine* = object
+    ## `(proc name export pattern typevars params rettype pragmas effects body)`.
+    ## The same layout is used by `func`, `iterator`, `template` and the other
+    ## routines. Walk the parameters with `for p in r.params.children` and read
+    ## each one with `asLocal`.
+    name*, exported*, pattern*, typevars*, params*, retType*,
+      pragmas*, effects*, body*: NifCursor
+
+  TypeDecl* = object
+    ## `(type name export typevars pragmas body)`.
+    name*, exported*, typevars*, pragmas*, body*: NifCursor
+
+  ObjectDecl* = object
+    ## `(object parent field*)`. `body` is the `object` node itself, so that
+    ## `fields` can walk it.
+    parentType*, body*: NifCursor
+
+  ForStmt* = object
+    ## `(for iter vars body)`.
+    iter*, vars*, body*: NifCursor
+
+proc asLocal*(c: NifCursor): Local =
+  ## The named parts of a `let`, `var`, `const`, `param` or `fld` node.
+  Local(name: slot(c, 0), exported: slot(c, 1), pragmas: slot(c, 2),
+        typ: slot(c, 3), val: slot(c, 4))
+
+proc asRoutine*(c: NifCursor): Routine =
+  ## The named parts of a `proc`, `func`, `iterator`, `template`, ... node.
+  Routine(name: slot(c, 0), exported: slot(c, 1), pattern: slot(c, 2),
+          typevars: slot(c, 3), params: slot(c, 4), retType: slot(c, 5),
+          pragmas: slot(c, 6), effects: slot(c, 7), body: slot(c, 8))
+
+proc isGeneric*(r: Routine): bool =
+  ## True if the routine has generic parameters.
+  r.typevars.otherKind == TypevarsU
+
+proc asTypeDecl*(c: NifCursor): TypeDecl =
+  ## The named parts of a `type` node.
+  TypeDecl(name: slot(c, 0), exported: slot(c, 1), typevars: slot(c, 2),
+           pragmas: slot(c, 3), body: slot(c, 4))
+
+proc isGeneric*(t: TypeDecl): bool =
+  ## True if the type has generic parameters.
+  t.typevars.otherKind == TypevarsU
+
+proc asObjectDecl*(c: NifCursor): ObjectDecl =
+  ## The named parts of an `object` type node.
+  assert c.typeKind == ObjectT, "asObjectDecl needs an object type"
+  ObjectDecl(parentType: slot(c, 0), body: c)
+
+iterator fields*(o: ObjectDecl): Local {.sideEffect.} =
+  ## Yields the fields declared directly in the object. Fields inside a `case`
+  ## or `when` part are not yielded.
+  var first = true
+  for f in o.body.children:
+    if first:
+      first = false                     # the parent type
+    elif f.otherKind in {FldU, GfldU}:
+      yield asLocal(f)
+
+proc asForStmt*(c: NifCursor): ForStmt =
+  ## The named parts of a `for` statement.
+  assert c.stmtKind == ForS, "asForStmt needs a for statement"
+  ForStmt(iter: slot(c, 0), vars: slot(c, 1), body: slot(c, 2))
+
+proc findDecl*(defs: NifCursor; s: SymId): NifCursor =
+  ## Finds the `(type …)` or `(typevar …)` declaration for `s` in `defs`.
+  ## Returns an exhausted cursor when there is no such declaration.
+  result = default(NifCursor)
+  if defs.stmtKind != StmtsS:
+    return
+  for n in defs.children:
+    if n.kind == TagLit and
+        (n.stmtKind == TypeS or n.otherKind in {TypevarU, StaticTypevarU}):
+      if firstChild(n).symId == s:
+        return n
+
+proc findTypeDecl*(defs: NifCursor; s: SymId): NifCursor =
+  ## Like `findDecl`, but only accepts `(type …)` declarations.
+  result = findDecl(defs, s)
+  if result.hasMore and result.stmtKind != TypeS:
+    result = default(NifCursor)
+
+proc isTypevarDecl*(decl: NifCursor): bool {.inline.} =
+  ## Whether `decl` is a `(typevar …)` or `(statictypevar …)` declaration.
+  decl.hasMore and decl.otherKind in {TypevarU, StaticTypevarU}
+
 # ── Traversal templates ──────────────────────────────────────────────────
 # Pure traversal helpers for reading/analyzing a tree without producing output.
 
 template linearScan*(n: var NifCursor; body: untyped) =
+  {.nifWrap.}
   ## Deep-scans all `TagLit` nodes in the subtree rooted at `n`.
   ## Inside `body`, `n` is positioned at each `TagLit` node in turn.
   ## `body` must **not** advance `n` — the template handles traversal.
@@ -550,119 +779,120 @@ proc assertTag(n: NifCursor; expected: NimonyOther) {.inline.} =
 
 # ── Core operations ───────────────────────────────────────────────────────
 
-proc keep*(t: var Replacer; expected: ChildKind) =
+proc keep*(t: var Replacer; expected: ChildKind) {.nifBalanced.} =
   ## Copy one child verbatim from input to output.
   assertChild(t.src, expected)
   t.dest.takeTree(t.src)
 
-proc keep*(t: var Replacer; expected: NimonyStmt) =
+proc keep*(t: var Replacer; expected: NimonyStmt) {.nifBalanced.} =
   ## Copy one child, asserting a specific statement tag.
   assertTag(t.src, expected)
   t.dest.takeTree(t.src)
 
-proc keep*(t: var Replacer; expected: NimonyExpr) =
+proc keep*(t: var Replacer; expected: NimonyExpr) {.nifBalanced.} =
   ## Copy one child, asserting a specific expression tag.
   assertTag(t.src, expected)
   t.dest.takeTree(t.src)
 
-proc keep*(t: var Replacer; expected: NimonyType) =
+proc keep*(t: var Replacer; expected: NimonyType) {.nifBalanced.} =
   ## Copy one child, asserting a specific type tag.
   assertTag(t.src, expected)
   t.dest.takeTree(t.src)
 
-proc keep*(t: var Replacer; expected: NimonyPragma) =
+proc keep*(t: var Replacer; expected: NimonyPragma) {.nifBalanced.} =
   ## Copy one child, asserting a specific pragma tag.
   assertTag(t.src, expected)
   t.dest.takeTree(t.src)
 
-proc keep*(t: var Replacer; expected: NimonyOther) =
+proc keep*(t: var Replacer; expected: NimonyOther) {.nifBalanced.} =
   ## Copy one child, asserting a specific substructure tag.
   assertTag(t.src, expected)
   t.dest.takeTree(t.src)
 
-proc drop*(t: var Replacer; expected: ChildKind) =
+proc drop*(t: var Replacer; expected: ChildKind) {.nifReads.} =
   ## Skip one child from input without emitting.
   assertChild(t.src, expected)
   t.src.skip()
 
-proc drop*(t: var Replacer; expected: NimonyStmt) =
+proc drop*(t: var Replacer; expected: NimonyStmt) {.nifReads.} =
   ## Skip one child, asserting a specific statement tag.
   assertTag(t.src, expected)
   t.src.skip()
 
-proc drop*(t: var Replacer; expected: NimonyExpr) =
+proc drop*(t: var Replacer; expected: NimonyExpr) {.nifReads.} =
   ## Skip one child, asserting a specific expression tag.
   assertTag(t.src, expected)
   t.src.skip()
 
-proc drop*(t: var Replacer; expected: NimonyType) =
+proc drop*(t: var Replacer; expected: NimonyType) {.nifReads.} =
   ## Skip one child, asserting a specific type tag.
   assertTag(t.src, expected)
   t.src.skip()
 
-proc drop*(t: var Replacer; expected: NimonyPragma) =
+proc drop*(t: var Replacer; expected: NimonyPragma) {.nifReads.} =
   ## Skip one child, asserting a specific pragma tag.
   assertTag(t.src, expected)
   t.src.skip()
 
-proc drop*(t: var Replacer; expected: NimonyOther) =
+proc drop*(t: var Replacer; expected: NimonyOther) {.nifReads.} =
   ## Skip one child, asserting a specific substructure tag.
   assertTag(t.src, expected)
   t.src.skip()
 
-proc replace*(t: var Replacer; expected: ChildKind; replacement: NifCursor) =
+proc replace*(t: var Replacer; expected: ChildKind; replacement: NifCursor) {.nifBalanced.} =
   ## Skip one child from input, emit replacement cursor tree instead.
   assertChild(t.src, expected)
   t.src.skip()
   t.dest.addSubtree(replacement)
 
 proc replace*(t: var Replacer; expected: ChildKind;
-              replacement: NifBuilder) =
+              replacement: NifBuilder) {.nifBalanced.} =
   ## Skip one child from input, emit replacement builder tree instead.
   assertChild(t.src, expected)
   t.src.skip()
   t.dest.addTree(replacement)
 
-proc replace*(t: var Replacer; expected: NimonyStmt; replacement: NifCursor) =
+proc replace*(t: var Replacer; expected: NimonyStmt; replacement: NifCursor) {.nifBalanced.} =
   ## Skip one child, asserting a specific statement tag, emit replacement.
   assertTag(t.src, expected)
   t.src.skip()
   t.dest.addSubtree(replacement)
 
 proc replace*(t: var Replacer; expected: NimonyStmt;
-              replacement: NifBuilder) =
+              replacement: NifBuilder) {.nifBalanced.} =
   ## Skip one child, asserting a specific statement tag, emit replacement.
   assertTag(t.src, expected)
   t.src.skip()
   t.dest.addTree(replacement)
 
-proc replace*(t: var Replacer; expected: NimonyExpr; replacement: NifCursor) =
+proc replace*(t: var Replacer; expected: NimonyExpr; replacement: NifCursor) {.nifBalanced.} =
   ## Skip one child, asserting a specific expression tag, emit replacement.
   assertTag(t.src, expected)
   t.src.skip()
   t.dest.addSubtree(replacement)
 
 proc replace*(t: var Replacer; expected: NimonyExpr;
-              replacement: NifBuilder) =
+              replacement: NifBuilder) {.nifBalanced.} =
   ## Skip one child, asserting a specific expression tag, emit replacement.
   assertTag(t.src, expected)
   t.src.skip()
   t.dest.addTree(replacement)
 
-proc replace*(t: var Replacer; expected: NimonyType; replacement: NifCursor) =
+proc replace*(t: var Replacer; expected: NimonyType; replacement: NifCursor) {.nifBalanced.} =
   ## Skip one child, asserting a specific type tag, emit replacement.
   assertTag(t.src, expected)
   t.src.skip()
   t.dest.addSubtree(replacement)
 
 proc replace*(t: var Replacer; expected: NimonyType;
-              replacement: NifBuilder) =
+              replacement: NifBuilder) {.nifBalanced.} =
   ## Skip one child, asserting a specific type tag, emit replacement.
   assertTag(t.src, expected)
   t.src.skip()
   t.dest.addTree(replacement)
 
 template keepTag*(t: var Replacer; body: untyped) =
+  {.nifWrap.}
   ## Copy the opening tag from input to output, run `body` for children,
   ## close the output node and advance past the input subtree.
   assert t.src.kind == TagLit, "keepTag requires cursor at TagLit"
@@ -679,6 +909,7 @@ template loopKeepTag*(t: var Replacer; body: untyped) =
 template replaceHead*(t: var Replacer;
                       tag: NimonyType|NimonyExpr|NimonyStmt|NimonyOther|NimonyPragma;
                       info: LineInfo; body: untyped) =
+  {.nifWrap.}
   ## Like `keepTag` but emits a new tag instead of copying the input's tag.
   ## Enters the input tree via `into`, runs `body`
   ## (which must consume the children), then closes both input and output
@@ -714,9 +945,31 @@ template peek*(t: var Replacer; body: untyped) =
 
 proc loadPluginTree(filename: string): NifBuilder =
   var hint = ""
-  result = parseFromFile(
-    filename, hint, sharedPool = pluginPool, sharedTags = pluginTags,
-    denseLineInfo = true)
+  if isBifFile(filename):
+    # Binary input behind an unchanged `.nif` name. `bif.load` mints fresh
+    # pools (the bif invariant), but every kind query above dispatches on
+    # `pluginTags` *identity*, so the content must be re-interned into the
+    # plugin world — `addSubtree` re-interns tags, literals and line-info
+    # filenames across pools. The text format's `.unusedname` directive
+    # arrives as a leading `(unusedname X)` tree; peel it off here.
+    var m = bif.load(filename)
+    var c = beginRead(m.buf)
+    if c.hasMore and c.kind == TagLit and
+        m.buf.tags.tagName(c.cursorTagId) == UnusedNameTag:
+      c.into:
+        while c.hasMore:
+          if c.kind == Symbol:
+            hint = c.symName
+          skip c
+    result = createTree()
+    while c.hasMore:
+      result.addSubtree(c)
+      skip c
+    c.endRead()
+  else:
+    result = parseFromFile(
+      filename, hint, sharedPool = pluginPool, sharedTags = pluginTags,
+      denseLineInfo = true)
   if hint.len > 0:
     var hintBase = ""
     var hintNumber = 0
@@ -732,16 +985,30 @@ proc loadPluginTree(filename: string): NifBuilder =
         nextUnusedName = hintNumber
 
 proc writePluginTree(tree: var NifBuilder; filename: string) =
-  var output = nifbuilder.open(filename)
+  # Binary bif behind the `.out.nif` name (the compiler sniffs the header;
+  # decode with `niftools bif2nif` for debugging). The copy into a private
+  # pool keeps the file compact — `tree` shares the big plugin pools, and
+  # `store` writes a buffer's pools whole. The gensym hint travels as the
+  # leading `(unusedname X)` tree, exactly as on the input side.
+  var buf = createTokenBuf(tree.len + 4)
   if unusedNameBase.len > 0:
-    output.addRaw "(.unusedname "
-    output.addSymbol unusedNameBase & "." & $nextUnusedName
-    output.addRaw ")\n"
-  tree.appendTo(output)
-  try:
-    output.close()
-  except:
-    quit "FAILURE: cannot write " & filename
+    buf.openTag(buf.tags.registerTag(UnusedNameTag))
+    nifcore.addSymUse(buf, unusedNameBase & "." & $nextUnusedName)
+    buf.closeTag()
+  if fileDependencies.len > 0:
+    # `(dependency …)`: the second sidecar tree, peeled off by `semos.runPlugin`
+    # like the gensym hint above.
+    buf.openTag(buf.tags.registerTag(DependencyTag))
+    for d in fileDependencies:
+      nifcore.addStrLit(buf, d)
+    buf.closeTag()
+  if tree.len > 0:
+    var c = beginRead(tree)
+    while c.hasMore:
+      buf.addSubtree(c)
+      skip c
+    c.endRead()
+  bif.store(buf, filename)
 
 proc loadReplacer*(inputFile = paramStr(1)): Replacer =
   ## Loads the input NIF file and returns a `Replacer` ready for
@@ -764,11 +1031,20 @@ proc loadPluginInput*(filename = paramStr(1)): NifCursor =
   result = snapshot(tree)
 
 proc loadTypeDefinitions*(): NifCursor =
-  ## Loads the type-definitions input for a type plugin (`paramStr(3)`).
+  ## Loads the second input file (`paramStr(3)`). Two kinds of plugin get one:
   ##
-  ## Type plugins receive two input files: the full module AST via
-  ## `loadPluginInput()` and the triggering type definitions via this proc.
-  ## The result has the shape `(stmts <type-sym1> <type-sym2> ...)`.
+  ## - **Type plugins**: the definitions that triggered the plugin, shaped
+  ##   `(stmts <type-sym1> <type-sym2> ...)` — bare symbols.
+  ## - **Template plugins**: the declarations the plugin has asked for with
+  ##   `needTypes`, shaped
+  ##   `(stmts (type :Sym <export> <typevars> <pragmas> <body>)*)`, with
+  ##   `(typevar :T …)` entries for symbols that turned out to be type
+  ##   variables. Empty on the first round — a plugin that never calls
+  ##   `needTypes` never gets anything, and pays nothing.
+  ##
+  ##   A generic instance's `<typevars>` slot holds `(at <head> <args>...)`,
+  ##   which is where `genericHead` and `genericParams` come from.
+  ##   See `lib/std/deps/typetraits.nim`.
   loadPluginInput(paramStr(3))
 
 proc pluginName*(n: NifCursor): string =

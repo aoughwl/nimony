@@ -34,7 +34,7 @@ when false:
       let pb = takeLocal(b, SkipFinalParRi)
       if not sameTrees(pa.typ, pb.typ):
         return false
-    if a.kind == ParRi and b.kind == ParRi:
+    if not a.hasMore and not b.hasMore:
       inc a
       inc b
       # check return types
@@ -42,14 +42,15 @@ when false:
     else:
       return false
 
-proc methodKeyImpl(name: string; a: Cursor): string =
-  # First parameter was the class type and has already been skipped here!
-  var a = a
+proc methodKeyImpl(name: string; params: Cursor): string =
+  # `params` sits at the routine's `(params …)` node.
+  var a = params
   var b = createMangler(60)
-  while a.hasMore:
-    let pa = takeLocal(a, SkipFinalParRi)
-    mangle b, pa.typ, Frontend
-  inc a
+  a.into:
+    skip a # first parameter is of the class type and must be ignored
+    while a.hasMore:
+      let pa = takeLocal(a, SkipFinalParRi)
+      mangle b, pa.typ, Frontend
   # also add return type:
   mangle b, a, Frontend
   skip a
@@ -65,7 +66,7 @@ proc methodKeyImpl(name: string; a: Cursor): string =
       # .raises without type defaults to ErrorCode - mangle the default
       b.addKeyw "raises"
       var errorCodeBuf = createTokenBuf(1)
-      errorCodeBuf.addSymUse pool.syms.getOrIncl(ErrorCodeName), NoLineInfo
+      errorCodeBuf.addSymUse pool.symId(ErrorCodeName), NoLineInfo
       let errorCodeCursor = cursorAt(errorCodeBuf, 0)
       mangle b, errorCodeCursor, Frontend
   else:
@@ -92,8 +93,9 @@ proc traceMethodKey*(): string =
   b.addKeyw "closureNo"
   result = "=trace:" & b.extract()
 
-proc methodKey*(methodName: string; paramRest: Cursor): string =
-  ## Compute the method signature key for vtable matching.
+proc methodKey*(methodName: string; params: Cursor): string =
+  ## Compute the method signature key for vtable matching; `params` sits at
+  ## the routine's `(params …)` node (the first parameter is the class type).
   ## For =destroy and =trace hooks, uses canonical signatures to ensure proper override matching.
   ## For other methods, mangles the params and return type.
   if methodName == "=destroy":
@@ -101,7 +103,7 @@ proc methodKey*(methodName: string; paramRest: Cursor): string =
   elif methodName == "=trace":
     result = traceMethodKey()
   else:
-    result = methodKeyImpl(methodName, paramRest)
+    result = methodKeyImpl(methodName, params)
 
 proc loadVTable*(typ: SymId): seq[semdata.MethodIndexEntry] =
   ## Load vtable methods from the type's (methods (kv key symId) ...) pragma.
@@ -114,18 +116,18 @@ proc loadVTable*(typ: SymId): seq[semdata.MethodIndexEntry] =
   # For non-types, pragmas cursor will be invalid and we'll return early
   let typeDecl = asTypeDecl(res.decl)
   var pragmas = typeDecl.pragmas
-  if pragmas.kind == ParLe:
+  if pragmas.isTagLit:
     pragmas.into:  # (pragmas …)
       while pragmas.hasMore:
-        if pragmas.kind == ParLe and pragmas.pragmaKind == MethodsP:
+        if pragmas.isTagLit and pragmas.pragmaKind == MethodsP:
           pragmas.into:  # (methods …)
             while pragmas.hasMore:
-              if pragmas.kind == ParLe and pragmas.substructureKind == KvU:
+              if pragmas.isTagLit and pragmas.substructureKind == KvU:
                 pragmas.into KvU:
-                  if pragmas.hasMore and pragmas.kind == StringLit:
-                    let signature = pragmas.litId
+                  if pragmas.hasMore and pragmas.isStringLit:
+                    let signature = pragmas.strId
                     inc pragmas, AnyExpr
-                    if pragmas.hasMore and pragmas.kind == Symbol:
+                    if pragmas.hasMore and pragmas.isSymbol:
                       let methodSym = pragmas.symId
                       result.add semdata.MethodIndexEntry(fn: methodSym, signature: signature)
                       inc pragmas, AnyExpr

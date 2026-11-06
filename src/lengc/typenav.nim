@@ -19,10 +19,105 @@ import ".." / "lib" / nifcoreparse        # re-exports nifcore + parseFromBuffer
 import ".." / "lib" / nifcdecl              # stmtKind/exprKind/typeKind, tag enums
 import ".." / "models" / tags               # *TagId ordinals for synthesis
 import nifmodules                                   # MainModule, getDeclOrNil
+import ".." / "lib" / intrinsics             # the shared `{.instruction.}` row table
+export intrinsics   # `intrinsicOfCallee` returns an `IntrinsicOp`, so every
+                    # importer needs the enum and the row table with it
 
 proc firstChild(c: Cursor): Cursor {.inline.} =
   result = c
   inc result
+
+proc intrinsicOfCallee*(m: var MainModule; callee: Cursor;
+                        bits: var int): IntrinsicOp =
+  ## The opcode a `(instr SYM …)` names, plus the width its row bound (taken
+  ## from the declared first operand). Reads the `(instruction X)` /
+  ## `(intrinsic X)` pragma off the callee's declaration — a table lookup on an
+  ## ident, not a match against a C name. Shared by both Leng back ends: the
+  ## C one keys its `__builtin_*` choice off it and the LLVM one reuses that
+  ## same choice, so neither re-derives the row from the declaration itself.
+  result = NoIntrinsicOp
+  bits = 0
+  if callee.kind != Symbol: return
+  let d = m.getDeclOrNil(callee.symId)
+  if d == nil or d.kind != ProcY: return
+  var n = d.pos
+  n.into:
+    inc n                                   # name
+    if n.typeKind == ParamsT:               # first param's type → the width
+      var p = n
+      p.loopInto:
+        if p.substructureKind == ParamU and bits == 0:
+          let pd = takeParamDecl(p)
+          if pd.typ.kind == TagLit and pd.typ.typeKind in {IT, UT, CT, FT}:
+            var b = pd.typ
+            inc b
+            if b.kind == IntLit: bits = int(b.intVal)
+        else:
+          skip p
+    skip n                                  # params
+    skip n                                  # return type
+    if n.substructureKind == PragmasU:
+      var p = n
+      p.loopInto:
+        let pk = p.pragmaKind
+        if pk in {InstructionP, IntrinsicP}:
+          var a = p; a = sub(a)
+          if a.kind == StrLit:
+            result = intrinsicOpByName(m.pool.strings[a.strId],
+                       (if pk == InstructionP: icPinned else: icPortable))
+        skip p
+    while n.hasMore: skip n
+
+proc cBuiltinFor*(op: IntrinsicOp; bits: int): string =
+  ## The C name a *portable* opcode lowers to: a GCC/clang builtin, or — for the
+  ## one row whose spelling is the C compiler's target to choose — a prelude
+  ## macro. Target-pinned rows have no portable C spelling by construction and
+  ## return "" — the C backend rejects them rather than guessing an equivalent.
+  case op
+  of CtzOp:      (if bits <= 32: "__builtin_ctz" else: "__builtin_ctzll")
+  of ClzOp:      (if bits <= 32: "__builtin_clz" else: "__builtin_clzll")
+  of PopcountOp: (if bits <= 32: "__builtin_popcount" else: "__builtin_popcountll")
+  of BswapOp:
+    if bits <= 16: "__builtin_bswap16"
+    elif bits <= 32: "__builtin_bswap32"
+    else: "__builtin_bswap64"
+  # The atomics map back to the `__atomic_*` builtins their declarations used to
+  # `importc` directly, so the generated C is unchanged by their becoming rows.
+  # `bits` is not consulted: unlike the bit-counting builtins these are
+  # type-generic in GCC — the width comes from the pointer argument — which is
+  # also why `intrinsicOfCallee` leaves `bits` at 0 here (the first param is a
+  # `ptr T`, not an integer).
+  of AtomicLoadOp: "__atomic_load_n"
+  of AtomicStoreOp: "__atomic_store_n"
+  of AtomicExchangeOp: "__atomic_exchange_n"
+  of AtomicCompareExchangeOp: "__atomic_compare_exchange_n"
+  of AtomicFetchAddOp: "__atomic_fetch_add"
+  of AtomicFetchSubOp: "__atomic_fetch_sub"
+  of AtomicFetchAndOp: "__atomic_fetch_and"
+  of AtomicFetchOrOp: "__atomic_fetch_or"
+  of AtomicFetchXorOp: "__atomic_fetch_xor"
+  of AtomicAddFetchOp: "__atomic_add_fetch"
+  of AtomicSubFetchOp: "__atomic_sub_fetch"
+  of AtomicTestAndSetOp: "__atomic_test_and_set"
+  of AtomicClearOp: "__atomic_clear"
+  of AtomicThreadFenceOp: "__atomic_thread_fence"
+  of AtomicSignalFenceOp: "__atomic_signal_fence"
+  # Not a `__builtin_*` but a PRELUDE macro, and it has to be: which spelling a
+  # spin hint has is a property of the C compiler's TARGET, and this side does
+  # not know it. `__builtin_ia32_pause` does not exist off x86 and there is no
+  # portable ARM equivalent to name instead, so the choice belongs in the `#if`
+  # the C compiler itself evaluates (`cprelude.NIM_CPU_RELAX`). The call shape is
+  # what matters here, and a function-like macro has exactly the one `genInstr`
+  # emits.
+  of CpuRelaxOp: "NIM_CPU_RELAX"
+  # The size operand is a Leng integer; C converts it to `size_t` implicitly.
+  of MemsetOp: "__builtin_memset"
+  of MemcpyOp: "__builtin_memcpy"
+  of MemcmpOp: "__builtin_memcmp"
+  # gcc/clang expand these inline (`sqrtsd`), with an errno slow path for a
+  # negative operand unless `-fno-math-errno`.
+  of SqrtOp: (if bits == 32: "__builtin_sqrtf" else: "__builtin_sqrt")
+  else: ""
 
 proc isImportC*(m: var MainModule; n: Cursor): bool =
   if n.kind in {Symbol, SymbolDef}:
@@ -51,8 +146,7 @@ proc createIntegralType*(c: var MainModule; name: string): Cursor =
   result = c.builtinTypes.getOrDefault(name, default(Cursor))
   if cursorIsNil(result):
     var buf = parseFromBuffer(name, "<builtin>", 8, c.pool, c.tags)
-    c.mem.add ensureMove(buf)
-    result = cursorAt(c.mem[c.mem.len-1], 0)
+    result = cursorAt(buf, 0)
     c.builtinTypes[name] = result
 
 proc ptrTypeOf(c: var MainModule; elem: Cursor): Cursor =
@@ -60,8 +154,7 @@ proc ptrTypeOf(c: var MainModule; elem: Cursor): Cursor =
   buf.openTag TagId(ord(PtrTagId))
   buf.addSubtree elem
   buf.closeTag()
-  c.mem.add ensureMove(buf)
-  result = cursorAt(c.mem[c.mem.len-1], 0)
+  result = cursorAt(buf, 0)
 
 # ---- field lookup ---------------------------------------------------------
 
@@ -77,6 +170,13 @@ proc typeOfField*(c: var MainModule; n: var Cursor; fld: SymId;
       result = if sel == FieldType: decl.typ else: decl.pragmas
     else:
       result = default(Cursor)
+  elif isUnionBranch(n):
+    # Discriminated-union branch: the fields live in its payload object.
+    result = default(Cursor)
+    let b = takeUnionBranch(n)   # advances `n` past the whole branch
+    if b.body.typeKind == ObjectT:
+      var body = b.body
+      result = typeOfField(c, body, fld, sel)
   else:
     result = default(Cursor)
     let tk = n.typeKind
@@ -99,6 +199,11 @@ proc typeOfField*(c: var MainModule; n: var Cursor; fld: SymId;
           if d != nil and d.pos.stmtKind == TypeS:
             var baseBody = asTypeDecl(d.pos).body
             result = typeOfField(c, baseBody, fld, sel)
+    else:
+      # Unknown node. Every other path advances `n`, and the caller above
+      # loops `while n.hasMore and not done` - so failing to advance here is
+      # an infinite loop, not a missed field. Keep the walk progressing.
+      skip n
 
 proc navigateToObjectBody*(c: var MainModule; n: Cursor): Cursor =
   var counter = 20
@@ -140,17 +245,20 @@ proc getTypeImpl(c: var MainModule; n: Cursor): Cursor =
     result = createIntegralType(c, "(aptr (c +8))")
   of CharLit:
     result = createIntegralType(c, "(c +8)")
-  of ExtendedSuffix, LineInfoLit:
+  of ExtendedSuffix, LineInfoLit, UnknownToken, EofToken, ParLe, ParRi:
     result = createIntegralType(c, "(err)")
   of TagLit:
     case n.exprKind
     of SizeofC, AlignofC, OffsetofC:
       result = createIntegralType(c, "(i +8)")
-    of InfC, NegInfC, NanC:
+    of InfC, NeginfC, NanC:
       result = createIntegralType(c, "(f +64)")
     of TrueC, FalseC, AndC, OrC, NotC, EqC, NeqC, LeC, LtC, ErrvC, OvfC:
       result = createIntegralType(c, "(bool)")
-    of CallC:
+    of CallC, InstrC:
+      # `(instr SYM …)` is typed EXACTLY like `(call SYM …)` — the callee's
+      # signature drives everything. Only the *cost* differs, which is what the
+      # separate tag exists to make visible.
       var procType = navigateToObjectBody(c, getTypeImpl(c, firstChild(n)))
       if procType.typeKind == ProctypeT or procType.symKind == ProcY:
         inc procType
@@ -188,7 +296,7 @@ proc getTypeImpl(c: var MainModule; n: Cursor): Cursor =
         result = firstChild(x)
       else:
         result = createIntegralType(c, "(err)")
-    of AddrC:
+    of AddrC, HaddrC:                       # both are `&lvalue`
       let x = getTypeImpl(c, firstChild(n))
       result = ptrTypeOf(c, x)
     of ConvC, CastC, AconstrC, OconstrC, BaseobjC:
@@ -199,7 +307,14 @@ proc getTypeImpl(c: var MainModule; n: Cursor): Cursor =
     of ParC:
       result = getTypeImpl(c, firstChild(n))
     of NilC:
-      result = createIntegralType(c, "(ptr (void))")
+      # `(nil T)` — the frontend types every `nil` it emits, so use that type.
+      # Only a `nil` some backend pass synthesized is still untyped, and for
+      # those `void*` remains the honest answer.
+      let t = firstChild(n)
+      if t.hasMore:
+        result = t
+      else:
+        result = createIntegralType(c, "(ptr (void))")
     of SufC:
       result = createIntegralType(c, "(err)")
       var a = firstChild(n)

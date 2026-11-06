@@ -66,6 +66,10 @@ type
     JKObject     = (3, "oconstr")
     JKArray      = (4, "aconstr")
     JKKv         = (5, "kv")
+    JKRaw        = (6, "rawnum")
+      ## A `JString` whose body is emitted without quotes. The parser uses it
+      ## for `rawIntegers` / `rawFloats` so the source spelling is preserved
+      ## instead of being converted through `int64`/`float64`.
 
   JsonNodeKind* = enum
     ## High-level value kind, the way `std/json` exposes it. Combines tag-driven
@@ -173,9 +177,26 @@ proc emitErrorKv(p: var JsonParser; t: var JsonTree; mode: LineInfoMode;
   emitError(p, t, mode, file, err)
   t.buf.closeTag()
 
-proc parseValue(p: var JsonParser; t: var JsonTree; mode: LineInfoMode; file: FileId)
+const
+  JsonMaxDepth* = 1000
+    ## Deepest array/object nesting `parseJson` accepts. The parser and every
+    ## tree walker (`$`, `pretty`, `fromJson`, …) recurse once per level, so
+    ## unbounded nesting in untrusted input would overflow the stack. A deeper
+    ## value is replaced by a `(null "nesting too deep")` error placeholder and
+    ## the rest of the input is discarded.
 
-proc parseObject(p: var JsonParser; t: var JsonTree; mode: LineInfoMode; file: FileId) =
+proc parseValue(p: var JsonParser; t: var JsonTree; mode: LineInfoMode; file: FileId;
+                depth: int; rawIntegers, rawFloats: bool)
+
+proc skipRest(p: var JsonParser) =
+  ## After a structural error the parser cannot know where the broken
+  ## container was meant to end, so the rest of the input is dropped. Every
+  ## enclosing level then sees `tkEof` and marks its own truncation: the
+  ## document is cut short *visibly*, never silently.
+  while p.tok != tkEof: discard getTok(p)
+
+proc parseObject(p: var JsonParser; t: var JsonTree; mode: LineInfoMode; file: FileId;
+                 depth: int; rawIntegers, rawFloats: bool) =
   t.buf.openTag JKObject.tagId
   emitInfo(p, t, mode, file)
   discard getTok(p)
@@ -183,6 +204,7 @@ proc parseObject(p: var JsonParser; t: var JsonTree; mode: LineInfoMode; file: F
   while p.tok != tkCurlyRi and p.tok != tkEof:
     if p.tok != tkString:
       emitErrorKv(p, t, mode, file, errStringExpected)   # malformed key
+      skipRest(p)
       truncated = true
       break
     t.buf.openTag JKKv.tagId
@@ -191,7 +213,7 @@ proc parseObject(p: var JsonParser; t: var JsonTree; mode: LineInfoMode; file: F
     discard getTok(p)
     if p.tok == tkColon:
       discard getTok(p)
-      parseValue(p, t, mode, file)
+      parseValue(p, t, mode, file, depth + 1, rawIntegers, rawFloats)
     else:
       emitError(p, t, mode, file, errColonExpected)      # value slot ← error null
     t.buf.closeTag()        # close kv
@@ -202,42 +224,64 @@ proc parseObject(p: var JsonParser; t: var JsonTree; mode: LineInfoMode; file: F
       discard getTok(p)
     elif p.tok == tkEof:
       emitErrorKv(p, t, mode, file, errCurlyRiExpected)  # mark truncation in-tree
+    else:
+      emitErrorKv(p, t, mode, file, errCommaExpected)    # `{"a": 1 "b": 2}`
+      skipRest(p)
   t.buf.closeTag()          # close oconstr
 
-proc parseArray(p: var JsonParser; t: var JsonTree; mode: LineInfoMode; file: FileId) =
+proc parseArray(p: var JsonParser; t: var JsonTree; mode: LineInfoMode; file: FileId;
+                depth: int; rawIntegers, rawFloats: bool) =
   t.buf.openTag JKArray.tagId
   emitInfo(p, t, mode, file)
   discard getTok(p)
   while p.tok != tkBracketRi and p.tok != tkEof:
-    parseValue(p, t, mode, file)
+    parseValue(p, t, mode, file, depth + 1, rawIntegers, rawFloats)
     if p.tok != tkComma: break
     discard getTok(p)
   if p.tok == tkBracketRi:
     discard getTok(p)
   elif p.tok == tkEof:
     emitError(p, t, mode, file, errBracketRiExpected)    # mark truncation in-tree
+  else:
+    emitError(p, t, mode, file, errCommaExpected)        # `[1 2]`
+    skipRest(p)
   t.buf.closeTag()
 
-proc parseValue(p: var JsonParser; t: var JsonTree; mode: LineInfoMode; file: FileId) =
+proc parseValue(p: var JsonParser; t: var JsonTree; mode: LineInfoMode; file: FileId;
+                depth: int; rawIntegers, rawFloats: bool) =
   case p.tok
   of tkString:
     t.buf.addStrLit p.a; emitInfo(p, t, mode, file); discard getTok(p)
   of tkInt:
-    var v: BiggestInt = 0
-    if parseBiggestInt(p.a, v) > 0:
-      t.buf.addIntLit int64(v)
+    if rawIntegers:
+      t.buf.openTag JKRaw.tagId
+      emitInfo(p, t, mode, file)
+      t.buf.addStrLit p.a
+      t.buf.closeTag()
     else:
-      # Integer literal outside the int64 range (e.g. C's UINT64_MAX in header
-      # dumps): the standard JSON fallback is to keep it as a (lossy) float atom
-      # rather than aborting the whole parse.
-      var f: BiggestFloat = 0.0
-      discard parseBiggestFloat(p.a, f)
-      t.buf.addFloatLit float64(f)
-    emitInfo(p, t, mode, file); discard getTok(p)
+      var v: BiggestInt = 0
+      if parseBiggestInt(p.a, v) > 0:
+        t.buf.addIntLit int64(v)
+      else:
+        # Integer literal outside the int64 range (e.g. C's UINT64_MAX in header
+        # dumps): the standard JSON fallback is to keep it as a (lossy) float atom
+        # rather than aborting the whole parse.
+        var f: BiggestFloat = 0.0
+        discard parseBiggestFloat(p.a, f)
+        t.buf.addFloatLit float64(f)
+      emitInfo(p, t, mode, file)
+    discard getTok(p)
   of tkFloat:
-    var v: BiggestFloat = 0.0
-    discard parseBiggestFloat(p.a, v)
-    t.buf.addFloatLit float64(v); emitInfo(p, t, mode, file); discard getTok(p)
+    if rawFloats:
+      t.buf.openTag JKRaw.tagId
+      emitInfo(p, t, mode, file)
+      t.buf.addStrLit p.a
+      t.buf.closeTag()
+    else:
+      var v: BiggestFloat = 0.0
+      discard parseBiggestFloat(p.a, v)
+      t.buf.addFloatLit float64(v); emitInfo(p, t, mode, file)
+    discard getTok(p)
   of tkTrue:
     t.buf.openTag JKTrue.tagId; emitInfo(p, t, mode, file); t.buf.closeTag()
     discard getTok(p)
@@ -247,8 +291,18 @@ proc parseValue(p: var JsonParser; t: var JsonTree; mode: LineInfoMode; file: Fi
   of tkNull:
     t.buf.openTag JKNull.tagId; emitInfo(p, t, mode, file); t.buf.closeTag()
     discard getTok(p)
-  of tkCurlyLe:   parseObject(p, t, mode, file)
-  of tkBracketLe: parseArray(p, t, mode, file)
+  of tkCurlyLe, tkBracketLe:
+    if depth >= JsonMaxDepth:
+      # Too deep: mark the slot and drop the rest of the input, so neither
+      # this parser nor any later tree walk recurses past the limit. Every
+      # enclosing level then sees `tkEof` and closes with its own
+      # truncation marker.
+      emitError(p, t, mode, file, errNestingTooDeep)
+      skipRest(p)
+    elif p.tok == tkCurlyLe:
+      parseObject(p, t, mode, file, depth, rawIntegers, rawFloats)
+    else:
+      parseArray(p, t, mode, file, depth, rawIntegers, rawFloats)
   else:
     # no value here — emit a (null "expr expected") placeholder and advance so
     # the caller's loop makes progress instead of spinning on the bad token.
@@ -256,7 +310,7 @@ proc parseValue(p: var JsonParser; t: var JsonTree; mode: LineInfoMode; file: Fi
     discard getTok(p)
 
 proc parseInto(stream: Stream; filename: string; lineInfo: LineInfoMode;
-               t: var JsonTree) =
+               t: var JsonTree; rawIntegers, rawFloats: bool) =
   ## Shared worker: drive the event parser into the already-created `t`. Kept
   ## separate so each public overload builds its own `result` in place — `JsonTree`
   ## is move-only, so returning one overload's value from another would need a
@@ -267,32 +321,41 @@ proc parseInto(stream: Stream; filename: string; lineInfo: LineInfoMode;
   if lineInfo != DiscardLineInfo:
     file = t.buf.pool.filenames.getOrIncl(filename)
   discard getTok(p)
-  parseValue(p, t, lineInfo, file)
-  eat(p, tkEof)
+  parseValue(p, t, lineInfo, file, 0, rawIntegers, rawFloats)
+  if p.tok != tkEof:
+    # Trailing input after the document (`[1] [2]`, `{} x`): recorded as a
+    # second top-level error node, which `errorMsg(tree)` looks at but `root`
+    # never reaches.
+    emitError(p, t, lineInfo, file, errEofExpected)
   close(p)
 
 proc parseJson*(stream: Stream; filename = "";
-                lineInfo = DiscardLineInfo; sharedPool: Pool = nil): JsonTree =
+                lineInfo = DiscardLineInfo; sharedPool: Pool = nil;
+                rawIntegers = false; rawFloats = false): JsonTree =
   ## Parse a full document off `stream` into an in-memory `JsonTree`. Under
   ## `KeepLineInfo` / `KeepColumnInfo` every node records its source position
   ## (the filename interned in the tree's `pool`, deduped if `sharedPool` is
   ## passed) — the same cheap mechanism NIF trees use, which `std/json` cannot
-  ## offer.
+  ## offer. `rawIntegers` / `rawFloats` keep the source spelling as raw-number
+  ## nodes instead of converting them.
   result = createJsonTree(sharedPool)
-  parseInto(stream, filename, lineInfo, result)
+  parseInto(stream, filename, lineInfo, result, rawIntegers, rawFloats)
 
 proc parseJson*(buffer: string; filename = "input";
-                lineInfo = DiscardLineInfo; sharedPool: Pool = nil): JsonTree =
+                lineInfo = DiscardLineInfo; sharedPool: Pool = nil;
+                rawIntegers = false; rawFloats = false): JsonTree =
   result = createJsonTree(sharedPool)
-  parseInto(newStringStream(buffer), filename, lineInfo, result)
+  parseInto(newStringStream(buffer), filename, lineInfo, result,
+            rawIntegers, rawFloats)
 
 proc parseFile*(filename: string;
-                lineInfo = DiscardLineInfo; sharedPool: Pool = nil): JsonTree =
+                lineInfo = DiscardLineInfo; sharedPool: Pool = nil;
+                rawIntegers = false; rawFloats = false): JsonTree =
   var fs = newFileStream(filename, fmRead)
   if fs == nil:
     quit "json.parseFile: cannot read " & filename
   result = createJsonTree(sharedPool)
-  parseInto(fs, filename, lineInfo, result)
+  parseInto(fs, filename, lineInfo, result, rawIntegers, rawFloats)
 
 # ── Node accessors (forward to the wrapped Cursor) ───────────────────────────
 # These let the rest of the module treat a `JsonNode` exactly the way the old
@@ -319,6 +382,13 @@ template into(n: var JsonNode; body: untyped)   = into(n.c, body)
 
 proc root*(t: var JsonTree): JsonNode {.inline.} = JsonNode(c: t.buf.beginRead())
 
+proc isRawNumber(n: JsonNode): bool =
+  rawKind(n) == TagLit and jsonKind(n.cursorTagId) == JKRaw
+
+proc rawNumberStr(n: JsonNode): string =
+  let body = sub(n.c)
+  result = strVal(body)
+
 proc kind*(n: JsonNode): JsonNodeKind =
   ## Effective high-level kind of the node. Coexists with `nifcore.kind(Cursor)`
   ## as a plain overload because `n` is a `JsonNode`, not a `Cursor`.
@@ -333,6 +403,7 @@ proc kind*(n: JsonNode): JsonNodeKind =
     of JKObject:         JObject
     of JKArray:          JArray
     of JKKv:             JNull   # kv shouldn't appear where a value is expected
+    of JKRaw:            JString  # raw number is string-shaped for readers
   else: JNull
 
 proc info*(n: JsonNode): NifLineInfo {.inline.} =
@@ -345,7 +416,9 @@ proc fileName*(n: JsonNode): string {.inline.} =
   lineInfoFile(n.c)
 
 proc getStr*(n: JsonNode; default = ""): string =
-  if rawKind(n) == StrLit: strVal(n) else: default
+  if rawKind(n) == StrLit: strVal(n)
+  elif isRawNumber(n): rawNumberStr(n)
+  else: default
 
 proc getInt*(n: JsonNode; default: int64 = 0): int64 =
   if rawKind(n) == IntLit: intVal(n) else: default
@@ -417,8 +490,13 @@ proc errorMsg*(t: var JsonTree): string =
   ## The first error message embedded anywhere in the document (depth-first), or
   ## `""` if it parsed cleanly. Ignore it and malformed nodes simply read as
   ## `null`; consult it for the diagnostic and source position of the first
-  ## failure.
-  firstErrorMsg(t.root)
+  ## failure. Trailing input after the document is reported here as well.
+  result = ""
+  var c = t.root
+  while c.hasMore:
+    result = firstErrorMsg(c)
+    if result.len > 0: return
+    c.skip
 
 proc hasError*(t: var JsonTree): bool {.inline.} =
   ## True when the document contains any parse error (see `errorMsg`).
@@ -462,18 +540,23 @@ iterator pairs*(n: JsonNode): (string, JsonNode) =
           yield (key, c2)
           c2.skip
 
-proc `{}`*(t: var JsonTree; key: string): JsonNode =
-  ## Object member lookup. Returns a nil-ish node when the root is not an
-  ## object or the key is absent (`kind` of it is `JNull`).
+proc nullNode(): JsonNode =
+  ## A standalone `(null)`. The node's cursor keeps its one-token buffer alive,
+  ## so it is as safe to read, skip and print as any node of a parsed tree.
+  var t = createJsonTree()
+  t.buf.openTag JKNull.tagId
+  t.buf.closeTag()
   result = t.root
-  if kind(result) != JObject:
-    return
+
+proc `{}`*(t: var JsonTree; key: string): JsonNode =
+  ## Object member lookup. Returns a `JNull` node when the root is not an
+  ## object or the key is absent.
   var c = t.root
-  for k, v in pairs(c):
-    if k == key:
-      result = v
-      return
-  result = JsonNode()
+  if kind(c) == JObject:
+    for k, v in pairs(c):
+      if k == key:
+        return v
+  result = nullNode()
 
 # ── Pretty-print ─────────────────────────────────────────────────────────────
 
@@ -498,7 +581,12 @@ proc emitUgly(c: var JsonNode; r: var string) =
   of JInt:   r.add $getInt(c);   c.inc
   of JFloat: r.add $getFloat(c); c.inc
   of JString:
-    emitEscaped(getStr(c), r); c.inc
+    if isRawNumber(c):
+      r.add rawNumberStr(c)
+      c.skip
+    else:
+      emitEscaped(getStr(c), r)
+      c.inc
   of JArray:
     r.add '['
     var first = true

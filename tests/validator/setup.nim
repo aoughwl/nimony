@@ -1,9 +1,11 @@
-## Custom runner for the validator: build `validator`, then run it over the
-## compiler pass sources (grammar/obligation checks) and the deliberately
-## broken `tests/check_tags` fixtures. A directory with just this file — the
-## suite validates `src/…`, not a folder of inputs.
+## Custom runner for the validator: build it and nimony, then run it over the
+## compiler pass sources (which must come back clean) and over the
+## deliberately broken `tests/validator_sem` fixtures (which must come back
+## with exactly the diagnostics they name). A directory with just this file:
+## the suite validates `src/…` and a sibling fixture folder, not a folder of
+## inputs of its own.
 import std / [os, strutils]
-import "../../src/hastur"
+import "../../src/hastur/kit"
 
 proc arg(name: string): string =
   let prefix = "--" & name & ":"
@@ -11,8 +13,16 @@ proc arg(name: string): string =
     if p.startsWith(prefix): return p[prefix.len .. ^1]
   result = ""
 
+let overwrite = "--overwrite" in commandLineParams()
+
 if arg("bindir").len > 0: toolchainDir = arg("bindir")
 if arg("cachedir").len > 0: nimcacheDir = arg("cachedir")
 
-buildValidator()
-validatorTests()
+# The validator reads what sem produced, so the suite builds nimony too and
+# semchecks its inputs itself -- unless the tree walk says the toolchain is
+# current (`--no-build`): it runs this suite next to tests that are using
+# `bin/nimony`, and relinking it under them fails on Windows.
+if "--no-build" notin commandLineParams():
+  buildValidator()
+  buildNimony()
+validatorTests(overwrite)

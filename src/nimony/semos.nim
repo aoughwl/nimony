@@ -6,14 +6,21 @@
 
 ## Path handling and `exec` like features as `sem.nim` needs it.
 
-from std / strutils import multiReplace, split, strip, startsWith
-import std / [tables, sets, os, envvars, syncio, formatfloat, assertions, dirs, paths]
-from std / osproc import execCmdEx
+from std / strutils import multiReplace, startsWith, split
+from std / algorithm import sort
+import std / [tables, sets, os, envvars, syncio, formatfloat, assertions, dirs, paths, times]
+from std / osproc import execCmdEx, startProcess, waitForExit, close,
+  poParentStreams
 
 include ".." / lib / nifprelude
 include ".." / lib / compat2
-import ".." / lib / [nifchecksums, nifindexes, tooldirs, argsfinder, symparser]
+import ".." / lib / [nifchecksums, nifindexes, tooldirs, argsfinder, symparser, vfs]
 import ".." / lib / nifreader as rd
+from ".." / lib / nifcoreparse import parse
+# qualified-only: the private-pool plugin-input copy must not fight the
+# global-pool overloads nifprelude puts in scope
+from ".." / lib / nifcore import nil
+from ".." / lib / bif import storeToString, isBifFile, UnusedNameTag, DependencyTag
 
 import nimony_model, symtabs, builtintypes, decls, asthelpers,
   programs, sigmatch, magics, reporters, nifconfig,
@@ -26,12 +33,27 @@ proc nimonyDir(): string =
   ## matched so the boot bootstrap can stage toolchains under sibling
   ## directories like `bin0`, `bin1`, `bin2` and still find `lib/` next to
   ## them.
-  let appDir = getAppDir()
+  var appDir = getAppDir()
+  # `getAppDir` follows the executable on Linux and is absolute there, but it
+  # can stay relative on macOS and Windows. Normalize it before comparing
+  # directories: `resolvedImports` compares absolute import paths against
+  # `pluginLibDir`, and a relative plugin dir makes the plugin API look like a
+  # regular program import.
+  if not appDir.isAbsolute:
+    try:
+      appDir = normalizedPath(os.getCurrentDir() / appDir)
+    except:
+      discard
+  appDir = normalizedPath(appDir)
   let (head, tail) = splitPath(appDir)
   if tail.startsWith("bin"):
     result = head
   else:
     result = appDir
+
+proc pluginLibDir(): string =
+  ## Where the plugin API (`plugins.nim`) lives.
+  nimonyDir() / "src" / "nimony" / "lib"
 
 proc stdlibDir*(): string =
   result = nimonyDir() / "lib"
@@ -99,6 +121,43 @@ proc joinPath*(head, tail: string): string = head / tail
 proc exec*(cmd: string) =
   if execShellCmd(cmd) != 0: quit("FAILURE: " & cmd)
 
+proc shellArgs*(args: string): string =
+  ## `args` -- a forwarded `commandLineArgs` string: raw, space separated
+  ## options -- as shell words, each one quoted. The values are the user's
+  ## (`-d:name=value`) and must reach the sub-compile verbatim, not be
+  ## interpreted by the shell a second time. Split exactly like
+  ## `deps.emitFrontendArgs` splits them for the `.build.nif`.
+  result = ""
+  for arg in args.split(' '):
+    if arg.len > 0:
+      result.add ' '
+      result.add quoteShell(arg)
+
+proc renderCmd*(exe: string; args: openArray[string]): string =
+  ## Diagnostics, and the command lines `deps.preNifle` hands to `execProcesses`.
+  ## `execArgs` never hands this string to a shell.
+  result = quoteShell(exe)
+  for i in 0 ..< args.len:
+    result.add ' '
+    result.add quoteShell(args[i])
+
+proc execArgs*(exe: string; args: openArray[string]) =
+  ## `exec` without a shell in between: `execShellCmd` runs the command
+  ## through `cmd.exe /c` on Windows (`/bin/sh -c` elsewhere), an extra
+  ## process per call that buys nothing here — no redirection, no globbing,
+  ## and the quoting it forces on the caller is a bug surface of its own.
+  ## Arguments travel as an argv array, so callers pass them RAW: no
+  ## `quoteShell`, the spawner does its own quoting.
+  var code = -1
+  try:
+    let p = startProcess(exe, args = args, options = {poParentStreams})
+    code = waitForExit(p)
+    close p
+  except:
+    code = -1
+  if code != 0:
+    quit("FAILURE: " & renderCmd(exe, args))
+
 proc nimexec(cmd: string) =
   let t = findExe("nim")
   if t.len == 0:
@@ -163,50 +222,54 @@ proc resolveFile*(paths: openArray[string]; origin: string; toResolve: string): 
         inc j
       if os.fileExists(aowlResult): result = aowlResult
 
+proc resolveImport*(paths: openArray[string]; origin: string; toResolve: string): string =
+  ## `resolveFile` for an imported module: `std/x` falls back to `x`.
+  result = resolveFile(paths, origin, toResolve)
+  if not os.fileExists(result) and toResolve.startsWith("std/"):
+    result = resolveFile(paths, origin, toResolve.substr(4))
+
 type
   ImportedFilename* = object
     path*: string ## stringified path from AST that has to be resolved
     name*: string ## extracted module name to define a sym for in `import`
     plugin*: string ## plugin name if any (usually empty)
     isSystem*: bool
+    isCyclic*: bool ## `import m {.cyclic.}`
 
 proc moduleNameFromPath*(path: string): string =
   result = splitFile(path).name
 
 proc filenameVal*(n: var Cursor; res: var seq[ImportedFilename]; hasError: var bool; allowAs: bool) =
   case n.kind
-  of StringLit:
-    let s = pool.strings[n.litId]
+  of StrLit:
+    let s = pool.strings[n.strId]
     # string literal could contain a path or .nim extension:
     let name = moduleNameFromPath(s)
     res.add ImportedFilename(path: s, name: name)
     inc n
   of Ident:
-    let s = pool.strings[n.litId]
+    let s = pool.strings[n.strId]
     res.add ImportedFilename(path: s, name: s)
     inc n
   of Symbol:
-    var s = pool.syms[n.symId]
-    extractBasename s
+    var s = pool.symBasename(n.symId)
     res.add ImportedFilename(path: s, name: s)
     inc n
-  of ParLe:
+  of TagLit:
     case exprKind(n)
     of OchoiceX, CchoiceX:
-      inc n
-      if n.kind == ParRi:
-        hasError = true
-      else:
-        filenameVal(n, res, hasError, allowAs)
-      while n.hasMore: skip n
-      consumeParRi n
+      n.peekInto:
+        if not n.hasMore:
+          hasError = true
+        else:
+          filenameVal(n, res, hasError, allowAs)
     of QuotedX:
       let s = pool.strings[takeUnquoted(n)]
       res.add ImportedFilename(path: s, name: s)
     of CallX, InfixX:
       var x = n
       skip n # ensure we skipped it completely
-      inc x
+      x = sub(x)
       let opId = takeIdent(x)
       if opId == StrId(0):
         hasError = true
@@ -216,12 +279,12 @@ proc filenameVal*(n: var Cursor; res: var seq[ImportedFilename]; hasError: var b
         if not allowAs:
           hasError = true
           return
-        if x.kind == ParRi:
+        if not x.hasMore:
           hasError = true
           return
         var rhs = x
         skip rhs # skip lhs
-        if rhs.kind == ParRi:
+        if not rhs.hasMore:
           hasError = true
           return
         let aliasId = takeIdent(rhs)
@@ -248,7 +311,7 @@ proc filenameVal*(n: var Cursor; res: var seq[ImportedFilename]; hasError: var b
     of PrefixX:
       var x = n
       skip n # ensure we skipped it completely
-      inc x
+      x = sub(x)
       let opId = takeIdent(x)
       if opId == StrId(0):
         hasError = true
@@ -276,37 +339,70 @@ proc filenameVal*(n: var Cursor; res: var seq[ImportedFilename]; hasError: var b
           while n.hasMore:
             filenameVal(n, res, hasError, allowAs)
     of PragmaxX:
-      let orig = n
-      inc n
+      # `import (m) {.plugin: "…".}`. Dependency scanning runs before sem, so
+      # the pragma is still the parser's `(pragmas (kv plugin "…"))` -- with
+      # `plugin` an Ident -- and not the resolved `(plugin …)` that
+      # `templates.nim` reads off a semchecked routine.
+      #
+      # Every level is entered with `into` and drained before it is left. The
+      # hand-written descent this replaces walked in with bare `inc`s and then
+      # stepped over the `kv`'s close, which under nifcore is not a token:
+      # the scope simply ends, `hasMore` is `rem > 0`, and `inc` asserts
+      # `rem != 0`. So `if not n.hasMore: inc n` -- a classic `skipParRi` --
+      # crashed the compiler on every well-formed import plugin (#2408).
       let start = res.len
-      if n.kind == ParRi:
-        hasError = true
-      else:
-        filenameVal(n, res, hasError, allowAs)
-        var success = false
-        if n.substructureKind == PragmasU:
-          inc n
-          if n.substructureKind == KvU:
-            inc n
-            if n.kind == Ident and pool.strings[n.litId] == "plugin":
-              inc n
-              if n.kind == StringLit:
-                for i in start ..< res.len:
-                  res[i].plugin = pool.strings[n.litId]
-                  success = true
-                inc n
-                if n.kind == ParRi: inc n
-                else: hasError = true
-        if not success:
-          n = orig
-          skip n
+      var success = false
+      n.into:                                  # (pragmax …)
+        if not n.hasMore:
           hasError = true
+        else:
+          filenameVal(n, res, hasError, allowAs)
+          if n.substructureKind == PragmasU:
+            n.into:                            # (pragmas …)
+              if n.substructureKind == KvU:
+                n.into:                        # (kv plugin "…")
+                  if n.isIdent and pool.strings[n.strId] == "plugin":
+                    inc n
+                    if n.isStringLit:
+                      for i in start ..< res.len:
+                        res[i].plugin = pool.strings[n.strId]
+                        success = true
+                      skip n, SkipValue        # the plugin path
+                      if n.hasMore: hasError = true
+                  while n.hasMore: skip n
+              while n.hasMore: skip n
+          while n.hasMore: skip n
+      if not success:
+        hasError = true
     else:
       hasError = true
       skip n
   else:
     hasError = true
     skip n
+
+proc isCyclicImport*(n: Cursor): bool =
+  ## `m {.cyclic.}` in an import list.
+  result = false
+  if n.isTagLit and n.exprKind == PragmaxX:
+    var y = n
+    inc y
+    skip y # the filename
+    if y.substructureKind == PragmasU:
+      inc y
+      result = y.isIdent and pool.strings[y.strId] == "cyclic"
+
+proc importedFilename*(n: var Cursor; res: var seq[ImportedFilename]; hasError: var bool) =
+  ## One entry of an `import` list: `m`, `m as x`, `m {.plugin: "p".}` or
+  ## `m {.cyclic.}`.
+  if isCyclicImport(n):
+    let start = res.len
+    n.into PragmaxX:
+      filenameVal(n, res, hasError, allowAs = false)
+      while n.hasMore: skip n # (pragmas cyclic)
+    for i in start ..< res.len: res[i].isCyclic = true
+  else:
+    filenameVal(n, res, hasError, allowAs = true)
 
 proc replaceSubs*(fmt, currentFile: string; config: NifConfig): string =
   # Unpack Current File to Absolute
@@ -324,86 +420,291 @@ proc replaceSubs*(fmt, currentFile: string; config: NifConfig): string =
     ("${nifcache}", nifcache)])
   result = path.normalizedPath()
 
+proc globMatch(pat, s: string; pi = 0; si = 0): bool =
+  ## `*` matches any run of characters, `?` exactly one.
+  var pi = pi
+  var si = si
+  while pi < pat.len:
+    case pat[pi]
+    of '*':
+      for k in si .. s.len:
+        if globMatch(pat, s, pi+1, k): return true
+      return false
+    of '?':
+      if si >= s.len: return false
+    else:
+      if si >= s.len or s[si] != pat[pi]: return false
+    inc pi
+    inc si
+  result = si == s.len
+
+proc globFiles*(pattern: string): seq[string] =
+  ## The files matching `pattern`, sorted. Like Nim's `walkFiles` as the
+  ## `.compile` tuple form uses it, except that only the file name component may
+  ## contain wildcards (the caller checks that).
+  result = @[]
+  let (dir, name) = splitPath(pattern)
+  try:
+    for it in walkDir(path(dir), relative = true):
+      if it.kind in {pcFile, pcLinkToFile} and globMatch(name, $it.path):
+        result.add dir / $it.path
+  except:
+    discard "an unreadable directory matches nothing"
+  sort result
+
 # ------------------ include/import handling ------------------------
 
-proc parseFile*(nimFile: string; paths: openArray[string], nifcachePath: string): TokenBuf =
-  let nifler = findTool("nifler")
+proc lastModTimeOrStale(path: string): int64 =
+  ## `getLastModificationTime` raises on transient I/O errors. The result is
+  ## only used for staleness comparisons, so any failure must fall through to
+  ## "regenerate": -1 makes that automatic, since `-1 > anything` is false.
+  ## Mirrors `deps.getLastModTime`.
+  try:
+    when defined(nimony):
+      result = getLastModificationTime(path)
+    else:
+      result = times.toUnix(getLastModificationTime(path))
+  except:
+    result = -1'i64
+
+proc ensureParsed(nimFile: string; paths: openArray[string], nifcachePath: string): string =
+  ## Runs nifler on `nimFile` unless its `.p.nif` (the result) and
+  ## `.p.deps.nif` are fresh.
+  let nifler = parserTool()
   let name = moduleSuffix(nimFile, paths)
   let src = nifcachePath / name & ".p.nif"
-  exec quoteShell(nifler) & " --portablePaths --deps parse " & quoteShell(nimFile) & " " &
-    quoteShell(src)
+  let depsFile = nifcachePath / name & ".p.deps.nif"
+  # `include`d files are part of the dependency graph, so the driver's own
+  # dep scan (`deps.execNifler`) has already parsed this file into the very
+  # same `.p.nif` — with the identical command line — before it ever spawned
+  # us. Re-running nifler would rewrite a byte-identical artifact: on
+  # `nimony n bug.nim` that was 21 of 47 nifler processes, one per module
+  # `system.nim` includes, and at ~2.7ms per spawn it is nearly all process
+  # overhead. Reuse the artifact under the same freshness rule `execNifler`
+  # uses, so the two agree on when a re-parse is actually needed.
+  let srcTime = lastModTimeOrStale(nimFile)
+  if fileExists(src) and fileExists(nimFile) and lastModTimeOrStale(src) > srcTime and
+      fileExists(depsFile) and lastModTimeOrStale(depsFile) > srcTime:
+    discard "already parsed by the dep scan"
+  else:
+    execArgs nifler, ["--portablePaths", "--deps", "parse", nimFile, src]
+  result = src
 
-  var stream = nifstreams.open(src)
-  try:
-    discard processDirectives(stream.r)
-    result = fromStream(stream)
-  finally:
-    nifstreams.close(stream)
+proc loadDepsFile*(depsFile: string): TokenBuf =
+  var r = rd.open(depsFile)
+  result = createTokenBuf()
+  parse(r, result)
+  rd.close(r)
 
-proc getFile*(info: PackedLineInfo): string =
-  let fid = unpack(pool.man, info).file
+proc parseFile*(nimFile: string; paths: openArray[string], nifcachePath: string): TokenBuf =
+  var r = rd.open(ensureParsed(nimFile, paths, nifcachePath))
+  result = createTokenBuf()
+  parse(r, result, denseLineInfo = true)
+  rd.close(r)
+
+proc resolvedImports(nimFile: string; paths: openArray[string]; nifcachePath: string;
+                     allResolve: var bool): seq[string] =
+  ## The modules `nimFile` imports plainly (no `{.plugin.}`, no `{.cyclic.}`),
+  ## read off its nifler deps file like `deps.processImport` does. `when`
+  ## conditions are not evaluated. `allResolve` tells whether every import
+  ## resolves on `paths` to a module outside of the plugin API (`src/nimony/lib`).
+  result = @[]
+  allResolve = true
+  var buf = loadDepsFile(ensureParsed(nimFile, paths, nifcachePath).changeFileExt(".deps.nif"))
+  var files: seq[ImportedFilename] = @[]
+  var n = beginRead(buf)
+  n.into:  # (stmts …)
+    while n.hasMore:
+      let kind = n.stmtKind
+      if kind in {ImportS, FromimportS, ImportexceptS}:
+        var x = n
+        x.into:
+          if x.stmtKind == WhenS: skip x, SkipCond
+          while x.hasMore:
+            var entry: seq[ImportedFilename] = @[]
+            var hasError = false
+            importedFilename(x, entry, hasError)
+            if not hasError:
+              for f in entry:
+                if not f.isCyclic and f.plugin.len == 0: files.add f
+            if kind != ImportS:
+              while x.hasMore: skip x # the imported/excluded names
+      skip n
+  let pluginDir = normalizedPath(pluginLibDir())
+  for f in files:
+    let path = toAbsolutePath(resolveImport(paths, nimFile, f.path))
+    if fileExists(path) and cmpPaths(path.parentDir, pluginDir) != 0:
+      result.add path
+    else:
+      allResolve = false
+
+proc pluginProgramImports*(plugin: string; paths: openArray[string];
+                           nifcachePath: string): seq[string] =
+  ## The modules the plugin source `plugin` imports that join the program of
+  ## the plugin's user, like a Nim macro module's imports: the plugin's
+  ## `bindSym`s refer to their symbols (#2639). Left out are imports that do
+  ## not resolve on the program's search path (`plugins`) and plugin code: a
+  ## module with such an import.
+  result = @[]
+  var allResolve = true
+  for path in resolvedImports(plugin, paths, nifcachePath, allResolve):
+    discard resolvedImports(path, paths, nifcachePath, allResolve)
+    if allResolve: result.add path
+proc getFile*(info: NifLineInfo): string =
+  let fid = info.file
   if fid.isValid:
-    result = pool.files[fid]
+    result = realFile(pool.filenames[fid])
   else:
     result = ""
 
 proc selfExec*(c: var SemContext; file: string; moreArgs: string) =
   let nimonyExe = findDriver()
-  exec quoteShell(nimonyExe) & c.commandLineArgs & moreArgs & " --ischild m " & quoteShell(file)
+  exec quoteShell(nimonyExe) & shellArgs(c.commandLineArgs) & moreArgs & " --ischild m " & quoteShell(file)
   #exec os.getAppFilename() & c.commandLineArgs & moreArgs & " --ischild m " & quoteShell(file)
 
 # ------------------ plugin handling --------------------------
 
-proc runValidatorOnPlugin(c: var SemContext; nf: string) =
-  ## Run the plugin validator on `nf` before compiling it. Skipped when
-  ## --novalidate was passed or when the validator binary is not available
-  ## (a fresh clone before `hastur build validator` has run).
-  if c.g.config.noValidate: return
-  let v = findTool("validator")
-  if not os.fileExists(v):
-    echo "warning: validator binary not found at ", v,
-         "; skipping plugin validation (build it with `hastur build validator` ",
-         "or pass --novalidate to silence this)"
-    return
-  exec quoteShell(v) & " " & quoteShell(nf)
-
-proc compilePlugin(c: var SemContext; info: PackedLineInfo; nf, exefile: string) =
-  ## Build a plugin's `.nim` source as an executable. Plugins import
-  ## `lib/plugins.nim` and are compiled by Nimony itself.
-  runValidatorOnPlugin(c, nf)
-  let pluginDir = nimonyDir() / "src/nimony/lib"
-  let pluginCache = exefile & "_d"
+proc makePluginCache(dir: string) =
   try:
     when defined(nimony):
-      createDir(path(pluginCache))
+      createDir(path(dir))
     else:
-      createDir(Path(pluginCache))
+      createDir(Path(dir))
   except:
-    quit "FAILURE: cannot create directory " & pluginCache
-  # `--nimcache:<pluginCache>` keeps the sub-compile's intermediate NIF
-  # artefacts in a per-plugin scratch dir so parallel test workers don't
-  # fight over `nimcache/` entries.
+    quit "FAILURE: cannot create directory " & dir
+
+proc pluginCompileCmd(config: NifConfig; cacheDir: string): string =
+  ## The invocation a plugin sub-compile shares with the sem-only run the
+  ## validator needs: the cache, the search paths and the stdlib-configuration
+  ## opt-outs. The caller appends the command and the file.
+  #
+  # `--nimcache:<cacheDir>` keeps the sub-compile's intermediate NIF artefacts
+  # in a per-plugin scratch dir so parallel test workers don't fight over
+  # `nimcache/` entries.
   #
   # Forward outer user search paths so plugin self-compilation computes the
   # same module identities for user modules. Internal Nimony library paths are
   # supplied below and deliberately not forwarded from the caller's path file.
   # Do not forward the raw command line: it can contain `--base`, which would
   # make plugin child compiles read caller-local nimony.paths files.
+  #
+  # `-d:nimonyPlugin` marks the sub-compile as the build OF a plugin. The
+  # dependency scanner then schedules no plugin builds of its own: a plugin is
+  # a leaf of the build graph. Without this, a plugin whose source imports the
+  # module declaring it (`lib/std/deps/smartcli.nim` imports `std/smartcli`)
+  # would need itself built first, and the nested builds never bottom out.
   let nimonyExe = findDriver()
+  let pluginDir = pluginLibDir()
   let srcLibPath = nimonyDir() / "src" / "lib"
-  var cmd = quoteShell(nimonyExe) &
-    " --nimcache:" & quoteShell(pluginCache) &
+  result = quoteShell(nimonyExe) &
+    " --nimcache:" & quoteShell(cacheDir) &
+    " -d:nimonyPlugin" &
     " --path:" & quoteShell(srcLibPath) &
     " --path:" & quoteShell(pluginDir)
-  for path in c.g.config.paths:
+  for path in config.paths:
     if path != stdlibDir() and path != pluginDir and path != srcLibPath:
-      cmd.add " --path:"
-      cmd.add quoteShell(path)
+      result.add " --path:"
+      result.add quoteShell(path)
+  # Forward the stdlib-configuration opt-outs so the plugin is built against
+  # the same stdlib variant as the module that uses it (nim-lang/nimony#2155's
+  # follow-up: `-d:useLibc` did not reach plugins). An explicit allow-list, not
+  # raw command-line forwarding, for the same reason `--base` is not forwarded
+  # above. The derived defines (`nimNativeAlloc`/`nimNativeIo`) are NOT
+  # forwarded: the child re-derives them from these opt-outs.
+  for d in ["useLibc", "useLibcIo", "useMimalloc"]:
+    if config.isDefined(d):
+      result.add " -d:"
+      result.add d
+  # A job cap chosen for a small machine must hold inside the sub-compile too.
+  if config.parallelBuild > 0:
+    result.add " --parallelBuild:"
+    result.add $config.parallelBuild
+
+proc runValidatorOnPlugin(config: NifConfig; nf, checkCache: string) =
+  ## Run the plugin validator on `nf` before compiling it. Skipped when
+  ## --novalidate was passed or when the validator binary is not available
+  ## (a fresh clone before `hastur build validator` has run).
+  ##
+  ## The validator reads the *semchecked* module, so the plugin is first
+  ## semchecked into a scratch cache of its own -- `check`, so the sub-compile
+  ## stops after sem and never reaches code generation.
+  ##
+  ## A failing sem run is not reported here. It means the plugin does not
+  ## compile, and the build that follows says so with the real diagnostics.
+  if config.noValidate: return
+  let v = findTool("validator")
+  if not os.fileExists(v):
+    echo "warning: validator binary not found at ", v,
+         "; skipping plugin validation (build it with `hastur build validator` ",
+         "or pass --novalidate to silence this)"
+    return
+  makePluginCache checkCache
+  let checkCmd = pluginCompileCmd(config, checkCache) & " check " & quoteShell(nf)
+  # Captured, not inherited: on failure the build below reports the same
+  # diagnostics, and printing them twice would only obscure them.
+  var checkCode = 0
+  try:
+    # Positional, not `.exitCode`: nimony's own `execCmdEx` returns an unnamed
+    # tuple, and this module is compiled by nimony when it compiles itself.
+    checkCode = int(execCmdEx(checkCmd)[1])
+  except:
+    checkCode = -1
+  if checkCode != 0: return
+  exec quoteShell(v) & " --nimcache:" & quoteShell(checkCache) & " " & quoteShell(nf)
+
+proc pluginDepFile*(exefile: string): string =
+  ## The source files the last build of the plugin `exefile` read: inputs of
+  ## the next build's `pluginbuild` node (#2785), the depfile pattern.
+  exefile & ".deps.nif"
+
+proc buildPluginInto(config: NifConfig; nf, exefile, scratch: string; depFile = "") =
+  ## Build a plugin's `.nim` source `nf` as the executable `exefile`. Plugins
+  ## import `lib/plugins.nim` and are compiled by Nimony itself. The
+  ## sub-compiles work in `<scratch>_d` (the build) and `<scratch>_v` (the
+  ## validator's sem-only run); the caller owns these directories. A non-empty
+  ## `depFile` receives the plugin's source files (`--depfile`).
+  ##
+  ## The link target is a temporary sibling, never `exefile` itself, and it is
+  ## moved into place as one operation once it is complete. Nothing ever opens
+  ## the live path for writing: a process executing the old plugin keeps its
+  ## inode, and one starting afterwards sees a complete file.
+  runValidatorOnPlugin(config, nf, scratch & "_v")
+  let cacheDir = scratch & "_d"
+  makePluginCache cacheDir
+  let staging = atomicTempPath(exefile)
+  var cmd = pluginCompileCmd(config, cacheDir)
+  if depFile.len > 0:
+    cmd.add " --depfile:"
+    cmd.add quoteShell(depFile)
   cmd.add " -o:"
-  cmd.add quoteShell(exefile)
+  cmd.add quoteShell(staging)
   cmd.add " c "
   cmd.add quoteShell(nf)
   exec cmd
+  if not vfsMoveInto(staging, exefile):
+    vfsRemove staging   # no `.tmp.NNN` litter
+    quit "FAILURE: cannot install plugin executable " & exefile
+
+proc buildPlugin*(config: NifConfig; nf, exefile: string) =
+  ## `nimsem plugin <nf> <exefile>`: the build-graph way to get a plugin.
+  ## The dependency scanner lists every `{.plugin.}` a module declares, so
+  ## nifmake builds the executable once, as a node of its own, before any of
+  ## the nimsem runs that may execute it. Being the only builder by
+  ## construction, this path may keep incremental caches next to the exe.
+  buildPluginInto(config, nf, exefile, exefile, pluginDepFile(exefile))
+
+proc ensurePlugin(config: NifConfig; nf, exefile: string) =
+  ## The lazy fallback for a plugin the build graph did not provide: a
+  ## `{.plugin.}` pragma nifler could not see, or a hand-driven `nimsem m`.
+  ## Several nimsem processes may get here for the same plugin at once, so it
+  ## shares nothing that could be corrupted: the sub-compiles run in throwaway
+  ## per-process caches, and the executable is installed atomically. The
+  ## worst case of a collision is a redundant compile.
+  if not needsRecompile(nf, exefile): return
+  let scratch = atomicTempPath(exefile)
+  buildPluginInto(config, nf, exefile, scratch)
+  vfsRemoveTree scratch & "_d"
+  vfsRemoveTree scratch & "_v"
 
 proc writeFileIfChanged(file, content: string) {.canRaise.} =
   if os.fileExists(file) and readFile(file) == content:
@@ -414,9 +715,24 @@ proc writeFileIfChanged(file, content: string) {.canRaise.} =
 
 const pluginTempBase = "tmp"
 
-proc addUnusedName(input, name: string): string =
-  result = "(.unusedname " & name & ")\n"
-  result.add input
+proc bifPluginInput(input: var TokenBuf; firstName: string): string =
+  ## Serializes a plugin input as in-memory `.bif` bytes: a private-pool copy
+  ## of `input` behind a leading `(unusedname firstName)` tree — the binary
+  ## carrier of what the text protocol's `.unusedname` directive transported
+  ## (bif has no directive channel; `plugins.loadPluginTree` peels the tree
+  ## off). The private pool matters twice over: the cache filename is a
+  ## checksum of these bytes and the global pool's ids depend on compile
+  ## history, and storing a global-pool buffer would write that whole pool.
+  var buf = nifcore.createTokenBuf(input.len + 4)
+  nifcore.openTag(buf, registerTag(buf.tags, UnusedNameTag))
+  nifcore.addSymUse(buf, firstName)
+  nifcore.closeTag(buf)
+  var n = beginRead(input)
+  while n.hasMore:
+    nifcore.addSubtree(buf, n)
+    skip n
+  endRead(n)
+  result = storeToString(buf)
 
 proc registerGeneratedSymbols(c: var SemContext; firstDisamb: int;
                               nextName: string) =
@@ -431,20 +747,182 @@ proc registerGeneratedSymbols(c: var SemContext; firstDisamb: int;
 
   for disamb in firstDisamb ..< nextDisamb:
     let name = pluginTempBase & "." & $disamb
-    c.freshSyms.incl pool.syms.getOrIncl(name)
+    c.freshSyms.incl pool.symId(name)
 
   if nextDisamb > firstDisamb:
     c.locals[pluginTempBase] = nextDisamb - 1
 
-proc runPlugin*(c: var SemContext; dest: var TokenBuf; info: PackedLineInfo;
-                pluginName: string; input: string; additionalInput = "") =
-  ## Runs a plugin with a NIF `.unusedname` hint and registers every generated
-  ## local symbol as fresh for subsequent semantic checking.
+# ── Plugin output ───────────────────────────────────────────────────────────
+#
+# A plugin's output is memoized under `checksum(input)`. That is exact for a
+# plugin that computes from its input alone and wrong for one that also reads a
+# file — a schema, a template, a table of constants: the file changes, the
+# input does not, and the memo is served forever (nim-lang/nimony#1378).
+# `plugins.dependsOn` reports such reads, and the paths travel back as a leading
+# `(dependency …)` tree beside the `(unusedname …)` gensym hint. Both are
+# sidecars: peeled off here, never part of the tree that is sem-checked. The
+# same list, read out of a cached output, decides whether the memo still holds.
+
+type
+  PluginOutput = object
+    buf: TokenBuf       ## the whole output; a bif carries private pools, text
+                        ## is parsed into the global ones
+    nextName: string    ## the gensym hint, or ""
+    deps: seq[string]   ## the `(dependency …)` paths
+
+proc isSidecar(o: PluginOutput; n: Cursor): bool =
+  n.kind == TagLit and
+    tagName(o.buf.tags, n.cursorTagId) in [UnusedNameTag, DependencyTag]
+
+proc peelSidecars(o: var PluginOutput) =
+  ## Reads the leading sidecar trees into `nextName` and `deps`.
+  if o.buf.len > 0:
+    var n = beginRead(o.buf)
+    while n.hasMore and o.isSidecar(n):
+      let tag = tagName(o.buf.tags, n.cursorTagId)
+      n.into:
+        while n.hasMore:
+          if tag == UnusedNameTag and n.kind == Symbol:
+            o.nextName = symName(n)
+          elif tag == DependencyTag and n.kind == StrLit:
+            o.deps.add strVal(n)
+          skip n
+    endRead(n)
+
+proc loadPluginOutput(outputFile: string; info: NifLineInfo): PluginOutput =
+  result = PluginOutput(nextName: "", deps: @[])
+  if isBifFile(outputFile):
+    # Binary output: the tokens carry absolute line infos, so no parentSeed
+    # resolution is needed, and the gensym hint is the `(unusedname X)` tree.
+    var m = bif.load(outputFile)
+    result.buf = move m.buf
+  else:
+    # Text output (hand-written or third-party plugins): the gensym hint is
+    # the `.unusedname` directive. `parse` reads ONE tree per call, so each
+    # sidecar costs a call of its own before the output proper is reached.
+    result.buf = createTokenBuf(30)
+    var r = rd.open(outputFile)
+    result.nextName = rd.firstUnusedName(r)
+    var lastWasSidecar = true
+    while lastWasSidecar:
+      let start = result.buf.len
+      # seed the parse with the invocation site's absolute info: text plugin
+      # output copies the (file-less, relative) infos of its input, so without
+      # an anchor they resolve to NoFile and diagnostics print as `???`
+      parse(r, result.buf, parentSeed = info, denseLineInfo = true)
+      lastWasSidecar = result.buf.len > start and
+        result.isSidecar(cursorAt(result.buf, start))
+    rd.close(r)
+  peelSidecars result
+
+const GlobalLayoutDecls = {TypeY, ProcY, FuncY, ConverterY, MethodY,
+                           TemplateY, MacroY, IteratorY, ConstY}
+
+proc collectGlobalDecls(c: var SemContext; n: Cursor;
+                        renames: var Table[SymId, SymId]) =
+  ## `genSym()` hands out local names (`tmp.N`), but a type, a routine or a
+  ## const gets a GLOBAL name wherever it is written: the backends lift it to module
+  ## scope, where a local name is neither indexed (#2644) nor unique (#2645).
+  var n = n
+  if n.kind == TagLit:
+    if n.symKind in GlobalLayoutDecls:
+      let def = n.childCursor
+      if def.kind == SymbolDef and pool.symIsLocal(def.symId) and
+          not renames.hasKey(def.symId):
+        var name = pool.symBasename(def.symId)
+        var counter = addr c.globals.mgetOrPut(name, -1)
+        counter[] += 1
+        name.add '.'
+        name.addInt counter[]
+        name.add '.'
+        name.add c.thisModuleSuffix
+        renames[def.symId] = pool.symId(name)
+    n.into:
+      while n.hasMore:
+        collectGlobalDecls(c, n, renames)
+        skip n
+
+proc addRenamed(dest: var TokenBuf; n: Cursor; renames: Table[SymId, SymId]) =
+  var n = n
+  case n.kind
+  of Symbol, SymbolDef:
+    let r = renames.getOrDefault(n.symId)
+    if r == SymId(0):
+      dest.addSubtree n
+    elif n.kind == Symbol:
+      dest.addSymUse r, n.info
+    else:
+      dest.addSymDef r, n.info
+  of TagLit:
+    dest.addParLe(n.cursorTagId, n.info)
+    n.into:
+      while n.hasMore:
+        addRenamed(dest, n, renames)
+        skip n
+      dest.addParRi(n.endInfo)
+  else:
+    dest.addSubtree n
+
+proc addPluginBody(c: var SemContext; dest: var TokenBuf; o: var PluginOutput) =
+  ## Appends the output proper, everything after the sidecars, to `dest`.
+  ## `addSubtree` re-interns a bif's private-pool content into the global pools.
+  if o.buf.len > 0:
+    var body = createTokenBuf(o.buf.len)
+    var n = beginRead(o.buf)
+    while n.hasMore and o.isSidecar(n):
+      skip n
+    while n.hasMore:
+      addSubtree(body, n)
+      skip n
+    endRead(n)
+    var renames = initTable[SymId, SymId]()
+    n = beginRead(body)
+    while n.hasMore:
+      collectGlobalDecls(c, n, renames)
+      skip n
+    endRead(n)
+    n = beginRead(body)
+    while n.hasMore:
+      if renames.len == 0: addSubtree(dest, n)
+      else: addRenamed(dest, n, renames)
+      skip n
+    endRead(n)
+    for _, r in renames:
+      c.freshSyms.incl r
+
+proc memoIsStale(outputFile: string; deps: seq[string]): bool =
+  ## True when a file the cached output depended on has changed or vanished
+  ## since it was written. A vanished file forces exactly one rerun: the plugin
+  ## no longer finds it and so no longer reports it. `vfsMtime` rather than
+  ## `lastModTimeOrStale`, which is whole seconds on host Nim: a data file
+  ## edited in the same second as the output would tie and read as unchanged.
+  ## nifmake compares nanoseconds for the same reason.
+  result = false
+  let written = vfsMtime(outputFile)
+  for d in deps:
+    if not vfsExists(d) or vfsMtime(d) > written:
+      result = true
+
+proc execPlugin(pluginExe, inputFile, outputFile, inputFileB: string) =
+  var cmd = quoteShell(pluginExe) & " " & quoteShell(inputFile) & " " & quoteShell(outputFile)
+  if inputFileB.len > 0:
+    cmd &= " "
+    cmd &= quoteShell(inputFileB)
+  exec cmd
+
+proc runPlugin*(c: var SemContext; dest: var TokenBuf; info: NifLineInfo;
+                pluginName: string; input: var TokenBuf;
+                additionalInput: var TokenBuf) =
+  ## Runs a plugin with a gensym hint and registers every generated local
+  ## symbol as fresh for subsequent semantic checking. The inputs are written
+  ## as binary `.bif` behind the unchanged `.in.nif`/`.types.nif` names — the
+  ## plugin-side loader sniffs the header (and still accepts text, so
+  ## hand-written inputs keep working). Inspect one with `niftools bif2nif`.
   let firstDisamb = c.locals.getOrDefault(pluginTempBase, -1) + 1
   let firstName = pluginTempBase & "." & $firstDisamb
-  let pluginInput = addUnusedName(input, firstName)
+  let pluginInput = bifPluginInput(input, firstName)
   let pluginAdditionalInput =
-    if additionalInput.len > 0: addUnusedName(additionalInput, firstName)
+    if additionalInput.len > 0: bifPluginInput(additionalInput, firstName)
     else: ""
 
   let p = splitFile(pluginName)
@@ -461,8 +939,8 @@ proc runPlugin*(c: var SemContext; dest: var TokenBuf; info: PackedLineInfo;
   let pluginExe = c.g.config.nifcachePath / p.name.addFileExt(ExeExt)
 
   let nf = resolveFile(c.g.config.paths, getFile(info), pluginName)
-  if needsRecompile(nf, pluginExe):
-    compilePlugin(c, info, nf, pluginExe)
+  ensurePlugin(c.g.config, nf, pluginExe)
+  if nf notin c.pluginSources: c.pluginSources.add nf
 
   try:
     writeFileIfChanged(inputFile, pluginInput)
@@ -471,20 +949,24 @@ proc runPlugin*(c: var SemContext; dest: var TokenBuf; info: PackedLineInfo;
   except:
     quit "FAILURE: cannot write plugin input file " & inputFile
 
+  let typesFile = if pluginAdditionalInput.len > 0: inputFileB else: ""
   if needsRecompile(pluginExe, outputFile):
-    var cmd = quoteShell(pluginExe) & " " & quoteShell(inputFile) & " " & quoteShell(outputFile)
-    if pluginAdditionalInput.len > 0:
-      cmd &= " "
-      cmd &= quoteShell(inputFileB)
-    exec cmd
-  var s = nifstreams.open(outputFile)
-  var nextName = ""
-  try:
-    nextName = rd.firstUnusedName(s.r)
-    parse s, dest, NoLineInfo
-  finally:
-    close s
-  registerGeneratedSymbols(c, firstDisamb, nextName)
+    execPlugin pluginExe, inputFile, outputFile, typesFile
+  var output = loadPluginOutput(outputFile, info)
+  if memoIsStale(outputFile, output.deps):
+    execPlugin pluginExe, inputFile, outputFile, typesFile
+    output = loadPluginOutput(outputFile, info)
+  for d in output.deps:
+    recordFileDep c, d
+  addPluginBody c, dest, output
+  registerGeneratedSymbols(c, firstDisamb, output.nextName)
+
+proc runPlugin*(c: var SemContext; dest: var TokenBuf; info: NifLineInfo;
+                pluginName: string; input: var TokenBuf) =
+  ## Single-input form (template/for-loop/module plugins; type plugins pass
+  ## their triggering type definitions as `additionalInput`).
+  var noAdditional = nifcore.createTokenBuf(1)
+  runPlugin(c, dest, info, pluginName, input, noAdditional)
 
 proc runProgram(file: string; nimcachePath: string; usedModules: HashSet[string];
                 commandLineArgs: string;
@@ -494,7 +976,7 @@ proc runProgram(file: string; nimcachePath: string; usedModules: HashSet[string]
   # to the invoking compile). Only the execution step uses `workingDir` so
   # relative paths like `doc/version.md` resolve next to the caller module.
   let nimonyExe = findDriver()
-  let compileCmd = quoteShell(nimonyExe) & commandLineArgs &
+  let compileCmd = quoteShell(nimonyExe) & shellArgs(commandLineArgs) &
     " --nimcache:" & quoteShell(nimcachePath) &
     " s " & quoteShell(file)
   try:
@@ -504,7 +986,7 @@ proc runProgram(file: string; nimcachePath: string; usedModules: HashSet[string]
   if result.exitCode != 0: return
 
   let modname = extractModuleSuffix(file)
-  let exe = nimcachePath / modname / splitFile(file).name.addFileExt(ExeExt)
+  let exe = nimcachePath / BackendDirC / modname / splitFile(file).name.addFileExt(ExeExt)
   # The child may start in `sourceDir`; keep the exe path absolute so it
   # still resolves against the outer compile's cwd, not the module dir.
   var exeToRun = exe
@@ -522,30 +1004,52 @@ proc runProgram(file: string; nimcachePath: string; usedModules: HashSet[string]
 const
   writeNifModuleSuffix* = "wriwhv7qv"
 
+proc buildWriteNifModule(c: var SemContext): string =
+  # Forward the outer compile's CLI args (notably `--cc`) so the inner nimony
+  # emits a build file whose `nimsem` cmd-line MATCHES what the outer build
+  # file uses. Otherwise nifmake's per-cmd staleness check sees a different
+  # argv for `nimsem ... m sysvq0asl.p.nif`, decides the existing
+  # `sysvq0asl.s.nif` is stale, and tries to overwrite it — which on Windows
+  # fails because the outer nimsem (currently paused waiting on this exec)
+  # still has it mmap'd. The outer's args live on `c.commandLineArgs`.
+  let nimonyExe = findDriver()
+  let cmd = quoteShell(nimonyExe) & shellArgs(c.commandLineArgs) &
+    " --nimcache:" & quoteShell(c.g.config.nifcachePath) &
+    " c " & quoteShell(stdlibFile("std/writenif.nim"))
+  try:
+    let (output, exitCode) = execCmdEx(cmd)
+    result = if exitCode != 0: output else: ""
+  except:
+    result = "failed to run: " & cmd
+
+const StaleLockNs = 120'i64 * 1_000_000_000'i64
+  ## A writenif build takes seconds; a lock this old lost its holder.
+
 proc prepareEval*(c: var SemContext): string =
+  ## Bring `std/writenif` up to date in this nimcache, once per process. The
+  ## eval program's build graph has no rule for it and links against whatever
+  ## `.s.nif` is there, so its mere existence is not enough: one left by an
+  ## older stdlib (a `std/math` since split into modules, say) fails every
+  ## evaluation with "cannot evaluate expression at compile time" until the
+  ## nimcache is wiped. nifmake makes the build a no-op when it is current.
+  ## Every module of a parallel build that evaluates something at compile
+  ## time gets here, all sharing the nimcache, so the build is done under a
+  ## lock: two concurrent builds of it race on the same outputs, and on
+  ## Windows the loser cannot replace a file the winner's C compiler still
+  ## has open.
+  result = ""
   if not c.checkedForWriteNifModule:
     c.checkedForWriteNifModule = true
-    if not os.fileExists(c.g.config.nifcachePath / writeNifModuleSuffix & ".s.nif"):
-      # precompile the module.
-      # Forward the outer compile's CLI args (notably `--cc`) so the
-      # inner nimony emits a build file whose `nimsem` cmd-line MATCHES
-      # what the outer build file uses. Otherwise nifmake's per-cmd
-      # staleness check sees a different argv for `nimsem ... m
-      # sysvq0asl.p.nif`, decides the existing `sysvq0asl.s.nif` is
-      # stale, and tries to overwrite it — which on Windows fails because
-      # the outer nimsem (currently paused waiting on this exec) still
-      # has it mmap'd. The outer's args live on `c.commandLineArgs`.
-      let nimonyExe = findDriver()
-      var cmd = quoteShell(nimonyExe) & c.commandLineArgs &
-        " --nimcache:" & quoteShell(c.g.config.nifcachePath) &
-        " c " & quoteShell(stdlibFile("std/writenif.nim"))
-      try:
-        let (output, exitCode) = execCmdEx(cmd)
-        if exitCode != 0:
-          return ensureMove(output)
-      except:
-        return "failed to run: " & cmd
-  return ""
+    let lock = c.g.config.nifcachePath / writeNifModuleSuffix & ".lock"
+    while true:
+      if vfsTryLock(lock):
+        result = buildWriteNifModule(c)
+        vfsUnlock(lock)
+        break
+      if vfsNow() - vfsMtime(lock) > StaleLockNs:
+        vfsUnlock(lock)
+      else:
+        vfsSleepMs(20)
 
 proc runEval*(c: var SemContext; dest: var TokenBuf; srcName: string; src: TokenBuf;
                usedModules: HashSet[string]; sourceDir = ""): string =
@@ -563,19 +1067,16 @@ proc runEval*(c: var SemContext; dest: var TokenBuf; srcName: string; src: Token
       deps.add c.importSnippets
     deps.addParRi()
     let depsFile = c.g.config.nifcachePath / srcName & ".p.deps.nif"
-    writeFile deps, depsFile
-
+    writeFile(depsFile, toString(deps, true))
     let (output, exitCode) = runProgram(progfile, c.g.config.nifcachePath, usedModules,
                                         c.commandLineArgs, sourceDir)
     if exitCode != 0:
       result = ensureMove(output)
     else:
       let outfile = c.g.config.nifcachePath / srcName.addFileExt(".out.nif")
-      var s = nifstreams.open(outfile)
-      try:
-        parse s, dest, NoLineInfo
-      finally:
-        close s
+      var r = rd.open(outfile)
+      parse(r, dest)
+      rd.close(r)
       result = ""  # success: caller interprets "" as no error
   except:
     result = "I/O error while evaluating " & srcName

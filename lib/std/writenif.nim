@@ -1,5 +1,8 @@
 # Helper routines for generating NIF code. Used by the `exprexec` module.
 
+# `outp` is the compile-time evaluator's output file; it runs single threaded.
+{.feature: "assumeSync".}
+
 import std/[syncio, math, formatfloat]
 
 var outp: File
@@ -74,6 +77,7 @@ proc writeNifStr*(s: string) =
   write(outp, "\"")
 
 proc writeNifSymbol*(s: string) =
+  write(outp, " ")
   if s.len > 0:
     let c = s[0]
     if c in {'.', '0'..'9', '+', '-', '~'} or c.needsEscape:

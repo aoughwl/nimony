@@ -21,9 +21,6 @@ type
     vtableType*: Cursor # UncheckedArray[pointer]
     continuationType*: Cursor
 
-proc tagToken(tag: string; info: PackedLineInfo = NoLineInfo): PackedToken {.inline.} =
-  parLeToken(pool.tags.getOrIncl(tag), info)
-
 const
   sso* = true ## set to true to enable SSO string implementation
 
@@ -52,115 +49,214 @@ const
   ExceptionName* = "Exception.0." & SystemModuleSuffix
   ExcThreadVarName* = "exc.0." & SystemModuleSuffix
   ContinuationName* = "Continuation.0." & SystemModuleSuffix
+  BareRootObjName* = "RootObj.0." & SystemModuleSuffix
+    ## The system's real `RootObj`: the env slot of a lowered closure tuple and
+    ## of an iter value, and what `typenav` answers for that slot. "Bare"
+    ## disambiguates it from `coro_transform.RootObjName`, which despite its
+    ## name is `CoroutineBase`.
   OpenArrayHeadName* = "openArray.0." & SystemModuleSuffix
 
+proc addSuccessTupleType*(dest: var TokenBuf; retType: Cursor; info: NifLineInfo) =
+  ## The type a `.raises` routine's result actually travels in: `ErrorCode`
+  ## alone when the routine returns nothing, `(tuple ErrorCode T)` when it
+  ## returns a `T`. Prefer `addLengReturnType` unless the caller has already
+  ## established that the routine raises.
+  if retType.isDotToken or retType.typeKind == VoidT:
+    dest.addSymUse pool.symId(ErrorCodeName), info
+  else:
+    dest.addParLe TupleT, info
+    dest.addSymUse pool.symId(ErrorCodeName), info
+    dest.addSubtree retType
+    dest.addParRi()
+
+proc addRaisedCode*(dest: var TokenBuf; loweredRetType: Cursor; code, resultSym: SymId;
+                    info: NifLineInfo) =
+  ## The operand of a `(raise ...)` emitted into a routine whose signature has
+  ## ALREADY been through `addSuccessTupleType`: a bare `ErrorCode` when the
+  ## routine returns nothing, else `(code, result[1])` — the code paired with
+  ## whatever the result slot holds so far.
+  ##
+  ## Exception lowering happens once, early. A pass that runs after it and
+  ## still needs to signal an error — the duplifier's out-of-memory check is
+  ## the only such case — cannot emit a bare `(raise code)` and leave the
+  ## typing to somebody downstream, because there is no longer anybody
+  ## downstream. It emits the finished payload through here.
+  if loweredRetType.typeKind != TupleT:
+    dest.addSymUse code, info
+  else:
+    dest.addParLe TupconstrX, info
+    dest.addSubtree loweredRetType
+    dest.addSymUse code, info
+    if resultSym != SymId(0):
+      dest.addParLe TupatX, info
+      dest.addSymUse resultSym, info
+      dest.addIntLit 1, info
+      dest.addParRi()
+    dest.addParRi()
+
+proc addLengReturnType*(dest: var TokenBuf; retType, pragmas: Cursor;
+                        info: NifLineInfo) =
+  ## THE mapping from a routine's Nimony return type to its Leng one, and the
+  ## only place it is decided.
+  ##
+  ## Hexer keeps asking the Nimony type system what things are, and that answer
+  ## stays in Nimony's terms: a `.raises` routine returns `T` and says so with
+  ## a pragma. Leng has no exceptions, so at the boundary that becomes a value
+  ## and a code travelling together. Whoever crosses the boundary applies this,
+  ## and everyone who does agrees by construction — which is the whole
+  ## requirement, because the two type systems are allowed to differ and are
+  ## not allowed to differ INCONSISTENTLY. A signature rewritten one way and a
+  ## proctype rewritten the other is a function pointer that does not match its
+  ## function, and nothing but the C compiler is going to notice.
+  ##
+  ## Nothing bakes the answer into a signature before `lengcgen`: hexer's
+  ## passes keep nimsem's signatures, `.raises` included, for the module's own
+  ## routines and the imported ones alike. `cps` for a coroutine's result slot,
+  ## `xelim` for the temp of a raising call and `lengcgen` for declarations and
+  ## proctypes all come back here for the same answer.
+  if hasPragma(pragmas, RaisesP):
+    addSuccessTupleType(dest, retType, info)
+  else:
+    dest.addSubtree retType
+
+proc addPragmasWithoutRaises*(dest: var TokenBuf; pragmas: Cursor) =
+  ## Copy a pragma list minus `(raises)`. Used on the procs `cps` generates
+  ## FOR a coroutine, which return a `Continuation` and never fail: the error
+  ## travels through the result slot instead.
+  if pragmas.isDotToken or not pragmas.isTagLit:
+    dest.addDotToken()
+    return
+  var n = pragmas
+  dest.addParLe(n.cursorTagId, n.info)
+  n = sub(n)
+  while n.hasMore:
+    if n.pragmaKind == RaisesP: skip n
+    else: dest.takeTree n
+  dest.addParRi()
+
 proc createBuiltinTypes*(bits: int): BuiltinTypes =
+  # Positions are recorded while building rather than hardcoded, so the
+  # layout stays correct when `-d:virtualParRi` elides the `)` tokens.
   result = BuiltinTypes(mem: createTokenBuf(30))
 
-  result.mem.add tagToken"auto" # 0
-  result.mem.addParRi() # 1
+  let autoPos = result.mem.len
+  result.mem.addParLe "auto"
+  result.mem.addParRi()
 
+  let stringPos = result.mem.len
   when true:
-    result.mem.add symToken(pool.syms.getOrIncl(StringName), NoLineInfo) # 2
-    result.mem.addDotToken() # 3
+    result.mem.addSymUse(pool.symId(StringName), NoLineInfo)
+    result.mem.addDotToken()
   else:
-    result.mem.add tagToken"string" # 2
-    result.mem.addParRi() # 3
+    result.mem.addParLe "string"
+    result.mem.addParRi()
 
-  result.mem.add tagToken"bool" # 4
-  result.mem.addParRi() # 5
+  let boolPos = result.mem.len
+  result.mem.addParLe "bool"
+  result.mem.addParRi()
 
-  let configBits = pool.integers.getOrIncl(bits)
-  result.mem.add tagToken"i" # 6
-  result.mem.add intToken(configBits, NoLineInfo) # 7
-  result.mem.addParRi() # 8
+  let configBits = bits
+  let intPos = result.mem.len
+  result.mem.addParLe "i"
+  result.mem.addIntLit(configBits, NoLineInfo)
+  result.mem.addParRi()
 
-  result.mem.add tagToken"u" # 9
-  result.mem.add intToken(configBits, NoLineInfo) # 10
-  result.mem.addParRi() # 11
+  let uintPos = result.mem.len
+  result.mem.addParLe "u"
+  result.mem.addIntLit(configBits, NoLineInfo)
+  result.mem.addParRi()
 
-  result.mem.add tagToken"f" # 12
-  result.mem.add intToken(pool.integers.getOrIncl(64), NoLineInfo) # 13
-  result.mem.addParRi() # 14
+  let floatPos = result.mem.len
+  result.mem.addParLe "f"
+  result.mem.addIntLit(64, NoLineInfo)
+  result.mem.addParRi()
 
-  result.mem.add tagToken"c" # 15
-  result.mem.add intToken(pool.integers.getOrIncl(8), NoLineInfo) # 16
-  result.mem.addParRi() # 17
+  let charPos = result.mem.len
+  result.mem.addParLe "c"
+  result.mem.addIntLit(8, NoLineInfo)
+  result.mem.addParRi()
 
-  result.mem.add dotToken(NoLineInfo) # 18
+  let voidPos = result.mem.len
+  result.mem.addDotToken(NoLineInfo)
 
-  result.mem.add tagToken"nilt" # 19
-  result.mem.addParRi() # 20
+  let niltPos = result.mem.len
+  result.mem.addParLe "nilt"
+  result.mem.addParRi()
 
-  template addBitsType(tag: string, bits: int) =
-    # adds 3
-    result.mem.add tagToken(tag) # +1
-    result.mem.add intToken(pool.integers.getOrIncl(bits), NoLineInfo) # +2
-    result.mem.addParRi() # +3
+  template addBitsType(tag: string, bits: int): int =
+    let pos = result.mem.len
+    result.mem.addParLe(tag)
+    result.mem.addIntLit(bits, NoLineInfo)
+    result.mem.addParRi()
+    pos
 
-  addBitsType "i", 8 # 21
-  addBitsType "i", 16 # 24
-  addBitsType "i", 32 # 27
-  addBitsType "i", 64 # 30
+  let int8Pos = addBitsType("i", 8)
+  let int16Pos = addBitsType("i", 16)
+  let int32Pos = addBitsType("i", 32)
+  let int64Pos = addBitsType("i", 64)
 
-  addBitsType "u", 8 # 33
-  addBitsType "u", 16 # 36
-  addBitsType "u", 32 # 39
-  addBitsType "u", 64 # 42
+  let uint8Pos = addBitsType("u", 8)
+  let uint16Pos = addBitsType("u", 16)
+  let uint32Pos = addBitsType("u", 32)
+  let uint64Pos = addBitsType("u", 64)
 
-  addBitsType "f", 32 # 45
-  addBitsType "f", 64 # 48
+  let float32Pos = addBitsType("f", 32)
+  let float64Pos = addBitsType("f", 64)
 
-  result.mem.add tagToken"tuple" # 51
-  result.mem.addParRi() # 52
+  let tuplePos = result.mem.len
+  result.mem.addParLe "tuple"
+  result.mem.addParRi()
 
-  result.mem.add tagToken"untyped" # 53
-  result.mem.addParRi() # 54
+  let untypedPos = result.mem.len
+  result.mem.addParLe "untyped"
+  result.mem.addParRi()
 
-  result.mem.add tagToken"cstring" # 55
-  result.mem.add tagToken"notnil" # 56
-  result.mem.addParRi() # 57 close notnil
-  result.mem.addParRi() # 58 close cstring
+  let cstringPos = result.mem.len
+  result.mem.addParLe "cstring"
+  result.mem.addParLe "notnil"
+  result.mem.addParRi() # close notnil
+  result.mem.addParRi() # close cstring
 
   # UncheckedArray[pointer] = (uarray (ptr (void)))
-  result.mem.add tagToken"uarray" # 59
-  result.mem.add tagToken"ptr" # 60
-  result.mem.add tagToken"void" # 61
-  result.mem.addParRi() # 62 close void
-  result.mem.addParRi() # 63 close ptr
-  result.mem.addParRi() # 64 close uarray
+  let vtablePos = result.mem.len
+  result.mem.addParLe "uarray"
+  result.mem.addParLe "ptr"
+  result.mem.addParLe "void"
+  result.mem.addParRi() # close void
+  result.mem.addParRi() # close ptr
+  result.mem.addParRi() # close uarray
 
-  result.mem.add symToken(pool.syms.getOrIncl(ContinuationName), NoLineInfo) # 65
+  let continuationPos = result.mem.len
+  result.mem.addSymUse(pool.symId(ContinuationName), NoLineInfo)
 
-  result.mem.freeze()
 
-  result.autoType = result.mem.cursorAt(0)
-  result.stringType = result.mem.cursorAt(2)
-  result.boolType = result.mem.cursorAt(4)
-  result.intType = result.mem.cursorAt(6)
-  result.uintType = result.mem.cursorAt(9)
-  result.floatType = result.mem.cursorAt(12)
-  result.charType = result.mem.cursorAt(15)
-  result.voidType = result.mem.cursorAt(18)
-  result.nilType = result.mem.cursorAt(19)
-  result.int8Type = result.mem.cursorAt(21)
-  result.int16Type = result.mem.cursorAt(24)
-  result.int32Type = result.mem.cursorAt(27)
-  result.int64Type = result.mem.cursorAt(30)
-  result.uint8Type = result.mem.cursorAt(33)
-  result.uint16Type = result.mem.cursorAt(36)
-  result.uint32Type = result.mem.cursorAt(39)
-  result.uint64Type = result.mem.cursorAt(42)
-  result.float32Type = result.mem.cursorAt(45)
-  result.float64Type = result.mem.cursorAt(48)
-  result.emptyTupleType = result.mem.cursorAt(51)
-  result.untypedType = result.mem.cursorAt(53)
-  result.cstringType = result.mem.cursorAt(55)
-  result.vtableType = result.mem.cursorAt(59)
-  result.continuationType = result.mem.cursorAt(65)
+  result.autoType = result.mem.cursorAt(autoPos)
+  result.stringType = result.mem.cursorAt(stringPos)
+  result.boolType = result.mem.cursorAt(boolPos)
+  result.intType = result.mem.cursorAt(intPos)
+  result.uintType = result.mem.cursorAt(uintPos)
+  result.floatType = result.mem.cursorAt(floatPos)
+  result.charType = result.mem.cursorAt(charPos)
+  result.voidType = result.mem.cursorAt(voidPos)
+  result.nilType = result.mem.cursorAt(niltPos)
+  result.int8Type = result.mem.cursorAt(int8Pos)
+  result.int16Type = result.mem.cursorAt(int16Pos)
+  result.int32Type = result.mem.cursorAt(int32Pos)
+  result.int64Type = result.mem.cursorAt(int64Pos)
+  result.uint8Type = result.mem.cursorAt(uint8Pos)
+  result.uint16Type = result.mem.cursorAt(uint16Pos)
+  result.uint32Type = result.mem.cursorAt(uint32Pos)
+  result.uint64Type = result.mem.cursorAt(uint64Pos)
+  result.float32Type = result.mem.cursorAt(float32Pos)
+  result.float64Type = result.mem.cursorAt(float64Pos)
+  result.emptyTupleType = result.mem.cursorAt(tuplePos)
+  result.untypedType = result.mem.cursorAt(untypedPos)
+  result.cstringType = result.mem.cursorAt(cstringPos)
+  result.vtableType = result.mem.cursorAt(vtablePos)
+  result.continuationType = result.mem.cursorAt(continuationPos)
 
 proc isStringType*(a: Cursor): bool {.inline.} =
-  result = a.kind == Symbol and a.symId == pool.syms.getOrIncl(StringName)
+  result = a.isSymbol and a.symId == pool.symId(StringName)
   #a.typeKind == StringT: StringT now unused!
 
 proc isSomeStringType*(a: Cursor): bool {.inline.} =

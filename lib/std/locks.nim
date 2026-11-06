@@ -32,59 +32,58 @@ func `$`*(lock: Lock): string =
   # workaround bug #14873
   result = "()"
 
-proc initLock*(lock: var Lock) {.inline.} =
+proc initLock*(lock: var Lock) {.sync, inline.} =
   ## Initializes the given lock.
   when not defined(js):
     initSysLock(lock)
 
-proc deinitLock*(lock: Lock) {.inline.} =
+proc deinitLock*(lock: var Lock) {.sync, inline.} =
   ## Frees the resources associated with the lock.
   deinitSys(lock)
 
-proc tryAcquire*(lock: var Lock): bool {.inline.} =
+proc tryAcquire*(lock: var Lock): bool {.sync, inline.} =
   ## Tries to acquire the given lock. Returns `true` on success.
   result = tryAcquireSys(lock)
 
-proc acquire*(lock: var Lock) {.inline.} =
+proc acquire*(lock: var Lock) {.sync, inline.} =
   ## Acquires the given lock.
   when not defined(js):
     acquireSys(lock)
 
-proc release*(lock: var Lock) {.inline.} =
+proc release*(lock: var Lock) {.sync, inline.} =
   ## Releases the given lock.
   when not defined(js):
     releaseSys(lock)
 
 
-proc initCond*(cond: var Cond) {.inline.} =
+proc initCond*(cond: var Cond) {.sync, inline.} =
   ## Initializes the given condition variable.
   initSysCond(cond)
 
-proc deinitCond*(cond: Cond) {.inline.} =
+proc deinitCond*(cond: var Cond) {.sync, inline.} =
   ## Frees the resources associated with the condition variable.
   deinitSysCond(cond)
 
-proc wait*(cond: var Cond, lock: var Lock) {.inline.} =
+proc wait*(cond: var Cond, lock: var Lock) {.sync, inline.} =
   ## Waits on the condition variable `cond`.
   waitSysCond(cond, lock)
 
-proc signal*(cond: var Cond) {.inline.} =
+proc signal*(cond: var Cond) {.sync, inline.} =
   ## Sends a signal to the condition variable `cond`.
   signalSysCond(cond)
 
-proc broadcast*(cond: var Cond) {.inline.} =
+proc broadcast*(cond: var Cond) {.sync, inline.} =
   ## Unblocks all threads currently blocked on the
   ## specified condition variable `cond`.
   broadcastSysCond(cond)
 
-# template withLock*(a: Lock, body: untyped) =
-#   ## Acquires the given lock, executes the statements in body and
-#   ## releases the lock after the statements finish executing.
-#   acquire(a)
-#   {.locks: [a].}:
-#     try:
-#       body
-#     finally:
-#       release(a)
+template withLock*(a: Lock, body: untyped) =
+  ## Acquires the given lock, executes the statements in body and
+  ## releases the lock after the statements finish executing.
+  acquire(a)
+  try:
+    body
+  finally:
+    release(a)
 
 # {.pop.}

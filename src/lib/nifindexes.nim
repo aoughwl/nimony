@@ -7,7 +7,8 @@
 ## Create an index file for a NIF file.
 
 import std / [tables, assertions, hashes, syncio, strutils]
-import bitabs, lineinfos, nifreader, nifstreams, nifcursors, nifchecksums, symparser, vfs
+import bitabs, nifreader, nifpools, nifchecksums, symparser, vfs, stringviews
+from lineinfos import PackedLineInfo  # only for NifIndexEntry.info (frozen Nim side)
 
 when defined(nimony):
   import std / sha1
@@ -22,6 +23,8 @@ import ".." / models / [tags, nifindex_tags]
 
 include compat2
 
+from nifcoreparse import parse
+
 proc entryKind(tag: TagId): NifIndexKind =
   if rawTagIsNifIndexKind(cast[TagEnum](tag)):
     result = cast[NifIndexKind](tag)
@@ -34,78 +37,66 @@ proc isImportant(s: string): bool =
     if ch == '.': inc c
   result = c >= 2
 
-proc isExported(n: Cursor): bool =
-  var n = n
-  if n.kind == SymbolDef:
+proc processDeclForChecksum(dest: var Sha1State; n: var Cursor) =
+  ## Hashes the single tree/token at `n` — the declarations in it, to be
+  ## exact — advancing past it. Private declarations count too: an importer
+  ## instantiates an exported generic, or expands an exported template, whose
+  ## body can name any of them.
+  let inlineT = TagId(InlineIdx)
+  if n.isTagLit:
+    var foundInline = false
+    let k = entryKind(n.cursorTagId)
+    case k
+    of LetIdx, VarIdx, CursorIdx, ConstIdx, TypeIdx, GletIdx, TletIdx, GvarIdx, TvarIdx:
+      n.into: # tag
+        updateLoop(dest, n, inlineT, foundInline) # SymbolDef
+        updateLoop(dest, n, inlineT, foundInline) # Export marker
+        updateLoop(dest, n, inlineT, foundInline) # pragmas
+        updateLoop(dest, n, inlineT, foundInline) # type
+        updateLoop(dest, n, inlineT, foundInline) # value
+        while n.hasMore: skip n
+    of TemplateIdx, MacroIdx, IteratorIdx:
+      # these always have inline semantics
+      n.into: # tag
+        updateLoop(dest, n, inlineT, foundInline) # SymbolDef
+        updateLoop(dest, n, inlineT, foundInline) # Export marker
+        updateLoop(dest, n, inlineT, foundInline) # pattern
+        updateLoop(dest, n, inlineT, foundInline) # typevars
+        updateLoop(dest, n, inlineT, foundInline) # params
+        updateLoop(dest, n, inlineT, foundInline) # retType
+        updateLoop(dest, n, inlineT, foundInline) # pragmas
+        updateLoop(dest, n, inlineT, foundInline) # effects
+        updateLoop(dest, n, inlineT, foundInline) # body
+        while n.hasMore: skip n
+    of ProcIdx, FuncIdx, MethodIdx, ConverterIdx:
+      n.into: # tag
+        var dummy = false
+        updateLoop(dest, n, inlineT, dummy) # SymbolDef
+        updateLoop(dest, n, inlineT, dummy) # Export marker
+        updateLoop(dest, n, inlineT, dummy) # pattern
+        # an importer instantiates a generic routine from its body; an
+        # instance holds `(at …)` here and was compiled in this module:
+        let isGeneric = n.isTagLit and n.cursorTagId == TagId(TypevarsTagId)
+        updateLoop(dest, n, inlineT, dummy) # typevars
+        updateLoop(dest, n, inlineT, dummy) # params
+        updateLoop(dest, n, inlineT, dummy) # retType
+        updateLoop(dest, n, inlineT, foundInline) # pragmas
+        updateLoop(dest, n, inlineT, dummy) # effects
+        if foundInline or isGeneric:
+          updateLoop(dest, n, inlineT, dummy) # body
+        else:
+          skip n
+        while n.hasMore: skip n
+    of NoIndexTag, InlineIdx, KvIdx, VvIdx, BuildIdx, BundleIdx, IndexIdx, DependencyIdx, LinkIdx, OptionkeyIdx,
+       ExportIdx, FromexportIdx, ExportexceptIdx:
+      n.loopInto:
+        processDeclForChecksum(dest, n)
+  else:
     inc n
-    if n.kind != DotToken:
-      return true
-  return false
 
 proc processForChecksum(dest: var Sha1State; content: var TokenBuf) =
   var n = beginRead(content)
-  var nested = 0
-  let inlineT = TagId(InlineIdx)
-  while true:
-    case n.kind
-    of ParLe:
-      var foundInline = false
-      let k = entryKind(n.tagId)
-      case k
-      of LetIdx, VarIdx, CursorIdx, ConstIdx, TypeIdx, GletIdx, TletIdx, GvarIdx, TvarIdx:
-        inc n # tag
-        if isExported(n):
-          updateLoop(dest, n, inlineT, foundInline) # SymbolDef
-          updateLoop(dest, n, inlineT, foundInline) # Export marker
-          updateLoop(dest, n, inlineT, foundInline) # pragmas
-          updateLoop(dest, n, inlineT, foundInline) # type
-          updateLoop(dest, n, inlineT, foundInline) # value
-        while n.hasMore: skip n
-        consumeParRi n
-      of TemplateIdx, MacroIdx, IteratorIdx:
-        # these always have inline semantics
-        inc n # tag
-        if isExported(n):
-          updateLoop(dest, n, inlineT, foundInline) # SymbolDef
-          updateLoop(dest, n, inlineT, foundInline) # Export marker
-          updateLoop(dest, n, inlineT, foundInline) # pattern
-          updateLoop(dest, n, inlineT, foundInline) # typevars
-          updateLoop(dest, n, inlineT, foundInline) # params
-          updateLoop(dest, n, inlineT, foundInline) # retType
-          updateLoop(dest, n, inlineT, foundInline) # pragmas
-          updateLoop(dest, n, inlineT, foundInline) # effects
-          updateLoop(dest, n, inlineT, foundInline) # body
-        while n.hasMore: skip n
-        consumeParRi n
-      of ProcIdx, FuncIdx, MethodIdx, ConverterIdx:
-        inc n # tag
-        if isExported(n):
-          var dummy = false
-          updateLoop(dest, n, inlineT, dummy) # SymbolDef
-          updateLoop(dest, n, inlineT, dummy) # Export marker
-          updateLoop(dest, n, inlineT, dummy) # pattern
-          updateLoop(dest, n, inlineT, dummy) # typevars
-          updateLoop(dest, n, inlineT, dummy) # params
-          updateLoop(dest, n, inlineT, dummy) # retType
-          updateLoop(dest, n, inlineT, foundInline) # pragmas
-          updateLoop(dest, n, inlineT, dummy) # effects
-          if foundInline:
-            updateLoop(dest, n, inlineT, dummy) # body
-          else:
-            skip n
-        while n.hasMore: skip n
-        consumeParRi n
-      of NoIndexTag, InlineIdx, KvIdx, VvIdx, BuildIdx, BundleIdx, IndexIdx,
-         ExportIdx, FromexportIdx, ExportexceptIdx:
-        inc n
-        inc nested
-    of ParRi:
-      dec nested
-      if nested == 0:
-        break
-      inc n
-    else:
-      inc n
+  processDeclForChecksum(dest, n)
 
 type
   HookIndexEntry* = object
@@ -115,6 +106,9 @@ type
   IndexSections* = object
     converters*: seq[(SymId, SymId)] # string is for compat with `methods`
     exportBuf*: TokenBuf
+    reexportedChecksums*: seq[string] ## the checksums of the modules
+      ## `exportBuf` re-exports: an importer reads their declarations through
+      ## this module, so they are part of its interface
 
 proc getSymbolSection(tag: TagId; values: seq[(SymId, SymId)]): TokenBuf =
   result = createTokenBuf(30)
@@ -122,16 +116,17 @@ proc getSymbolSection(tag: TagId; values: seq[(SymId, SymId)]): TokenBuf =
 
   for value in values:
     let (key, sym) = value
-    result.buildTree TagId(KvIdx), NoLineInfo:
-      if key == SymId(0):
-        result.add dotToken(NoLineInfo)
-      else:
-        result.add symToken(key, NoLineInfo)
-      result.add symToken(sym, NoLineInfo)
+    result.addParLe(TagId(KvIdx), NoLineInfo)
+    if key == SymId(0):
+      result.addDotToken(NoLineInfo)
+    else:
+      result.addSymUse(key, NoLineInfo)
+    result.addSymUse(sym, NoLineInfo)
+    result.addParRi()
 
   result.addParRi()
 
-proc createIndex*(infile: string; root: PackedLineInfo; buildChecksum: bool; sections: IndexSections) {.canRaise.} =
+proc createIndex*(infile: string; root: NifLineInfo; buildChecksum: bool; sections: IndexSections) {.canRaise.} =
   # Mirror the doc-mode cache split: `foo.sc.nif` → `foo.sc.idx.nif`, the regular
   # `foo.s.nif` → `foo.s.idx.nif`. Keeps both populations valid in parallel.
   let isDocMode = infile.endsWith(".sc.nif")
@@ -150,167 +145,164 @@ proc createIndex*(infile: string; root: PackedLineInfo; buildChecksum: bool; sec
     content.add "\n"
 
   if buildChecksum:
-    var s = nifstreams.open(infile)
-    discard processDirectives(s.r)
-    var buf = fromStream(s)
-    close s
+    var r = nifreader.open(infile)
+    var buf = createTokenBuf()
+    nifcoreparse.parse(r, buf)
+    # Close eagerly: the reader mmaps `infile`, and a leaked mapping keeps the
+    # file locked on Windows — a later rewrite of the same file (e.g. repeated
+    # `runEval` const folds writing the same tco<hash>.p.nif) then fails.
+    nifreader.close(r)
     var checksum = newSha1State()
     processForChecksum(checksum, buf)
+    for cs in sections.reexportedChecksums:
+      checksum.update cs
     let final = SecureHash checksum.finalize()
     content.add "(checksum \"" & $final & "\")"
   content.add "\n)\n"
-  # OnlyIfChanged: clients (downstream nimsem/hexer) depend on this file.
-  # When a module's interface and inline-proc bodies are unchanged, its
-  # checksum is identical, so we keep the old mtime to avoid cascading
-  # rebuilds through importers. nifmake's `needsRebuild` uses the freshest
-  # of a node's outputs (max), so the always-written `.s.nif` still proves
-  # "we ran since the inputs changed" for nimsem's own staleness check.
+  # The module's interface file (doc/internals/ic.md): importers' nimsem and
+  # hexer depend on this file, not on `.s.nif`. When a module's interface and
+  # inline-proc bodies are unchanged, its checksum is identical, so we keep
+  # the old mtime to avoid cascading rebuilds through importers. nifmake's
+  # `needsRebuild` uses the freshest of a node's outputs (max), so the
+  # always-written `.s.nif` still proves "we ran since the inputs changed"
+  # for nimsem's own staleness check.
   let existingContent = try: vfsRead(indexName) except: ""
   if existingContent != content:
     vfsWrite(indexName, content)
 
-proc createIndex*(infile: string; buildChecksum: bool; root: PackedLineInfo) {.canRaise.} =
+proc createIndex*(infile: string; buildChecksum: bool; root: NifLineInfo) {.canRaise.} =
   createIndex(infile, root, buildChecksum, IndexSections())
 
 proc writeFileAndIndex*(outfile: string; content: TokenBuf) {.canRaise.} =
-  writeFile(content, outfile)
-  createIndex(outfile, true, content[0].info)
-
+  vfsWrite(outfile, toString(content, true))
+  var c = cursorAt(cast[ptr TokenBuf](unsafeAddr content)[], 0)
+  createIndex(outfile, true, c.info)
 type
   IndexVisibility* = enum
     Hidden, Exported
   NifIndexEntry* = object
     offset*: int
-    info*: PackedLineInfo
+    info*: PackedLineInfo    ## kept for the frozen Nim-compiler side
+                             ## (ast2nif's position index); unused here
+    parentInfo*: NifLineInfo ## absolute info of the decl's write-time parent
+                             ## node; seeds `parse` on an index-jumped load so
+                             ## file-less relative infos resolve correctly
     vis*: IndexVisibility
 
   NifIndex* = object
     converters*: seq[(string, string)] # map of dest types to converter symbols
     exports*: seq[(string, NifIndexKind, seq[StrId])] # module, export kind, filtered names
+    checksum*: string ## the interface checksum, "" when the index has none
 
-proc readSymbolSection(s: var Stream; tab: var seq[(string, string)]) =
-  var t = next(s)
-  var nested = 1
-  while t.kind != EofToken:
-    if t.kind == ParLe:
-      inc nested
-      if t.tagId == TagId(KvIdx):
-        t = next(s)
-        var key: string
-        if t.kind == Symbol:
-          key = pool.syms[t.symId]
-        elif t.kind == Ident:
-          key = pool.strings[t.litId]
-        elif t.kind == DotToken:
-          key = "."
-        else:
-          raiseAssert "invalid (kv) construct: symbol expected"
-        t = next(s) # skip Symbol
-        var value: string
-        if t.kind == Symbol:
-          value = pool.syms[t.symId]
-        elif t.kind == Ident:
-          value = pool.strings[t.litId]
-        else:
-          raiseAssert "invalid (kv) construct: symbol expected"
-        t = next(s) # skip value symbol
-        tab.add((key, value))
-        if t.kind == ParRi:
-          t = next(s)
-          dec nested
-        else:
-          assert false, "invalid (kv) construct: ')' expected"
+proc symOrIdentOrDot(n: var Cursor): string =
+  if n.isSymbol: result = pool.symString(n.symId)
+  elif n.isIdent: result = pool.strings[n.strId]
+  elif n.isDotToken: result = "."
+  else: result = ""
+  skip n
+
+proc readSymbolSectionC(n: var Cursor; tab: var seq[(string, string)]) =
+  ## Cursor walk of a `(converter (kv key value) …)` section.
+  n.into:
+    while n.hasMore:
+      if n.isTagLit and n.cursorTagId == TagId(KvIdx):
+        n.into:
+          let key = symOrIdentOrDot(n)
+          let value = symOrIdentOrDot(n)
+          tab.add((key, value))
       else:
-        assert false, "expected (kv) construct"
-    elif t.kind == ParRi:
-      dec nested
-      if nested == 0:
-        break
-      t = next(s)
-    else:
-      assert false, "expected (kv) construct"
-      #t = next(s)
+        skip n
 
 proc readIndex*(indexName: string): NifIndex =
-  var s = nifstreams.open(indexName)
-  let res = processDirectives(s.r)
-  assert res == Success
-
+  var r = nifreader.open(indexName)
+  var buf = createTokenBuf()
+  nifcoreparse.parse(r, buf)   # reads directives + the `(index …)` tree
+  r.close()
   result = default(NifIndex)
-  var t = next(s)
-  if t.tag != TagId(IndexIdx):
+  var n = beginRead(buf)
+  if not (n.isTagLit and n.cursorTagId == TagId(IndexIdx)):
     assert false, "expected 'index' tag"
-  t = next(s)
-  while t.kind != ParRi and t.kind != EofToken:
-    if t.kind == ParLe:
-      case t.tagId
-      of TagId(ConverterIdx):
-        readSymbolSection(s, result.converters)
-        t = next(s)
-      of TagId(ExportIdx), TagId(FromexportIdx), TagId(ExportexceptIdx):
-        let kind = cast[NifIndexKind](t.tag)
-        t = next(s)
-        assert t.kind == StringLit
-        let path = pool.strings[t.litId]
-        t = next(s)
-        var names: seq[StrId] = @[]
-        while t.kind != ParRi:
-          assert t.kind == Ident
-          names.add t.litId
-          t = next(s)
-        result.exports.add (path, kind, names)
-        t = next(s)
-      else:
-        var nested = 1
-        t = next(s)
-        while t.kind != EofToken:
-          case t.kind
-          of ParLe: inc nested
-          of ParRi:
-            dec nested
-            if nested == 0: break
-          else: discard
-          t = next(s)
-        t = next(s)
-    else:
-      t = next(s)
-
-proc readEmbeddedIndex*(s: var Stream): Table[string, NifIndexEntry] =
-  ## Reads the simple embedded index (index (kv sym offset)...) from indexStartsAt position.
-  result = initTable[string, NifIndexEntry]()
-  let indexPos = indexStartsAt(s.r)
-  if indexPos <= 0:
-    return result
-  let contentPos = offset(s.r)  # Save position
-  s.r.jumpTo(indexPos)
-
-  var previousOffset = 0
-  var t = next(s)
-  let exportedTagId = pool.tags.getOrIncl("x")
-  if t.kind == ParLe and pool.tags[t.tagId] == ".index":
-    t = next(s)
-    while t.kind != EofToken and t.kind != ParRi:
-      if t.kind == ParLe:
-        let vis = if t.tagId == exportedTagId: Exported else: Hidden
-        let info = t.info
-        t = next(s)  # skip (kv
-        var key = ""
-        if t.kind == Symbol:
-          key = pool.syms[t.symId]
+    return
+  n.into:
+    while n.hasMore:
+      if n.isTagLit:
+        let t = n.cursorTagId
+        if t == TagId(ConverterIdx):
+          readSymbolSectionC(n, result.converters)
+        elif t == TagId(ExportIdx) or t == TagId(FromexportIdx) or
+             t == TagId(ExportexceptIdx):
+          let kind = cast[NifIndexKind](n.cursorTagId)
+          n.into:
+            assert n.isStringLit
+            let path = pool.strings[n.strId]
+            skip n
+            var names: seq[StrId] = @[]
+            while n.hasMore:
+              if n.isIdent: names.add n.strId
+              skip n
+            result.exports.add (path, kind, names)
+        elif globalTags.tags[t] == "checksum":
+          n.into:
+            if n.isStringLit: result.checksum = pool.strings[n.strId]
+            while n.hasMore: skip n
         else:
-          raiseAssert "invalid (kv) in .index: symbol expected"
-        t = next(s)  # skip symbol
-        if t.kind == IntLit:
-          let offset = int(pool.integers[t.intId]) + previousOffset
-          result[key] = NifIndexEntry(offset: offset, info: info, vis: vis)
-          previousOffset = offset
-        t = next(s)  # skip offset
-        if t.kind == ParRi:
-          t = next(s)  # skip )
+          skip n
       else:
-        t = next(s)
+        skip n
 
-  s.r.jumpTo(contentPos)  # Restore position
+proc readEmbeddedIndex*(r: var Reader): OrderedTable[string, NifIndexEntry] =
+  ## Reader-based twin of the classic streaming version (mirrors
+  ## `foreignmodules.readEmbeddedIndex`, but keeps visibility). ORDERED because
+  ## the overload sets built from it are iterated in table order, and a plain
+  ## `Table` does not agree with itself across builds of the compiler: nimony's
+  ## `Table` keeps its payload in a `seq` and iterates it in insertion order,
+  ## Nim's walks the bucket array. So a host-Nim built compiler and a
+  ## self-hosted one would list overloads differently. Each entry's
+  ## line-info suffix records the indexed decl's PARENT absolute info (written
+  ## relative to the `.index` head's root anchor when the file matches, see
+  ## `emitValueIndexed`); resolve it here so an index-jumped `parse` can seed
+  ## its parent stack with it — a decl whose file switch sits on an ancestor
+  ## node (e.g. code from an `include` file) would otherwise resolve file-less
+  ## relative infos to the module's own file.
+  result = initOrderedTable[string, NifIndexEntry]()
+  let indexPos = indexStartsAt(r)
+  if indexPos <= 0: return
+  let contentPos = offset(r)
+  r.jumpTo(indexPos)
+  var previousOffset = 0
+  var t = default(ExpandedToken)
+  next(r, t)                                   # `(.index`
+  if t.tk == ParLe and t.data == ".index":
+    var root = NoNifLineInfo
+    if t.filename.len != 0:
+      root = NifLineInfo(file: pool.filenames.getOrIncl(decodeFilename(t)),
+                         line: t.pos.line, col: t.pos.col)
+    next(r, t)
+    while t.tk != EofToken and t.tk != ParRi:
+      if t.tk == ParLe:
+        let vis = if t.data == "x": Exported else: Hidden
+        var parentInfo = NoNifLineInfo
+        if t.filename.len != 0:
+          parentInfo = NifLineInfo(file: pool.filenames.getOrIncl(decodeFilename(t)),
+                                   line: t.pos.line, col: t.pos.col)
+        elif root.file.isValid:
+          parentInfo = NifLineInfo(file: root.file,
+                                   line: root.line + t.pos.line,
+                                   col: root.col + t.pos.col)
+        next(r, t)                             # the symbol
+        var key = ""
+        if t.tk == Symbol: key = decodeStr(r, t)
+        next(r, t)                             # the (delta) offset
+        if t.tk == IntLit:
+          let off = int(decodeInt t) + previousOffset
+          if key.len > 0:
+            result[key] = NifIndexEntry(offset: off, parentInfo: parentInfo, vis: vis)
+          previousOffset = off
+        next(r, t)                             # closing `)`
+        if t.tk == ParRi: next(r, t)
+      else:
+        next(r, t)
+  r.jumpTo(contentPos)
 
 when isMainModule:
   import std / [os]

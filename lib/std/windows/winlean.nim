@@ -11,12 +11,13 @@ when defined(windows):
 
   # See https://docs.microsoft.com/en-us/windows/win32/winprog/windows-data-types
   type
-    # TODO: typedef PVOID HANDLE;
-    Handle* {.importc: "HANDLE", header: "<WinDef.h>", nodecl.} = distinct int
-    LONG* {.importc: "LONG", header: "<WinDef.h>".} = int32
+    # Plain Nim types, no `header: "<windef.h>"`: the Win API procs here are
+    # `dynlib` imports that nimony declares itself, so no Windows header is needed.
+    Handle* = distinct int
+    LONG* = int32
     WINBOOL* = distinct int32
       ## `WINBOOL` uses opposite convention as posix, !=0 meaning success.
-    DWORD* {.importc: "DWORD", header: "<WinDef.h>", nodecl.} = uint32
+    DWORD* = uint32
 
   let
     INVALID_HANDLE_VALUE* = cast[Handle](-1)
@@ -98,7 +99,7 @@ when defined(windows):
   func `==`*(x, y: Handle): bool {.borrow.}
   func isNil*(x: Handle): bool = x == Handle 0
 
-  func `==`(x, y: WINBOOL): bool {.borrow.}
+  func `==`*(x, y: WINBOOL): bool {.borrow.}
 
   func isFail*(x: WINBOOL): bool {.inline.} =
     ## Returns true if `x != 0`. Windows uses a different convention than POSIX,
@@ -109,24 +110,24 @@ when defined(windows):
     not isFail(a)
 
   proc closeHandle*(hObject: Handle): WINBOOL {.
-      importc: "CloseHandle", stdcall, header: "<Windows.h>".}
+      importc: "CloseHandle", stdcall, dynlib: "kernel32".}
   proc getLastError*(): int32 {.
-      importc: "GetLastError", stdcall, header: "<Windows.h>", sideEffect.}
+      importc: "GetLastError", stdcall, dynlib: "kernel32", sideEffect.}
   proc createFileW*(lpFileName: WideCString, dwDesiredAccess, dwShareMode: DWORD,
                     lpSecurityAttributes: nil pointer,
                     dwCreationDisposition, dwFlagsAndAttributes: DWORD,
                     hTemplateFile: Handle): Handle {.
-      importc: "CreateFileW", stdcall, header: "<Windows.h>".}
+      importc: "CreateFileW", stdcall, dynlib: "kernel32".}
   proc setEndOfFile*(hFile: Handle): WINBOOL {.
-      importc: "SetEndOfFile", stdcall, header: "<Windows.h>".}
+      importc: "SetEndOfFile", stdcall, dynlib: "kernel32".}
   proc setFilePointer*(hFile: Handle, lDistanceToMove: LONG,
                        lpDistanceToMoveHigh: ptr LONG,
                        dwMoveMethod: DWORD): DWORD {.
-      importc: "SetFilePointer", stdcall, header: "<Windows.h>".}
+      importc: "SetFilePointer", stdcall, dynlib: "kernel32".}
 
   proc getFileSize*(hFile: Handle, lpFileSizeHigh: ptr DWORD): DWORD {.
       importc: "GetFileSize",
-      stdcall, header: "<Windows.h>".}
+      stdcall, dynlib: "kernel32".}
 
   when defined(cpu32):
     type
@@ -139,15 +140,15 @@ when defined(windows):
                         dwFileOffsetHigh, dwFileOffsetLow: DWORD,
                         dwNumberOfBytesToMap: WinSizeT,
                         lpBaseAddress: nil pointer): nil pointer{.
-      importc: "MapViewOfFileEx", stdcall, header: "<Windows.h>".}
+      importc: "MapViewOfFileEx", stdcall, dynlib: "kernel32".}
   proc createFileMappingW*(hFile: Handle,
                            lpFileMappingAttributes: nil pointer,
                            flProtect, dwMaximumSizeHigh: DWORD,
                            dwMaximumSizeLow: DWORD,
                            lpName: nil pointer): Handle {.
-      importc: "CreateFileMappingW", stdcall, header: "<Windows.h>".}
+      importc: "CreateFileMappingW", stdcall, dynlib: "kernel32".}
   proc unmapViewOfFile*(lpBaseAddress: nil pointer): WINBOOL {.
-      importc: "UnmapViewOfFile", stdcall, header: "<Windows.h>".}
+      importc: "UnmapViewOfFile", stdcall, dynlib: "kernel32".}
 
 
   type
@@ -216,6 +217,17 @@ when defined(windows):
   proc getCommandLineW*(): WideCString {.importc: "GetCommandLineW",
     stdcall, dynlib: "kernel32", sideEffect.}
 
+  proc getEnvironmentStringsW*(): WideCString {.
+    importc: "GetEnvironmentStringsW", stdcall, dynlib: "kernel32", sideEffect.}
+    ## The whole environment as one block of NUL-separated `KEY=VALUE` strings,
+    ## terminated by a second NUL. Release it with `freeEnvironmentStringsW`.
+  proc freeEnvironmentStringsW*(env: WideCString): WINBOOL {.
+    importc: "FreeEnvironmentStringsW", stdcall, dynlib: "kernel32", sideEffect.}
+  proc setEnvironmentVariableW*(name: WideCString;
+                                value: nil WideCString): WINBOOL {.
+    importc: "SetEnvironmentVariableW", stdcall, dynlib: "kernel32", sideEffect.}
+    ## A nil `value` deletes the variable.
+
   proc sleep*(dwMilliseconds: DWORD) {.importc: "Sleep", stdcall, dynlib: "kernel32", sideEffect.}
 
   proc getSystemTimeAsFileTime*(lpSystemTimeAsFileTime: var FILETIME) {.
@@ -241,8 +253,23 @@ when defined(windows):
                         flags: DWORD): int32 {.
     importc:"CreateSymbolicLinkW", dynlib: "kernel32", stdcall, sideEffect.}
   proc createHardLinkW*(lpFileName, lpExistingFileName: WideCString,
-                        security: pointer=nil): int32 {.
+                        security: nil pointer=nil): int32 {.
     importc:"CreateHardLinkW", dynlib: "kernel32", stdcall, sideEffect.}
+
+  # -------- Reparse points (symlinks / junctions) for std/private/ossymlinks --------
+  const
+    IO_REPARSE_TAG_MOUNT_POINT* = 0xA0000003'u32
+    IO_REPARSE_TAG_SYMLINK* = 0xA000000C'u32
+    MAXIMUM_REPARSE_DATA_BUFFER_SIZE* = 16 * 1024
+    SYMLINK_FLAG_RELATIVE* = 0x1'u32
+    FSCTL_GET_REPARSE_POINT* = 0x000900A8'u32
+
+  proc deviceIoControl*(hDevice: Handle, dwIoControlCode: DWORD,
+                        lpInBuffer: nil pointer, nInBufferSize: DWORD,
+                        lpOutBuffer: nil pointer, nOutBufferSize: DWORD,
+                        lpBytesReturned: var DWORD,
+                        lpOverlapped: nil pointer): WINBOOL {.
+    importc: "DeviceIoControl", dynlib: "kernel32", stdcall, sideEffect.}
 
   # -------- Process / pipe / synchronization bindings for std/osproc --------
   const
@@ -361,6 +388,10 @@ when defined(windows):
                   lpOverlapped: nil pointer): WINBOOL {.
     importc: "WriteFile", stdcall, dynlib: "kernel32", sideEffect.}
 
+  proc getConsoleMode*(hConsoleHandle: Handle; lpMode: ptr DWORD): WINBOOL {.
+    importc: "GetConsoleMode", stdcall, dynlib: "kernel32", sideEffect.}
+    ## Succeeds only for console (terminal) handles; used as an `isatty` probe.
+
   proc createProcessW*(lpApplicationName: nil WideCString;
                       lpCommandLine: WideCString;
                       lpProcessAttributes: nil pointer;
@@ -391,3 +422,52 @@ when defined(windows):
     importc: "SuspendThread", stdcall, dynlib: "kernel32", sideEffect.}
   proc resumeThread*(hThread: Handle): DWORD {.
     importc: "ResumeThread", stdcall, dynlib: "kernel32", sideEffect.}
+
+  # -------- Console bindings for std/terminal --------
+  const
+    ENABLE_VIRTUAL_TERMINAL_PROCESSING* = 0x0004'u32
+
+  type
+    COORD* {.pure.} = object
+      x*: int16
+      y*: int16
+
+    SMALL_RECT* {.pure.} = object
+      left*: int16
+      top*: int16
+      right*: int16
+      bottom*: int16
+
+    CONSOLE_SCREEN_BUFFER_INFO* {.pure.} = object
+      dwSize*: COORD
+      dwCursorPosition*: COORD
+      wAttributes*: uint16
+      srWindow*: SMALL_RECT
+      dwMaximumWindowSize*: COORD
+
+    CONSOLE_CURSOR_INFO* {.pure.} = object
+      dwSize*: DWORD
+      bVisible*: WINBOOL
+
+  proc setConsoleMode*(hConsoleHandle: Handle; dwMode: DWORD): WINBOOL {.
+    importc: "SetConsoleMode", stdcall, dynlib: "kernel32", sideEffect.}
+  proc getConsoleScreenBufferInfo*(hConsoleOutput: Handle;
+      lpConsoleScreenBufferInfo: ptr CONSOLE_SCREEN_BUFFER_INFO): WINBOOL {.
+    importc: "GetConsoleScreenBufferInfo", stdcall, dynlib: "kernel32", sideEffect.}
+  proc getConsoleCursorInfo*(hConsoleOutput: Handle;
+      lpConsoleCursorInfo: ptr CONSOLE_CURSOR_INFO): WINBOOL {.
+    importc: "GetConsoleCursorInfo", stdcall, dynlib: "kernel32", sideEffect.}
+  proc setConsoleCursorInfo*(hConsoleOutput: Handle;
+      lpConsoleCursorInfo: ptr CONSOLE_CURSOR_INFO): WINBOOL {.
+    importc: "SetConsoleCursorInfo", stdcall, dynlib: "kernel32", sideEffect.}
+  proc setConsoleCursorPosition*(hConsoleOutput: Handle;
+      dwCursorPosition: COORD): WINBOOL {.
+    importc: "SetConsoleCursorPosition", stdcall, dynlib: "kernel32", sideEffect.}
+  proc fillConsoleOutputCharacterW*(hConsoleOutput: Handle; cCharacter: uint16;
+      nLength: DWORD; dwWriteCoord: COORD;
+      lpNumberOfCharsWritten: ptr DWORD): WINBOOL {.
+    importc: "FillConsoleOutputCharacterW", stdcall, dynlib: "kernel32", sideEffect.}
+  proc fillConsoleOutputAttribute*(hConsoleOutput: Handle; wAttribute: uint16;
+      nLength: DWORD; dwWriteCoord: COORD;
+      lpNumberOfAttrsWritten: ptr DWORD): WINBOOL {.
+    importc: "FillConsoleOutputAttribute", stdcall, dynlib: "kernel32", sideEffect.}

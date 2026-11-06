@@ -38,13 +38,15 @@ func ssLenOf(bytes: uint): int {.inline.} =
     int(bytes and 0xFF'u)
 
 template ssLen(s: string): int =
-  ## Reads slen via a byte load at offset 0. Keeps slen access visibly distinct
-  ## from char writes at offsets 1+ so the C compiler can cache slen across loops.
-  int(cast[ptr byte](addr s.bytes)[])
+  ## Slen from the `bytes` word. A field load (not `addr s.bytes`) so SROA can
+  ## explode an inlined by-value copy `var tmp = s` into a `bytes` scalar;
+  ## `ssLenOf` is then a register mask.
+  ssLenOf(s.bytes)
 
 template setSSLen(s: var string; v: int) =
   ## Writes slen to byte 0 of `bytes`.
-  cast[ptr byte](addr s.bytes)[] = cast[byte](v)
+  {.cast(noSideEffect).}: # writes into `s` itself, through its address
+    cast[ptr byte](addr s.bytes)[] = cast[byte](v)
 
 template inlinePtr(s: string): ptr UncheckedArray[char] =
   ## Read-only pointer to the inline char storage (offset +1 from `bytes`).
@@ -53,6 +55,11 @@ template inlinePtr(s: string): ptr UncheckedArray[char] =
 template inlinePtrV(s: var string): ptr UncheckedArray[char] =
   ## Mutable pointer to the inline char storage (offset +1 from `bytes`).
   cast[ptr UncheckedArray[char]](cast[uint](addr s.bytes) + 1'u)
+
+template setInline(s: var string; i: int; c: char) =
+  ## Writes the inline char at `i`.
+  {.cast(noSideEffect).}: # writes into `s` itself, through its address
+    inlinePtrV(s)[i] = c
 
 template inlinePtrAt(s: var string; offset: int): pointer =
   ## Mutable pointer to inline char at `offset` (avoids addr-of-template-index issues).
@@ -69,12 +76,17 @@ func rawData(s {.byref.}: string): ptr UncheckedArray[char] {.inline.} =
 
 # ---- length ----
 
-func len*(s: string): int {.inline, semantics: "string.len", ensures: (0 <= result).} =
+func len*(s: string): int {.alwaysInline, semantics: "string.len",
+    ensures: (0 <= result and result <= MaxContainerLen).} =
   result = ssLen(s)
   if result > PayloadSize:
     result = s.more.fullLen
+  # A length is never negative: `ssLen` is one byte of the header, and `fullLen`
+  # is only ever set from a non-negative length within the capacity. Nor is it
+  # past `MaxContainerLen`: `allocLong` refuses such a capacity.
+  {.assume: 0 <= result and result <= MaxContainerLen.}
 
-func high*(s: string): int {.inline.} = len(s) - 1
+func high*(s: string): int {.alwaysInline.} = len(s) - 1
 func low*(s: string): int {.inline.} = 0
 
 func capacity*(s: string): int =
@@ -87,10 +99,139 @@ func isOom*(s: string): bool {.inline.} =
   ## True if `s` is the OOM marker (set by string ops on allocation failure).
   s.bytes == OomBytes
 
+# ---- hashing ----
+#
+# `std/hashes` cannot see this representation and `system` cannot import
+# `std/hashes`, so the mixing steps are restated here. THEY MUST STAY IN LOCK-STEP
+# WITH `hashes.!&` AND `hashes.!$` — `hash(string)` is just an inline shim for
+# `hashStr`, and two different mixes would silently split every table.
+
+template hashMix(h: uint; val: uint): uint =
+  ## The `!&` step of `std/hashes`.
+  var r = h + val
+  r = r + (r shl 10)
+  r = r xor (r shr 6)
+  r
+
+template hashFinish(h: uint): uint =
+  ## The `!$` step of `std/hashes`.
+  var r = h + h shl 3
+  r = r xor (r shr 11)
+  r = r + r shl 15
+  r
+
+template dropSlen(w: uint): uint =
+  ## Shift `slen` out of the `bytes` word, leaving char 0 where `charAt(..., 0)`
+  ## reads it. Byte 0 of `bytes` is `slen`, so the chars sit at memory offsets
+  ## 1.. — ascending bits little-endian, descending big-endian.
+  when defined(bigEndian): w shl 8
+  else: w shr 8
+
+template charAt(w: uint; shift: uint): uint =
+  ## Byte at bit `shift` of a dropSlen'd prefix word (or of a medium `more`
+  ## word). `shift` must be a literal (`0`, `8`, `16`, …) so arkham emits
+  ## `shr imm`. `i * 8` becomes `shr cl` — the `nextChar` problem in another
+  ## shape. Independent extracts; GCC peels a `nextChar` chain into this form
+  ## and we don't.
+  (w shr shift) and 0xFF'u
+
+template mixN(h: untyped; w: uint; n: int) =
+  ## Mix `n` chars (`0 .. AlwaysAvail`) out of word `w`. Unrolled: each `charAt`
+  ## is a constant shift. A counted loop would be `shr cl`.
+  let ww = w
+  let nn = n
+  when defined(bigEndian):
+    when sizeof(uint) == 8:
+      if nn >= 1: h = hashMix(h, charAt(ww, 56'u))
+      if nn >= 2: h = hashMix(h, charAt(ww, 48'u))
+      if nn >= 3: h = hashMix(h, charAt(ww, 40'u))
+      if nn >= 4: h = hashMix(h, charAt(ww, 32'u))
+      if nn >= 5: h = hashMix(h, charAt(ww, 24'u))
+      if nn >= 6: h = hashMix(h, charAt(ww, 16'u))
+      if nn >= 7: h = hashMix(h, charAt(ww, 8'u))
+    else:
+      if nn >= 1: h = hashMix(h, charAt(ww, 24'u))
+      if nn >= 2: h = hashMix(h, charAt(ww, 16'u))
+      if nn >= 3: h = hashMix(h, charAt(ww, 8'u))
+  else:
+    if nn >= 1: h = hashMix(h, ww and 0xFF'u)
+    if nn >= 2: h = hashMix(h, charAt(ww, 8'u))
+    if nn >= 3: h = hashMix(h, charAt(ww, 16'u))
+    when sizeof(uint) == 8:
+      if nn >= 4: h = hashMix(h, charAt(ww, 24'u))
+      if nn >= 5: h = hashMix(h, charAt(ww, 32'u))
+      if nn >= 6: h = hashMix(h, charAt(ww, 40'u))
+      if nn >= 7: h = hashMix(h, charAt(ww, 48'u))
+
+template mixAlwaysAvail(h: untyped; w: uint) =
+  ## All `AlwaysAvail` prefix chars. No length tests — every non-short string
+  ## has them. Independent `charAt`s from the same word.
+  let ww = w
+  when defined(bigEndian):
+    when sizeof(uint) == 8:
+      h = hashMix(h, charAt(ww, 56'u))
+      h = hashMix(h, charAt(ww, 48'u))
+      h = hashMix(h, charAt(ww, 40'u))
+      h = hashMix(h, charAt(ww, 32'u))
+      h = hashMix(h, charAt(ww, 24'u))
+      h = hashMix(h, charAt(ww, 16'u))
+      h = hashMix(h, charAt(ww, 8'u))
+    else:
+      h = hashMix(h, charAt(ww, 24'u))
+      h = hashMix(h, charAt(ww, 16'u))
+      h = hashMix(h, charAt(ww, 8'u))
+  else:
+    h = hashMix(h, ww and 0xFF'u)
+    h = hashMix(h, charAt(ww, 8'u))
+    h = hashMix(h, charAt(ww, 16'u))
+    when sizeof(uint) == 8:
+      h = hashMix(h, charAt(ww, 24'u))
+      h = hashMix(h, charAt(ww, 32'u))
+      h = hashMix(h, charAt(ww, 40'u))
+      h = hashMix(h, charAt(ww, 48'u))
+
+func hashStrLong(v: uint; sl: int; more: ptr LongString): uint {.noinline.} =
+  ## Medium tail (`more` is a char word, not a pointer) and heap/static tail.
+  ## `{.noinline.}` so splicing this into every intern site does not bloat
+  ## `getOrIncl`. The short path never calls it.
+  result = 0'u
+  if sl <= PayloadSize:
+    mixAlwaysAvail(result, v)
+    mixN(result, cast[uint](more), sl - AlwaysAvail)
+  else:
+    # Prefix cache is valid only up to `fullLen` — `shrink` leaves stale bytes
+    # in `bytes` past the logical length.
+    let n = more.fullLen
+    if n <= AlwaysAvail:
+      mixN(result, v, n)
+    else:
+      mixAlwaysAvail(result, v)
+      let p = cast[ptr UncheckedArray[char]](
+        cast[uint](more) + uint(LongStringDataOffset))
+      var i = AlwaysAvail
+      while i < n:
+        result = hashMix(result, uint(p[i]))
+        inc i
+
+func hashStr*(s: string): uint {.alwaysInline, noSideEffect, raises: [], tags: [].} =
+  ## Hash of `s`'s bytes. The VALUE is mixing the chars one at a time (`!&`/`!$`);
+  ## the fetch is the prefix word the ABI already has. Short strings stay in this
+  ## wrapper (`charAt` of `bytes`). Longer ones call `hashStrLong` for the tail.
+  ## By-value and `{.alwaysInline.}` so intern does not call out or take an
+  ## address of the 16-byte string.
+  let w = s.bytes
+  let sl = ssLenOf(w)
+  result = 0'u
+  if sl <= AlwaysAvail:
+    mixN(result, dropSlen(w), sl)
+  else:
+    result = hashStrLong(dropSlen(w), sl, s.more)
+  result = hashFinish(result)
+
 # ---- read-only raw data API (public, safe for external callers) ----
 
 func readRawData*(s {.byref.}: string; start = 0): ptr UncheckedArray[char]
-    {.inline, noSideEffect, raises: [], tags: [].} =
+    {.alwaysInline, noSideEffect, raises: [], tags: [].} =
   ## Returns a read-only pointer to s[start].
   ## For inline strings, the pointer is into s's inline storage;
   ## s must remain alive while the pointer is used.
@@ -99,15 +240,73 @@ func readRawData*(s {.byref.}: string; start = 0): ptr UncheckedArray[char]
   else:
     result = cast[ptr UncheckedArray[char]](cast[uint](inlinePtr(s)) + uint(start))
 
+# ---- iteration ----
+
+iterator items*(s: string): char {.inline.} =
+  ## Walks `s`'s bytes.
+  ##
+  ## Without this overload `for c in s` binds to `openArray.items` through an
+  ## implicit `string`→`openArray` conversion, and then pays a bounds-checked
+  ## `a[i]` per byte — a call the native backend does not inline, ~34
+  ## instructions each, millions of them per emitted module. Resolving the
+  ## payload pointer ONCE and indexing it raw is the whole win; the bound is
+  ## `0 ..< len(s)` either way, so no check is being skipped, only hoisted.
+  ##
+  ## As with `readRawData`, the pointer is captured up front: growing `s` from
+  ## inside the loop body can reallocate it and invalidate the walk. That was
+  ## already true of the `openArray` view this replaces.
+  let n = len(s)
+  if n > 0:
+    let p = readRawData(s)
+    var i = 0
+    while i < n:
+      yield p[i]
+      inc i
+
+iterator pairs*(s: string): (int, char) {.inline.} =
+  ## `items` with the index, on the same single payload pointer.
+  let n = len(s)
+  if n > 0:
+    let p = readRawData(s)
+    var i = 0
+    while i < n:
+      yield (i, p[i])
+      inc i
+
 # ---- lifecycle hooks ----
 
 func `=wasMoved`*(s: var string) {.exportc: "nimStrWasMoved", inline.} =
   s.bytes = 0
 
-func `=destroy`*(s: string) {.exportc: "nimStrDestroy", inline.} =
+func destroyHeapStr(more: ptr LongString) {.noinline.} =
+  ## The cold half of `=destroy`. Only a HEAP string reaches here, and on the
+  ## compiler's own workload that is 0.17% of destroys — so this is the same
+  ## split, for the same reason, as `hashStr`/`hashStrLong` above.
+  ##
+  ## The size is the whole point. `arcDec` is `{.inline.}`, so by the time the
+  ## inliner scores `=destroy` its body has already absorbed the atomic
+  ## acquire-load plus the LL/SC decrement loop — well past `InlineTinyBound`
+  ## (100 tokens), which is why `=destroy` stayed an out-of-line call at every
+  ## site despite carrying `{.inline.}` (a pragma `computeInlineInfo`
+  ## deliberately does not consult; only `.alwaysInline` is). Splitting the
+  ## check from the tail is what makes the half that is worth splicing small
+  ## enough to splice.
+  ##
+  ## `ptr LongString` rather than `string`: a `string` parameter would drag the
+  ## lifecycle hooks back into the cold half, which is the thing being escaped.
+  {.cast(noSideEffect).}:
+    if arcDec(more.rc):
+      dealloc(more)
+
+func `=destroy`*(s: string) {.exportc: "nimStrDestroy", alwaysInline.} =
+  ## The check, and nothing else. Out of line this costs a `bl` and — on
+  ## AArch64, where `bl` clobbers the link register — a frame in the callee for
+  ## the sole benefit of a branch that is not taken: measured on `nifbench`,
+  ## 788,157 calls of which 3 reached `dealloc`, and 1,576,308 of the 1,576,314
+  ## instructions spent saving and restoring `lr` were on paths that never
+  ## called anything.
   if ssLen(s) == HeapSlen:
-    if arcDec(s.more.rc):
-      dealloc(s.more)
+    destroyHeapStr(s.more)
 
 func `=copy`*(dest: var string; src: string) {.exportc: "nimStrCopy", nodestroy.} =
   let ssrc = ssLen(src)
@@ -126,12 +325,14 @@ func `=copy`*(dest: var string; src: string) {.exportc: "nimStrCopy", nodestroy.
       if arcDec(dest.more.rc):
         dealloc(dest.more)
     if ssrc == HeapSlen:
-      arcInc(src.more.rc)
+      {.cast(noSideEffect).}:
+        arcInc(src.more.rc)
     copyMem(addr dest.bytes, addr src.bytes, sizeof(string))
 
 func `=dup`*(s: string): string {.exportc: "nimStrDup", inline, nodestroy.} =
   if ssLenOf(s.bytes) == HeapSlen:
-    arcInc(s.more.rc)
+    {.cast(noSideEffect).}:
+      arcInc(s.more.rc)
   result = string(bytes: s.bytes, more: s.more)
 
 # ---- cstring length ----
@@ -145,9 +346,33 @@ when defined(nimNativeIo):
 else:
   func strlen(a: cstring): csize_t {.importc: "strlen", header: "<string.h>".}
 
-func len*(a: cstring): int {.inline.} =
-  if a == nil: 0
-  else: a.strlen.int
+func len*(a: cstring): int {.inline, ensures: (0 <= result and result <= MaxContainerLen).} =
+  if a == nil: result = 0
+  else:
+    result = a.strlen.int
+    # `strlen` counts bytes of one block in the address space, which holds
+    # less than `MaxContainerLen` of them.
+    {.assume: 0 <= result and result <= MaxContainerLen.}
+
+func allocLong(cap: int): ptr LongString {.inline.} =
+  ## A block for a long string of capacity `cap`, nil on failure. A capacity past
+  ## `MaxContainerLen` fails like an exhausted heap: that is what bounds `len`
+  ## (and keeps the header offset from wrapping).
+  if cap > MaxContainerLen: result = nil
+  else: result = cast[ptr LongString](alloc(LongStringDataOffset + cap))
+
+func growCap(newLen, grown: int): int {.inline.} =
+  ## `grown` (a growth policy's answer, at least `newLen`) without letting the
+  ## policy alone push a valid length past `MaxContainerLen`.
+  result = grown
+  if result > MaxContainerLen and newLen <= MaxContainerLen: result = MaxContainerLen
+
+func initLongString(p: ptr LongString; len, cap: int) {.inline.} =
+  ## Sets up the header of a freshly allocated, not yet shared block.
+  {.cast(noSideEffect).}:
+    p.rc = 0
+    p.fullLen = len
+    p.capImpl = cap
 
 # ---- internal growth helpers ----
 
@@ -163,20 +388,21 @@ func ensureUniqueLong(s: var string; oldLen, newLen: int) =
   let cap = if isHeap: s.more.capImpl else: 0
   if isHeap and arcIsUnique(s.more.rc) and newLen <= cap:
     s.more.fullLen = newLen
-    # Sync inline cache even on fast path (use oldLen since new data may not exist yet)
-    copyMem(inlinePtrV(s), addr s.more.data[0], min(oldLen, AlwaysAvail))
+    # Prefix already matches the heap once the string is long; recopying it on
+    # every append (via `copyMem` of a runtime 0..7) dominated bif.
+    if oldLen < AlwaysAvail:
+      copyMem(inlinePtrV(s), addr s.more.data[0], oldLen)
   else:
-    let newCap = if newLen > cap: max(newLen, ssResize(cap)) else: cap
-    let p = cast[ptr LongString](alloc(LongStringDataOffset + newCap))
+    let newCap = if newLen > cap: growCap(newLen, max(newLen, ssResize(cap))) else: cap
+    let p = allocLong(newCap)
     if p != nil:
-      p.rc = 0
-      p.fullLen = newLen
-      p.capImpl = newCap
+      initLongString(p, newLen, newCap)
       if isHeap:
         let old = s.more
         copyMem(addr p.data[0], addr old.data[0], min(oldLen, newCap))
-        if arcDec(old.rc):
-          dealloc(old)
+        {.cast(noSideEffect).}:
+          if arcDec(old.rc):
+            dealloc(old)
       else:
         # Static long string: full data lives in s.more.data; the inline
         # cache only holds the first AlwaysAvail bytes, so reading from it
@@ -188,15 +414,23 @@ func ensureUniqueLong(s: var string; oldLen, newLen: int) =
       # Sync inline cache after creating new block (use oldLen since new data may not exist yet)
       copyMem(inlinePtrV(s), addr p.data[0], min(oldLen, AlwaysAvail))
     else:
+      # `s` becomes the OOM cookie, so release what it is holding first: only
+      # the heap case owns anything (a static long string is never freed, a
+      # short/medium one keeps its chars inline), and `arcDec` covers both the
+      # unique owner and a shared one exactly as the success path above does.
+      # Dropping the pointer instead would leak a block at the one moment
+      # memory is known to be scarce.
+      if isHeap:
+        let old = s.more
+        {.cast(noSideEffect).}:
+          if arcDec(old.rc): dealloc(old)
       strOom s, LongStringDataOffset + newCap
 
 func transitionToLong(s: var string; sl: int; newLen: int) =
-  let newCap = max(newLen, ssResize(newLen))
-  let p = cast[ptr LongString](alloc(LongStringDataOffset + newCap))
+  let newCap = growCap(newLen, max(newLen, ssResize(newLen)))
+  let p = allocLong(newCap)
   if p != nil:
-    p.rc = 0
-    p.fullLen = newLen
-    p.capImpl = newCap
+    initLongString(p, newLen, newCap)
     copyMem(addr p.data[0], inlinePtrV(s), sl)
     s.more = p
     setSSLen(s, HeapSlen)
@@ -221,24 +455,34 @@ func readRawDataStable*(s: var string; start = 0): ptr UncheckedArray[char] =
 
 # ---- mutation helpers ----
 
-func prepareMutation*(s: var string) =
-  ## Ensures s's data is uniquely owned (not shared with another string or static).
+func makeUnique(s: var string): bool =
+  ## `prepareMutation`, telling whether `s` may now be written in place:
+  ## `false` when the private copy was refused and `s` is the OOM marker.
+  result = true
   let sl = ssLen(s)
   if sl == StaticSlen or (sl == HeapSlen and not arcIsUnique(s.more.rc)):
     if sl == HeapSlen:
+      # Reached only when `not arcIsUnique`, i.e. the count is non-zero and
+      # another owner remains to free the block. That guard is what makes
+      # discarding the result safe: `arcDec` may answer "you are the last one"
+      # without writing the decrement back, and here nobody would act on it.
       discard arcDec(s.more.rc)
     let old = s.more
     let oldLen = old.fullLen
-    let p = cast[ptr LongString](alloc(LongStringDataOffset + oldLen))
+    let p = allocLong(oldLen)
     if p != nil:
-      p.rc = 0
-      p.fullLen = oldLen
-      p.capImpl = oldLen
+      initLongString(p, oldLen, oldLen)
       copyMem(addr p.data[0], addr old.data[0], oldLen)
       s.more = p
       setSSLen(s, HeapSlen)
     else:
       strOom s, LongStringDataOffset + oldLen
+      result = false
+
+func prepareMutation*(s: var string) =
+  ## Ensures s's data is uniquely owned (not shared with another string or static).
+  ## On allocation failure `s` becomes the OOM marker (see `isOom`).
+  discard makeUnique(s)
 
 # ---- beginStore / endStore for bulk writes ----
 
@@ -248,6 +492,9 @@ func beginStore*(s: var string; newLen: int; start = 0): ptr UncheckedArray[char
   ## ownership, and returns a pointer to s[start] for bulk writing.
   ## Call endStore(s) after writing to sync the inline cache.
   ## To keep the current length, pass `s.len`.
+  ##
+  ## Returns `nil` when the storage could not be allocated: `s` is then the
+  ## OOM marker (see `isOom`) and nothing may be written.
   let sl = ssLen(s)
   let curLen = if sl > PayloadSize: s.more.fullLen else: sl
   if newLen <= PayloadSize and sl <= PayloadSize:
@@ -255,14 +502,21 @@ func beginStore*(s: var string; newLen: int; start = 0): ptr UncheckedArray[char
     if newLen != curLen:
       setSSLen(s, newLen)
     result = cast[ptr UncheckedArray[char]](cast[uint](inlinePtrV(s)) + uint(start))
-  elif sl <= PayloadSize:
-    # Inline/medium → long.
-    transitionToLong(s, curLen, newLen)
-    result = cast[ptr UncheckedArray[char]](cast[uint](addr s.more.data[0]) + uint(start))
   else:
-    # Already long: resize within heap (no transition back to inline).
-    ensureUniqueLong(s, curLen, newLen)
-    result = cast[ptr UncheckedArray[char]](cast[uint](addr s.more.data[0]) + uint(start))
+    if sl <= PayloadSize:
+      # Inline/medium → long.
+      transitionToLong(s, curLen, newLen)
+    else:
+      # Already long: resize within heap (no transition back to inline).
+      ensureUniqueLong(s, curLen, newLen)
+    # Both leave `s` long with a block, or -- refused -- the inline OOM marker
+    # with `more` set to nil, and an address computed from that would point at
+    # nothing.
+    let m = s.more
+    if m != nil:
+      result = cast[ptr UncheckedArray[char]](addr m.data[start])
+    else:
+      result = nil
 
 func endStore*(s: var string) {.inline, noSideEffect, raises: [], tags: [].} =
   ## Syncs the hot prefix cache after a bulk write via beginStore.
@@ -276,7 +530,7 @@ func add*(s: var string; c: char) =
   let sl = ssLen(s)
   if sl < PayloadSize:
     let newLen = sl + 1
-    inlinePtrV(s)[sl] = c
+    setInline(s, sl, c)
     setSSLen(s, newLen)
   elif sl > PayloadSize:
     let l = s.more.fullLen
@@ -284,14 +538,14 @@ func add*(s: var string; c: char) =
       s.more.data[l] = c
       s.more.fullLen = l + 1
       if l < AlwaysAvail:
-        inlinePtrV(s)[l] = c
+        setInline(s, l, c)
     else:
       let oldLen = s.more.fullLen
       ensureUniqueLong(s, oldLen, oldLen + 1)
       if ssLen(s) == HeapSlen:
         s.more.data[oldLen] = c
         if oldLen < AlwaysAvail:
-          inlinePtrV(s)[oldLen] = c
+          setInline(s, oldLen, c)
   else:
     # sl == PayloadSize → transition to long
     transitionToLong(s, sl, sl + 1)
@@ -360,11 +614,12 @@ func shrink*(s: var string; newLen: int) =
     else:
       # Heap or static: keep the buffer allocated, just update fullLen.
       # Avoids alloc/dealloc flip-flops when callers shrink and then grow.
-      # `prepareMutation` promotes a static literal into a heap copy if we
-      # are about to mutate, so `s.more.fullLen = newLen` is safe afterwards.
-      prepareMutation(s)
-      s.more.fullLen = newLen
-      copyMem(inlinePtrV(s), addr s.more.data[0], min(newLen, AlwaysAvail))
+      # `makeUnique` promotes a static literal into a heap copy if we are
+      # about to mutate, so `s.more.fullLen = newLen` is safe afterwards. On
+      # refusal `s` is already the (shorter) OOM marker, with no `more`.
+      if makeUnique(s):
+        s.more.fullLen = newLen
+        copyMem(inlinePtrV(s), addr s.more.data[0], min(newLen, AlwaysAvail))
 
 func setLen*(s: var string; newLen: int) =
   if newLen <= s.len:
@@ -400,17 +655,23 @@ func setLen*(s: var string; newLen: int) =
 
 # ---- indexing ----
 
-func `[]`*(s: string; i: int): char {.requires: (i < len(s) and i >= 0), inline.} =
+func `[]`*(s: string; i: int): char {.requires: (i < len(s) and i >= 0), alwaysInline.} =
   if ssLen(s) > PayloadSize: s.more.data[i]
   else: inlinePtr(s)[i]
 
-func `[]=`*(s: var string; i: int; c: char) {.requires: (i < len(s) and i >= 0), inline.} =
-  prepareMutation(s)
-  if ssLen(s) > PayloadSize:
-    s.more.data[i] = c
-    if i < AlwaysAvail: inlinePtrV(s)[i] = c
-  else:
-    inlinePtrV(s)[i] = c
+func `[]=`*(s: var string; i: int; c: char) {.requires: (i < len(s) and i >= 0),
+    ensures: len(s) == old(len(s)), inline.} =
+  # A refused copy leaves the 7-char OOM marker, which `i` may lie past.
+  if makeUnique(s):
+    if ssLen(s) > PayloadSize:
+      s.more.data[i] = c
+      if i < AlwaysAvail: setInline(s, i, c)
+    else:
+      setInline(s, i, c)
+  # A character is written into the payload; the length lives in the header
+  # byte and in `fullLen`, which neither write reaches, and `makeUnique`
+  # copies a shared payload without changing its length.
+  {.assume: len(s) == old(len(s)).}
 
 # ---- substr / slicing ----
 
@@ -431,11 +692,9 @@ func substr*(s: string; first, last: int): string =
     setSSLen(result, newLen)
     copyMem(inlinePtrV(result), cast[pointer](cast[uint](src) + uint(f)), newLen)
   else:
-    let p = cast[ptr LongString](alloc(LongStringDataOffset + newLen))
+    let p = allocLong(newLen)
     if p != nil:
-      p.rc = 0
-      p.fullLen = newLen
-      p.capImpl = newLen
+      initLongString(p, newLen, newLen)
       copyMem(addr p.data[0], cast[pointer](cast[uint](src) + uint(f)), newLen)
       result.more = p
       setSSLen(result, HeapSlen)
@@ -449,9 +708,9 @@ func substr*(s: string; first = 0): string =
 
 # ---- SWAR / comparison helpers ----
 
-func bswap64(x: uint64): uint64 {.importc: "__builtin_bswap64", nodecl, noSideEffect.}
-func ctz64(x: uint64): int32  {.importc: "__builtin_ctzll",   nodecl, noSideEffect.}
-func clz64(x: uint64): int32  {.importc: "__builtin_clzll",   nodecl, noSideEffect.}
+proc bswap64(x: uint64): uint64 {.intrinsic: "Bswap", noSideEffect.}
+proc ctz64(x: uint64): int32    {.intrinsic: "Ctz", noSideEffect.}
+proc clz64(x: uint64): int32    {.intrinsic: "Clz", noSideEffect.}
 
 func bswap(x: uint): uint {.inline.} = uint(bswap64(uint64(x)))
 func ctzImpl(x: uint): int {.inline.} = int(ctz64(uint64(x)))
@@ -564,30 +823,100 @@ func cmpStringPtrs(a, b: ptr string): int =
 
 # ---- comparison ----
 
-func equalStrings(a, b: string): bool =
+func prefixMaskImplLE(n: int): uint {.inline.} =
+  if n <= 0: 0'u
+  elif n >= AlwaysAvail: (not 0'u) shr 8              # every char byte, slen dropped
+  else: (1'u shl uint(n * 8)) - 1'u
+
+func prefixMaskImplBE(n: int): uint {.inline.} =
+  if n <= 0: 0'u
+  elif n >= AlwaysAvail: (not 0'u) shl 8
+  else: not ((1'u shl uint(sizeof(uint) * 8 - n * 8)) - 1'u)
+
+func prefixMask(n: int): uint {.inline.} =
+  ## Selects the first `n` chars of a `dropSlen`'d word. LE keeps the low bytes,
+  ## BE the high ones — the same split `zeroSwarPadImpl` makes.
+  when defined(bigEndian): prefixMaskImplBE(n)
+  else: prefixMaskImplLE(n)
+
+func equalStringsLong(a, b: string): bool {.noinline.} =
+  ## Length, then prefix, then tail. The prefix compare is MASKED to the logical
+  ## length, and that is load-bearing: the prefix cache in `bytes` is only valid
+  ## up to `fullLen` (`hashStrLong` says so in as many words — a shrink or an
+  ## in-place reuse leaves the older content's bytes above the length). Comparing
+  ## the whole word instead made a heap "hello" carrying a stale `ed` in bytes 5-6
+  ## compare UNEQUAL to the literal "hello", whose pad is zero — `toString` round
+  ## trips and `strutils` both failed on it.
+  ##
+  ## Native (no libc `memcmp`): a qword mismatch is `false` immediately.
+  ## Arkham's `memcmp` then byte-rescans those eight bytes to produce a signed
+  ## order `==` never uses. The C backend keeps `cmpMem` (glibc SIMD).
+  let aslen = ssLenOf(a.bytes)
+  let bslen = ssLenOf(b.bytes)
+  let la = if aslen > PayloadSize: a.more.fullLen else: aslen
+  let lb = if bslen > PayloadSize: b.more.fullLen else: bslen
+  if la != lb: return false
+  let m = prefixMask(min(la, AlwaysAvail))
+  if (dropSlen(a.bytes) and m) != (dropSlen(b.bytes) and m): return false
+  if la <= AlwaysAvail: return true
+  if aslen <= PayloadSize and bslen <= PayloadSize:
+    let nbits = uint(la - AlwaysAvail) * 8'u
+    let mask = (1'u shl nbits) - 1'u
+    return (cast[uint](a.more) and mask) == (cast[uint](b.more) and mask)
+  let ap0 = if aslen > PayloadSize:
+              cast[pointer](cast[uint](addr a.more.data[0]) + uint(AlwaysAvail))
+            else:
+              tailPtrOf(unsafeAddr a)
+  let bp0 = if bslen > PayloadSize:
+              cast[pointer](cast[uint](addr b.more.data[0]) + uint(AlwaysAvail))
+            else:
+              tailPtrOf(unsafeAddr b)
+  when defined(nimNoLibc):
+    var ap = cast[uint](ap0)
+    var bp = cast[uint](bp0)
+    var left = la - AlwaysAvail
+    while left >= sizeof(uint):
+      if cast[ptr uint](ap)[] != cast[ptr uint](bp)[]: return false
+      ap = ap + uint(sizeof(uint))
+      bp = bp + uint(sizeof(uint))
+      left = left - sizeof(uint)
+    while left > 0:
+      if cast[ptr char](ap)[] != cast[ptr char](bp)[]: return false
+      ap = ap + 1'u
+      bp = bp + 1'u
+      dec left
+    true
+  else:
+    cmpMem(ap0, bp0, la - AlwaysAvail) == 0
+
+func equalStrings(a, b: string): bool {.alwaysInline.} =
+  ## `{.alwaysInline.}` so intern / string-case see the short compare, not a call.
+  ## Heap / medium / mixed go to `equalStringsLong`.
+  ##
+  ## The reject CANNOT lead with the bare `dropSlen` word: that is only the
+  ## logical value for a SHORT string, where `zeroSwarPad` keeps the pad
+  ## canonical. Once a string is medium or heap, `bytes` is a *cache* that may
+  ## hold bytes above the length — see `equalStringsLong`.
   let abytes = a.bytes
   let bbytes = b.bytes
   let aslen = ssLenOf(abytes)
   let bslen = ssLenOf(bbytes)
   if aslen <= AlwaysAvail and bslen <= AlwaysAvail:
-    return abytes == bbytes  # SWAR: one word covers slen + all chars
-  let la = if aslen > PayloadSize: a.more.fullLen else: aslen
-  let lb = if bslen > PayloadSize: b.more.fullLen else: bslen
-  if la != lb: return false
-  if la == 0: return true
-  if aslen <= PayloadSize and bslen <= PayloadSize:
-    # Both medium: compare bytes word first (slen + chars 0-6 in one op),
-    # then the tail stored in the `more` overlay.
-    if abytes != bbytes: return false
-    return cmpMem(tailPtrOf(unsafeAddr a), tailPtrOf(unsafeAddr b),
-                  la - AlwaysAvail) == 0
-  # At least one long: delegate to cmpStringPtrs
-  cmpStringPtrs(unsafeAddr a, unsafeAddr b) == 0
+    return abytes == bbytes            # SWAR: one word covers slen + all chars
+  equalStringsLong(a, b)
 
-func `==`*(a, b: string): bool {.inline, semantics: "string.==".} =
-  equalStrings(a, b)
+func `==`*(a, b: string): bool {.alwaysInline, semantics: "string.==".} =
+  ## Same body as `equalStrings` (not a call to it) so one alwaysInline splice
+  ## puts the short compare into intern.
+  let abytes = a.bytes
+  let bbytes = b.bytes
+  let aslen = ssLenOf(abytes)
+  let bslen = ssLenOf(bbytes)
+  if aslen <= AlwaysAvail and bslen <= AlwaysAvail:
+    return abytes == bbytes            # SWAR: one word covers slen + all chars
+  equalStringsLong(a, b)
 
-func nimStrAtLe(s: string; idx: int; ch: char): bool {.inline.} =
+func nimStrAtLe(s: string; idx: Natural; ch: char): bool {.inline.} =
   result = idx < s.len and s[idx] <= ch
 
 func cmp*(a, b: string): int =
@@ -649,12 +978,10 @@ func newString*(len: int): string =
     setSSLen(result, len)
     zeroMem(inlinePtrV(result), len)
   else:
-    let p = cast[ptr LongString](alloc(LongStringDataOffset + len))
+    let p = allocLong(len)
     if p != nil:
       zeroMem(p, LongStringDataOffset + len)
-      p.rc = 0
-      p.fullLen = len
-      p.capImpl = len
+      initLongString(p, len, len)
       result.more = p
       setSSLen(result, HeapSlen)
     else:
@@ -662,14 +989,13 @@ func newString*(len: int): string =
 
 func newStringOfCap*(len: int): string =
   ## Returns a new empty string with capacity reserved for `len` chars.
+  ## Spare payload is uninitialized — length is 0, so nothing reads it.
+  ## (`newString` zeros because its length is `len` and callers see those bytes.)
   result = string(bytes: 0'u, more: nil)
   if len <= PayloadSize: return  # inline capacity always available
-  let p = cast[ptr LongString](alloc(LongStringDataOffset + len))
+  let p = allocLong(len)
   if p != nil:
-    zeroMem(p, LongStringDataOffset + len)
-    p.rc = 0
-    p.fullLen = 0
-    p.capImpl = len
+    initLongString(p, 0, len)
     result.more = p
     setSSLen(result, HeapSlen)
   else:
@@ -687,11 +1013,9 @@ func `&`*(a, b: string): string {.semantics: "string.&".} =
     if al > 0: copyMem(inlinePtrV(result), rawData(a), al)
     if b.len > 0: copyMem(inlinePtrAt(result, al), rawData(b), b.len)
   else:
-    let p = cast[ptr LongString](alloc(LongStringDataOffset + rlen))
+    let p = allocLong(rlen)
     if p != nil:
-      p.rc = 0
-      p.fullLen = rlen
-      p.capImpl = rlen
+      initLongString(p, rlen, rlen)
       let al = a.len
       if al > 0: copyMem(addr p.data[0], rawData(a), al)
       if b.len > 0:
@@ -705,7 +1029,7 @@ func `&`*(a, b: string): string {.semantics: "string.&".} =
 func charToString(c: char): string =
   result = string(bytes: 0'u, more: nil)
   setSSLen(result, 1)
-  inlinePtrV(result)[0] = c
+  setInline(result, 0, c)
 
 func `&`*(x: string; y: char): string {.inline.} = result = x & charToString(y)
 func `&`*(x: char; y: string): string {.inline.} = result = charToString(x) & y
@@ -727,11 +1051,9 @@ func borrowCStringUnsafe*(s: cstring; l: int): string =
     setSSLen(result, l)
     copyMem(inlinePtrV(result), s, l)
   else:
-    let p = cast[ptr LongString](alloc(LongStringDataOffset + l))
+    let p = allocLong(l)
     if p != nil:
-      p.rc = 0
-      p.fullLen = l
-      p.capImpl = l
+      initLongString(p, l, l)
       copyMem(addr p.data[0], s, l)
       result.more = p
       setSSLen(result, HeapSlen)
@@ -764,11 +1086,9 @@ func fromCString*(s: cstring): string =
     setSSLen(result, l)
     copyMem(inlinePtrV(result), s, l)
   else:
-    let p = cast[ptr LongString](alloc(LongStringDataOffset + l))
+    let p = allocLong(l)
     if p != nil:
-      p.rc = 0
-      p.fullLen = l
-      p.capImpl = l
+      initLongString(p, l, l)
       copyMem(addr p.data[0], s, l)
       result.more = p
       setSSLen(result, HeapSlen)
@@ -777,3 +1097,15 @@ func fromCString*(s: cstring): string =
       strOom result, LongStringDataOffset + l
 
 template `$`*(x: string): string = x
+
+when defined(wasm32) and defined(standalone):
+  # Used by the JS backend's `importjs` string bridge (nativenif's `jsToNimStr`).
+  proc nimStrBeginStore(s: var string; newLen: int): ptr UncheckedArray[char]
+      {.exportc: "nimStrBeginStore", noSideEffect, raises: [], tags: [].} =
+    ## `nil` if the allocation failed.
+    result = beginStore(s, newLen)
+    if isOom(s): result = nil
+
+  proc nimStrEndStore(s: var string)
+      {.exportc: "nimStrEndStore", noSideEffect, raises: [], tags: [].} =
+    endStore(s)

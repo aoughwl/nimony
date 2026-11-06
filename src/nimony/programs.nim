@@ -6,6 +6,7 @@
 
 when defined(nimony):
   {.feature: "lenientnils".}
+  {.feature: "assumeSync".}  # compiler-internal globals; single threaded
 
 import std / [syncio, os, hashes, tables, sets]
 when not defined(nimony):
@@ -18,14 +19,28 @@ import ".." / models / [nifindex_tags]
 
 include ".." / lib / compat2
 
+import ".." / lib / nifreader
+from ".." / lib / nifcoreparse import parse, peekRootInfo
+
 type
   Iface* = OrderedTable[StrId, seq[SymId]] # eg. "foo" -> @["foo.1.mod", "foo.3.mod"]
 
   NifModule* = ref object
-    stream: Stream
+    reader: Reader
     index*: NifIndex
-    public*: Table[string, NifIndexEntry]
-    private*: Table[string, NifIndexEntry]
+    public*: OrderedTable[string, NifIndexEntry]  ## ORDERED: `loadInterface`
+                                                 ## turns this into the
+                                                 ## overload sets, so its
+                                                 ## order is observable in
+                                                 ## diagnostics and must not
+                                                 ## depend on which compiler
+                                                 ## built us (see
+                                                 ## `readEmbeddedIndex`)
+    private*: OrderedTable[string, NifIndexEntry]
+    rootInfo: NifLineInfo   ## the toplevel `(stmts)` head's absolute info;
+                            ## seeds index-jumped decl parses so their
+                            ## relative line infos resolve (file would be
+                            ## unknown mid-file otherwise)
 
   SemPhase* = enum
     SemcheckTopLevelSyms,
@@ -143,7 +158,7 @@ proc del*(t: var ToplevelEntries; s: SymId) =
   ## Remove an entry by SymId. The entry is cleared but not removed from the seq.
   if t.bySymId.hasKey(s):
     let idx = t.bySymId.getOrDefault(s)
-    t.entries[idx].buffer = default(TokenBuf)  # clear the buffer
+    t.entries[idx].buffer = initTokenBuf()  # clear the buffer
     t.bySymId.del(s)
 
 iterator items*(t: ToplevelEntries): lent ToplevelEntry =
@@ -165,13 +180,13 @@ iterator symIds*(t: ToplevelEntries): SymId =
 # -------------- end ToplevelEntries methods --------------
 
 proc newNifModule(infile: string): NifModule =
-  result = NifModule(stream: nifstreams.open(infile),
-                     public: initTable[string, NifIndexEntry](),
-                     private: initTable[string, NifIndexEntry]())
-  discard processDirectives(result.stream.r)
-
-proc addEmbeddedIndex(public, private: var Table[string, NifIndexEntry];
-                      embedded: Table[string, NifIndexEntry]) =
+  result = NifModule(reader: nifreader.open(infile),
+                     public: initOrderedTable[string, NifIndexEntry](),
+                     private: initOrderedTable[string, NifIndexEntry]())
+  discard nifreader.processDirectives(result.reader)
+  result.rootInfo = peekRootInfo(result.reader, pool)
+proc addEmbeddedIndex(public, private: var OrderedTable[string, NifIndexEntry];
+                      embedded: OrderedTable[string, NifIndexEntry]) =
   for k, v in embedded:
     if v.vis == Exported:
       public[k] = v
@@ -182,7 +197,8 @@ proc loadModuleContent*(infile: string; owningBuf: var TokenBuf; paths: openArra
   ## Load a module's content into owningBuf and return a cursor to it.
   ## Also registers the module in prog.mods.
   let m = newNifModule(infile)
-  owningBuf = fromStream(m.stream)
+  owningBuf = createTokenBuf()
+  parse(m.reader, owningBuf, denseLineInfo = true)
   result = beginRead(owningBuf)
   let suffix = moduleSuffix(infile, paths)
   prog.mods[suffix] = m
@@ -190,7 +206,8 @@ proc loadModuleContent*(infile: string; owningBuf: var TokenBuf; paths: openArra
 proc loadModule*(infile: string; owningBuf: var TokenBuf; suffix: string): Cursor =
   ## Load a module's content and register it under the given suffix.
   let m = newNifModule(infile)
-  owningBuf = fromStream(m.stream)
+  owningBuf = createTokenBuf()
+  parse(m.reader, owningBuf, denseLineInfo = true)
   result = beginRead(owningBuf)
   prog.mods[suffix] = m
 
@@ -224,7 +241,8 @@ proc load*(suffix: string): NifModule =
     let infile = suffixToNif suffix
     result = newNifModule(infile)
     result.index = default(NifIndex)
-    let embedded = readEmbeddedIndex(result.stream)
+    let embedded =
+      readEmbeddedIndex(result.reader)
     if embedded.len > 0:
       addEmbeddedIndex(result.public, result.private, embedded)
     let indexName = infile.changeModuleExt(semIndexExt())
@@ -254,6 +272,31 @@ proc mergeFilter*(f: var ImportFilter; g: ImportFilter) =
     of FromImport:
       f.list = intersection(f.list, g.list)
 
+proc unionFilter*(f: var ImportFilter; g: ImportFilter) =
+  # combines two filters for the same module that were reached through
+  # different export paths: a name passes if either `f` or `g` lets it pass.
+  case g.kind
+  of ImportAll:
+    f = g
+  of ImportExcept:
+    case f.kind
+    of ImportAll: discard
+    of ImportExcept:
+      # hidden only if both paths hide it
+      f.list = intersection(f.list, g.list)
+    of FromImport:
+      # hidden if `g` hides it and `f` does not list it
+      let listed = f.list
+      f = g
+      f.list.excl(listed)
+  of FromImport:
+    case f.kind
+    of ImportAll: discard
+    of ImportExcept:
+      f.list.excl(g.list)
+    of FromImport:
+      f.list.incl(g.list)
+
 proc filterAllows*(f: ImportFilter; name: StrId): bool =
   case f.kind
   of ImportAll: result = true
@@ -269,11 +312,11 @@ proc loadInterface*(suffix: string; iface: var Iface;
   let alreadyLoaded = iface.len != 0
   var marker = filter.list
   let negateMarker = filter.kind == FromImport
-  for k, _ in m.public:
+  for k, _ in uncheckedBorrow(m.public):
     var base = k
     extractBasename(base)
     let strId = pool.strings.getOrIncl(base)
-    let symId = pool.syms.getOrIncl(k)
+    let symId = pool.symId(k)
     if not alreadyLoaded:
       iface.mgetOrPut(strId, @[]).add symId
     let symMarked =
@@ -282,16 +325,18 @@ proc loadInterface*(suffix: string; iface: var Iface;
     if not symMarked:
       # mark that this module contains the identifier `strId`:
       importTab.mgetOrPut(strId, @[]).addUnique(module)
-  for k, v in m.index.converters.items:
+  for i in 0 ..< m.index.converters.len:
+    let (k, v) = m.index.converters[i]
     var name = v
     extractBasename(name)
     let nameId = pool.strings.getOrIncl(name)
     # check that the converter is imported, slow but better to be slow here:
     if nameId in importTab and module in importTab.getOrDefault(nameId):
-      let key = if k == ".": SymId(0) else: pool.syms.getOrIncl(k)
-      let val = pool.syms.getOrIncl(v)
+      let key = if k == ".": SymId(0) else: pool.symId(k)
+      let val = pool.symId(v)
       converters.mgetOrPut(key, @[]).addUnique(val)
-  for ex in m.index.exports:
+  for i in 0 ..< m.index.exports.len:
+    let ex = m.index.exports[i]
     let (path, kind, names) = ex
     let filterKind =
       case kind
@@ -316,8 +361,8 @@ proc tryLoadSym*(s: SymId): LoadResult =
   if prog.mem.hasKey(s):
     result = LoadResult(status: LacksNothing, decl: cursorAt(prog.mem[s].buffer, 0))
   else:
-    let nifName = pool.syms[s]
-    let modname = extractModule(nifName)
+    let nifName = pool.symString(s)
+    let modname = pool.symModule(s)
     if modname == "":
       result = LoadResult(status: LacksModuleName)
     else:
@@ -328,9 +373,11 @@ proc tryLoadSym*(s: SymId): LoadResult =
       if indexEntry.offset == 0:
         result = LoadResult(status: LacksOffset)
       else:
-        m.stream.r.jumpTo indexEntry.offset
         var buf = createTokenBuf(30)
-        nifcursors.parse(m.stream, buf, indexEntry.info)
+        m.reader.jumpTo indexEntry.offset
+        let seed = if indexEntry.parentInfo.file.isValid: indexEntry.parentInfo
+                   else: m.rootInfo
+        parse(m.reader, buf, parentSeed = seed, denseLineInfo = true)
         let decl = cursorAt(buf, 0)
         prog.mem[s] = ToplevelEntry(buffer: ensureMove(buf), phase: SemcheckBodies)
         result = LoadResult(status: LacksNothing, decl: decl)
@@ -373,10 +420,10 @@ proc tryLoadHook*(op: AttachedOp; typ: SymId): SymId =
     let typedef = asTypeDecl(d.decl)
     var n = typedef.pragmas
     n.linearScan:
-      if n.tagId == hooktag:
+      if n.cursorTagId == hooktag:
         var c = n
         inc c
-        if c.kind == Symbol:
+        if c.isSymbol:
           result = c.symId
           break
 
@@ -384,7 +431,7 @@ proc tryLoadAllHooks*(typ: SymId): HooksPerType =
   template setRes(hookCursor: Cursor; op: AttachedOp) =
     var c = hookCursor
     inc c
-    if c.kind == Symbol:
+    if c.isSymbol:
       result.a[op] = c.symId
 
   result = HooksPerType(a: default(array[AttachedOp, SymId]))
@@ -393,7 +440,7 @@ proc tryLoadAllHooks*(typ: SymId): HooksPerType =
     let typedef = asTypeDecl(d.decl)
     var n = typedef.pragmas
     n.linearScan:
-      case hookKind(n.tagId)
+      case hookKind(n.cursorTagId)
       of NoHook: discard
       of WasmovedH: setRes(n, attachedWasMoved)
       of DestroyH: setRes(n, attachedDestroy)
@@ -406,12 +453,12 @@ proc loadSyms*(suffix: string; identifier: StrId): seq[SymId] =
   # gives top level exported syms of a module
   result = @[]
   var m = load(suffix)
-  for k, _ in m.public:
+  for k, _ in uncheckedBorrow(m.public):
     var base = k
     extractBasename(base)
     let strId = pool.strings.getOrIncl(base)
     if strId == identifier:
-      let symId = pool.syms.getOrIncl(k)
+      let symId = pool.symId(k)
       result.add symId
 
 proc knowsSym*(s: SymId): bool {.inline.} = prog.mem.hasKey(s)
@@ -433,78 +480,89 @@ proc publish*(s: SymId; buf: sink TokenBuf; phase = SemcheckBodies) =
 proc publish*(s: SymId; dest: TokenBuf; start: int; phase = SemcheckBodies) =
   var buf = createTokenBuf(dest.len - start + 1)
   for i in start..<dest.len:
+    # the span is an already-balanced subtree; raw copy keeps its seals
     buf.add dest[i]
   publish s, buf, phase
 
 proc publishSignature*(dest: TokenBuf; s: SymId; start: int) =
+  when defined(debugPublish):
+    if pool.symString(s).startsWith("\x2E."):
+      echo "PUBSIG ", pool.symString(s), " src=", toString(readonlyCursorAt(dest, start), false)
   var buf = createTokenBuf(dest.len - start + 3)
-  for i in start..<dest.len:
+  # the span is the routine's open tag followed by complete signature
+  # subtrees; open the tag properly so the final close seals it, and copy
+  # the sealed children (incl. the head's own line-info suffix) raw
+  buf.openTag readonlyCursorAt(dest, start).cursorTagId
+  for i in start+1 ..< dest.len:
     buf.add dest[i]
   buf.addDotToken() # body is empty for a signature
   buf.addParRi()
+  when defined(debugPublish):
+    if pool.symString(s).startsWith("\x2E."):
+      echo "PUBSIG OUT ", toString(readonlyCursorAt(buf, 0), false)
   publish s, buf, SemcheckSignatures
 
 proc publishStringType*() =
   # This logic is not strictly necessary for "system.nim" itself, but
   # for modules that emulate system via --isSystem.
-  let symId = pool.syms.getOrIncl(StringName)
+  let symId = pool.symId(StringName)
   let exportMarker = pool.strings.getOrIncl("x")
   var str = createTokenBuf(10)
   when sso:
-    let bytesId = pool.syms.getOrIncl(StringBytesField)
-    let moreId  = pool.syms.getOrIncl(StringMoreField)
-    let longStrSymId = pool.syms.getOrIncl(LongStringName)
+    let bytesId = pool.symId(StringBytesField)
+    let moreId  = pool.symId(StringMoreField)
+    let longStrSymId = pool.symId(LongStringName)
     str.copyIntoUnchecked "type", NoLineInfo:
-      str.add symdefToken(symId, NoLineInfo)
-      str.add identToken(exportMarker, NoLineInfo)
+      str.addSymDef(symId, NoLineInfo)
+      str.addIdent(exportMarker, NoLineInfo)
       str.addDotToken() # pragmas
       str.addDotToken() # generic parameters
       str.copyIntoUnchecked "object", NoLineInfo:
         str.addDotToken() # inherits from nothing
         str.copyIntoUnchecked "fld", NoLineInfo:
-          str.add symdefToken(bytesId, NoLineInfo)
+          str.addSymDef(bytesId, NoLineInfo)
           str.addDotToken() # export marker
           str.addDotToken() # pragmas
           # type is `uint`
           str.copyIntoUnchecked "u", NoLineInfo:
-            str.add intToken(pool.integers.getOrIncl(-1), NoLineInfo)
+            str.addIntLit(-1, NoLineInfo)
           str.addDotToken() # default value
 
         str.copyIntoUnchecked "fld", NoLineInfo:
-          str.add symdefToken(moreId, NoLineInfo)
+          str.addSymDef(moreId, NoLineInfo)
           str.addDotToken() # export marker
           str.addDotToken() # pragmas
           # type is `ptr LongString`
           str.copyIntoUnchecked "ptr", NoLineInfo:
-            str.add symToken(longStrSymId, NoLineInfo)
+            str.addSymUse(longStrSymId, NoLineInfo)
           str.addDotToken() # default value
   else:
-    let aId = pool.syms.getOrIncl(StringAField)
-    let iId = pool.syms.getOrIncl(StringIField)
+    let aId = pool.symId(StringAField)
+    let iId = pool.symId(StringIField)
     str.copyIntoUnchecked "type", NoLineInfo:
-      str.add symdefToken(symId, NoLineInfo)
-      str.add identToken(exportMarker, NoLineInfo)
+      str.addSymDef(symId, NoLineInfo)
+      str.addIdent(exportMarker, NoLineInfo)
       str.addDotToken() # pragmas
       str.addDotToken() # generic parameters
       str.copyIntoUnchecked "object", NoLineInfo:
         str.addDotToken() # inherits from nothing
         str.copyIntoUnchecked "fld", NoLineInfo:
-          str.add symdefToken(aId, NoLineInfo)
+          str.addSymDef(aId, NoLineInfo)
           str.addDotToken() # export marker
           str.addDotToken() # pragmas
           # type is `ptr UncheckedArray[char]`
           str.copyIntoUnchecked "ptr", NoLineInfo:
             str.copyIntoUnchecked "uarray", NoLineInfo:
               str.copyIntoUnchecked "c", NoLineInfo:
-                str.add intToken(pool.integers.getOrIncl(8), NoLineInfo)
+                str.addIntLit(8, NoLineInfo)
           str.addDotToken() # default value
 
         str.copyIntoUnchecked "fld", NoLineInfo:
-          str.add symdefToken(iId, NoLineInfo)
+          str.addSymDef(iId, NoLineInfo)
           str.addDotToken() # export marker
           str.addDotToken() # pragmas
           str.copyIntoUnchecked "i", NoLineInfo:
-            str.add intToken(pool.integers.getOrIncl(-1), NoLineInfo)
+            str.addIntLit(-1, NoLineInfo)
           str.addDotToken() # default value
   publish symId, str, SemcheckBodies
 
@@ -522,15 +580,16 @@ proc setupProgram*(infile, outfile: string; owningBuf: var TokenBuf; hasIndex=fa
 
   if hasIndex:
     m.index = default(NifIndex)
-    let embedded = readEmbeddedIndex(m.stream)
+    let embedded =
+      readEmbeddedIndex(m.reader)
     if embedded.len > 0:
       addEmbeddedIndex(m.public, m.private, embedded)
     let indexName = infile.changeModuleExt".s.idx.nif"
     m.index = readIndex(indexName)
 
   #echo "INPUT IS ", toString(m.buf)
-  owningBuf = fromStream(m.stream)
-
+  owningBuf = createTokenBuf()
+  parse(m.reader, owningBuf, denseLineInfo = true)
   result = beginRead(owningBuf)
   prog.mods[prog.main.name] = m
   #publishStringType()
@@ -541,18 +600,37 @@ proc setupProgramForTesting*(dir, file, ext: string) =
   prog.main.ext = ext
   publishStringType()
 
-proc takeParRi*(dest: var TokenBuf; n: var Cursor) =
-  if n.kind == ParRi:
-    dest.add n
+proc takeParRi*(dest: var TokenBuf; n: var Cursor) {.nifBalanced.} =
+  if not n.hasMore:
+    dest.addParRi(n.endInfo)
     consumeParRi n
   else:
     bug "expected ')', but got: ", n
 
-proc skipParRi*(n: var Cursor) =
-  if n.kind == ParRi:
+proc skipParRi*(n: var Cursor) {.nifBalanced.} =
+  if not n.hasMore:
     consumeParRi n
   else:
     bug "expected ')', but got: ", n
 
 template isLocalDecl*(s: SymId): bool =
-  extractModule(pool.syms[s]) == ""
+  pool.symIsLocal(s)
+
+proc isConcat(s: SymId): bool =
+  let res = tryLoadSym(s)
+  if res.status != LacksNothing or not isRoutine(res.decl.symKind):
+    return false
+  let routine = asRoutine(res.decl)
+  result = hasPragmaOfValue(routine.pragmas, SemanticsP, "string.&")
+
+proc isStringConcatCall*(n: Cursor): bool =
+  ## Is `n` a call of the string `&` (`.semantics: "string.&"`)? `derefs`
+  ## folds a chain of them into one allocation.
+  result = false
+  if n.exprKind in CallKinds:
+    var c = n
+    inc c                       # past call tag
+    if c.kind == Symbol:
+      let name = pool.symString(c.symId)
+      if name.len > 2 and name[0] == '&' and name[1] == '.':
+        result = isConcat(c.symId)

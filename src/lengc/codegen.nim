@@ -9,6 +9,12 @@
 
 # We produce C code as a list of tokens.
 
+when defined(nimony):
+  # `moveToDataSection` & co. are `.dirty` templates whose bodies reach for the
+  # caller's `c`; sem needs the feature to leave those idents untyped until the
+  # expansion site (see doc/porting.md, "Dirty templates").
+  {.feature: "untyped".}
+
 import std / [assertions, syncio, tables, sets, intsets, formatfloat, packedsets]
 from std / syncio import readFile, writeFile
 from std / os import changeFileExt, splitFile, extractFilename, fileExists
@@ -17,6 +23,7 @@ from std / sequtils import insert
 
 import ".." / lib / nifcoreparse   # re-exports nifcore
 import ".." / lib / nifcdecl        # leng_model replacement (stmtKind/decls/tags)
+import ".." / lib / intrinsics      # the shared `{.instruction.}` / `{.intrinsic.}` table
 import mangler
 import cprelude
 import noptions
@@ -95,7 +102,7 @@ proc toString(c: Cursor; spaces: bool): string =
 proc fillTokenTable(tab: var BiTable[Token, string]) =
   for e in EmptyToken..high(PredefinedToken):
     let id = tab.getOrIncl $e
-    assert id == Token(e), $(id, " ", ord(e))
+    assert id == Token(e), $uint32(id) & " " & $ord(e)
 
 type
   GenFlag* = enum
@@ -142,7 +149,7 @@ proc add*(c: var GeneratedCode; s: string) {.inline.} =
 
 type
   CppFile = object
-    buf: string  # write to buffer, then writeFileIfChanged at end
+    buf: string  # write to buffer, then to the file at the end
 
 proc write(f: var CppFile; s: string) = f.buf.add s
 proc write(f: var CppFile; c: char) = f.buf.add c
@@ -183,10 +190,27 @@ proc render(m: MainModule; n: Cursor): string =
   buf.addSubtree n
   result = toString(buf)
 
+proc errorAt(m: MainModule; msg: string; n: Cursor) {.noreturn.} =
+  ## `error` without the trailing render of `n`. For a message that already names
+  ## what is wrong in prose: rendering the node would append its raw NIF spelling
+  ## (mangled symbol plus embedded line info), which says nothing a reader wants.
+  let info = rawLineInfo(n)
+  if info.isValid:
+    write stdout, realFile(m.pool.filenames[info.file])
+    write stdout, "(" & $info.line & ", " & $(info.col+1) & ") "
+  # `Error: `, not the `[Error] ` of the rendering `error` above: this is a
+  # user-facing diagnostic, and that is the spelling every other user-facing
+  # nimony error uses (the test harness keys the expected exit code off it).
+  write stdout, "Error: "
+  writeLine stdout, msg
+  when defined(debug):
+    echo getStackTrace()
+  quit 1
+
 proc error(m: MainModule; msg: string; n: Cursor) {.noreturn.} =
   let info = rawLineInfo(n)
   if info.isValid:
-    write stdout, m.pool.filenames[info.file]
+    write stdout, realFile(m.pool.filenames[info.file])
     write stdout, "(" & $info.line & ", " & $(info.col+1) & ") "
   write stdout, "[Error] "
   write stdout, msg
@@ -278,6 +302,18 @@ proc parseProcPragmas(c: var GeneratedCode; n: var Cursor): PragmaInfo =
       of NodeclP:
         result.flags.incl NodeclP
         skip n
+      of DynlibP:
+        # Static-import library annotation for the NATIVE backend (arkham);
+        # meaningless for C output — the linker resolves the symbol.
+        skip n
+      of ConstrefP:
+        # A PARAMETER pragma; never legal on a proc.
+        error c.m, "invalid proc pragma: ", n
+      of ImportjsP:
+        # The JS back end's extern: the argument is a JS splice template only
+        # jorogumo can answer. Ignoring it would emit a call to a C symbol that is
+        # never declared, so refuse while the name is still in hand.
+        errorAt c.m, "importjs is a JS-backend pragma and has no C lowering", n
       of ImportcppP, ImportcP, ExportcP:
         n.into:
           if n.hasMore and n.kind == StrLit:
@@ -297,6 +333,36 @@ proc parseProcPragmas(c: var GeneratedCode; n: var Cursor): PragmaInfo =
       of SelectanyP:
         result.flags.incl pk
         skip n
+      of InstructionP, IntrinsicP:
+        # An intrinsic declares a machine instruction, not a callable: there is
+        # no definition anywhere, and every call to it is an `(instr …)` the
+        # expression generator lowers directly. Recording the flag is enough —
+        # `genProcDecl` then emits nothing for the declaration itself.
+        result.flags.incl pk
+        skip n
+      of AssemblerP, NakedP:
+        # `{.assembler.}`/`{.naked.}` bodies are transliterated by arkham, not
+        # compiled to C.
+        # Routing them into a C build means assembling them separately and
+        # linking the object — see `nativenif/doc/asm-c-interop.md`, which is not
+        # built yet. Reject loudly rather than emit a prototype that will fail to
+        # link with no explanation.
+        result.flags.incl pk
+        skip n
+      of InterruptP:
+        # An interrupt-table entry, and a C build has no such table to install it
+        # in. Emitting the function anyway would compile and link and simply
+        # never be reached — a device that does not respond to the interrupt,
+        # with nothing at the failure site to say why. `{.exportc: "…".}` is
+        # what binds a handler by name against a vendor startup file.
+        result.flags.incl pk
+        skip n
+      of RegisterP, StackP:
+        # Location pins. They are assertions inside an `{.assembler.}` proc
+        # (rejected above) and allocator hints outside one; C has no way to
+        # honour either (its own `register` keyword is advisory), so drop them.
+        result.flags.incl pk
+        skip n
       of WasP:
         genWasPragma c, n
       of ErrsP, RaisesP, SmryP:
@@ -304,7 +370,7 @@ proc parseProcPragmas(c: var GeneratedCode; n: var Cursor): PragmaInfo =
       of InlineP:
         result.flags.incl pk
         skip n
-      of NoinlineP:
+      of AlwaysInlineP, NoinlineP:
         result.flags.incl pk
         skip n
       of AttrP:
@@ -321,17 +387,25 @@ proc parseProcPragmas(c: var GeneratedCode; n: var Cursor): PragmaInfo =
   else:
     error c.m, "expected proc pragmas but got: ", n
 
-proc genSymDef(c: var GeneratedCode; n: Cursor; prag: PragmaInfo): string =
+proc isBareImportProc(prag: PragmaInfo): bool {.inline.} =
+  ## `importc` proc with neither `header` nor `nodecl`: declared by US, under
+  ## its mangled name + `__asm__` label (collision-proof against header
+  ## prototypes for the same libc identifier — see `mangleSym`).
+  ImportcP in prag.flags and {HeaderP, NodeclP} * prag.flags == {}
+
+proc genSymDef(c: var GeneratedCode; n: Cursor; prag: PragmaInfo;
+               isProc = false): string =
   if n.kind == SymbolDef:
     let lit = n.symId
     if {ImportcP, ImportcppP, ExportcP} * prag.flags != {}:
-      if prag.extern != StrId(0):
+      if isProc and isBareImportProc(prag):
+        result = mangleToC(c.m.pool.symString(lit))
+      elif prag.extern != StrId(0):
         result = c.m.pool.strings[prag.extern]
       else:
-        result = c.m.pool.syms[lit]
-        extractBasename(result)
+        result = c.m.pool.symBasename(lit)
     else:
-      result = mangleToC(c.m.pool.syms[lit])
+      result = mangleToC(c.m.pool.symString(lit))
     c.add result
   else:
     result = ""
@@ -351,6 +425,11 @@ proc genParamPragmas(c: var GeneratedCode; n: var Cursor) =
           while n.hasMore: skip n
       of WasP:
         genWasPragma c, n
+      of ConstrefP:
+        # Provenance only (see `doc/tags.md`): the pointer stands for a
+        # by-value source parameter. Nothing to emit — it exists for
+        # `funcsummary`/the optimizer.
+        skip n
       else:
         error c.m, "invalid pragma: ", n
   else:
@@ -418,14 +497,14 @@ proc genCLineDir(c: var GeneratedCode; info: NifLineInfo) =
     if id.isValid:
       c.fileIds.incl id
 
-template moveToDataSection(body: untyped) =
+template moveToDataSection(body: untyped) {.dirty.} =
   let oldLen = c.code.len
   body
   for i in oldLen ..< c.code.len:
     c.data.add c.code[i]
   setLen c.code, oldLen
 
-template moveToInitSection(body: untyped) =
+template moveToInitSection(body: untyped) {.dirty.} =
   let oldLen = c.code.len
   body
   for i in oldLen ..< c.code.len:
@@ -445,7 +524,7 @@ proc isLiteral(n: var Cursor): bool =
     inc n
   else:
     case n.exprKind
-    of FalseC, TrueC, InfC, NegInfC, NanC, SufC, NilC:
+    of FalseC, TrueC, InfC, NeginfC, NanC, SufC, NilC:
       result = true
       skip n
     of AconstrC, OconstrC, CastC, ConvC:
@@ -520,7 +599,7 @@ proc genVarDecl(c: var GeneratedCode; n: var Cursor; vk: VarKind; toExtern = fal
     genType c, typ, name, isConst = vk == IsConst
     let flags = genVarPragmas(c, d.pragmas)
     if not toExtern and (StaticP in flags or useStatic):
-      c.code.insert(Token(StaticKeyword), beforeDecl)
+      c.code.insert([Token(StaticKeyword)], beforeDecl)
     let beforeInit = c.code.len
 
     var value = d.value
@@ -550,8 +629,11 @@ proc genVarDecl(c: var GeneratedCode; n: var Cursor; vk: VarKind; toExtern = fal
 
 include genstmts
 
-proc addOverflowDecl(c: var GeneratedCode; code: var seq[Token]; beforeBody: int) =
-  let tokens = @[
+proc overflowDeclTokens(c: var GeneratedCode): seq[Token] =
+  ## The `NB8 ovf = NIM_FALSE;` prologue. Returned instead of inserted by the
+  ## callee: the destination is always a field of `c` itself, and passing it as
+  ## a separate `var seq` parameter next to `c` aliases the two.
+  result = @[
     c.tokens.getOrIncl("NB8"),
     Token(Space),
     Token(OvfToken),
@@ -559,7 +641,6 @@ proc addOverflowDecl(c: var GeneratedCode; code: var seq[Token]; beforeBody: int
     c.tokens.getOrIncl("NIM_FALSE"),
     Token(Semicolon)
   ]
-  code.insert(tokens, beforeBody)
 
 proc genProcDecl(c: var GeneratedCode; n: var Cursor; isExtern: bool) =
   c.m.openScope()
@@ -570,6 +651,32 @@ proc genProcDecl(c: var GeneratedCode; n: var Cursor; isExtern: bool) =
   var prc = takeProcDecl(n)
 
   let prag = parseProcPragmas(c, prc.pragmas)
+  if prag.flags * {AssemblerP, NakedP} != {}:
+    errorAt c.m, "the C backend cannot compile an `{.assembler.}` proc; it must " &
+      "be assembled by arkham and linked as an object (see doc/asm-c-interop.md)",
+      prc.name
+  if InterruptP in prag.flags:
+    errorAt c.m, "the C backend has no interrupt table to install an `{.interrupt.}` " &
+      "handler in; use `{.exportc: \"...\".}` to bind one by name against a " &
+      "startup file, or compile it with arkham",
+      prc.name
+  if {ImportcP, ImportcppP} * prag.flags != {} and InlineP notin prag.flags and
+      prc.body.kind != DotToken:
+    # The back end emits only a declaration for an imported proc; a body here
+    # is a hexer bug, not something to drop silently.
+    errorAt c.m, "BUG: imported proc reached Leng with a body", prc.name
+  if prag.flags * {InstructionP, IntrinsicP} != {}:
+    # No C declaration: an intrinsic has no definition to link against, and
+    # every application of it is an `(instr …)` lowered at the use site.
+    # Undo EVERY piece of entry state, `inToplevel` included: the normal exit
+    # restores it, and leaving it false here would make the rest of the module
+    # think it is inside a proc — so a later module-scope `(var …)` would stop
+    # being routed into `c.init` and land at file scope with its initializer.
+    c.code.setLen signatureBegin
+    c.m.closeScope()
+    c.inToplevel = true
+    c.currentProc = oldProc
+    return
   if InlineP in prag.flags:
     c.add StaticKeyword
     c.add "inline "
@@ -590,7 +697,7 @@ proc genProcDecl(c: var GeneratedCode; n: var Cursor; isExtern: bool) =
     c.add Comma
     if prag.attr != StrId(0):
       c.add "__attribute__((" & c.m.pool.strings[prag.attr] & ")) "
-    name = genSymDef(c, prc.name, prag)
+    name = genSymDef(c, prc.name, prag, isProc = true)
     c.add ParRi
   else:
     if prc.returnType.kind == DotToken:
@@ -600,7 +707,7 @@ proc genProcDecl(c: var GeneratedCode; n: var Cursor; isExtern: bool) =
     c.add Space
     if prag.attr != StrId(0):
       c.add "__attribute__((" & c.m.pool.strings[prag.attr] & ")) "
-    name = genSymDef(c, prc.name, prag)
+    name = genSymDef(c, prc.name, prag, isProc = true)
 
   c.add ParLe
 
@@ -620,6 +727,19 @@ proc genProcDecl(c: var GeneratedCode; n: var Cursor; isExtern: bool) =
     c.code.setLen signatureBegin
   elif InlineP notin prag.flags and (isExtern or {ImportcP, ImportcppP} * prag.flags != {}):
     # External/imported function without body - just prototype
+    if isBareImportProc(prag):
+      # Bind the mangled identifier to the real symbol. The identifier never
+      # collides with a header's prototype for the same libc function, which
+      # matters since inliner splices carry bare-importc references into
+      # arbitrary modules (measured: `write` vs <unistd.h> in threads/cps).
+      var asmName = ""
+      if prag.extern != StrId(0):
+        asmName = c.m.pool.strings[prag.extern]
+      else:
+        asmName = c.m.pool.symBasename(prc.name.symId)
+      c.add " __asm__(NIM_ASM_PREFIX "
+      c.add makeCString(asmName)
+      c.add ")"
     for i in signatureBegin ..< c.code.len:
       c.protos.add c.code[i]
     c.protos.add Token Semicolon
@@ -635,13 +755,14 @@ proc genProcDecl(c: var GeneratedCode; n: var Cursor; isExtern: bool) =
     let beforeBody = c.code.len
     genStmt c, prc.body
     if c.currentProc.needsOverflowFlag:
-      addOverflowDecl c, c.code, beforeBody
+      let ovfDecl = overflowDeclTokens(c)
+      c.code.insert(ovfDecl, beforeBody)
     c.add CurlyRi
   c.m.closeScope()
   c.inToplevel = true
   c.currentProc = oldProc
 
-template genForeignDataDecl(body: untyped) =
+template genForeignDataDecl(body: untyped) {.dirty.} =
   # Foreign var/const/gvar/tvar `extern` declarations are emitted by `genVar`
   # into `c.data` via `moveToDataSection`. But `genImportedSyms` runs *after*
   # `genToplevel` has already filled `c.data` with this module's own consts —
@@ -759,14 +880,14 @@ proc generateCode*(s: var State, inp, outp: string; flags: set[GenFlag]) =
   if c.init.len > 0:
     f.write "static void __attribute__((constructor)) init(void) {"
     if c.currentProc.needsOverflowFlag:
-      addOverflowDecl c, c.init, 0
+      let ovfDecl = overflowDeclTokens(c)
+      c.init.insert(ovfDecl, 0)
     writeTokenSeq f, c.init, c
     f.write "}\n\n"
 
-  if vfsExists(outp) and vfsRead(outp) == f.buf:
-    discard "unchanged, keep mtime for incremental builds"
-  else:
-    vfsWrite outp, f.buf
+  # Always written: the `.c` file is no interface file, its one consumer is
+  # this module's C compiler (doc/internals/ic.md).
+  vfsWrite outp, f.buf
 
   if c.headerFile.len > 0:
     let selectHeader = outp.changeFileExt(".h")

@@ -32,8 +32,15 @@ elif defined(windows):
   import ../windows/winlean
 elif defined(posix):
   import ../posix/posix
-  proc c_rename(oldname, newname: cstring): cint {.
-    importc: "rename", header: "<stdio.h>".}
+  when linuxA64Raw:
+    # No `rename` syscall on AArch64 (see `linuxA64Raw`): both paths are resolved
+    # against the cwd, which is what glibc's `rename` does with `renameat`.
+    proc renameat(oldDirfd: cint; oldname: cstring;
+                  newDirfd: cint; newname: cstring): cint {.importc: "renameat".}
+    proc c_rename(oldname, newname: cstring): cint {.inline.} =
+      renameat(AT_FDCWD, oldname, AT_FDCWD, newname)
+  else:
+    proc c_rename(oldname, newname: cstring): cint {.importc: "rename".}
 
 
 
@@ -182,8 +189,23 @@ when supportedSystem:
       let access = if writeAccess: GENERIC_WRITE else: 0'u32
 
       var path = path
+      # Bound to a `let` so the buffer outlives the call (see `fileExists`).
+      let w = newWideCString(path)
       result = createFileW(
-        newWideCString(path).toWideCString(), access,
+        w.toWideCString, access,
         FILE_SHARE_DELETE or FILE_SHARE_READ or FILE_SHARE_WRITE,
         nil, OPEN_EXISTING, flags, cast[Handle](0)
         )
+
+when not supportedSystem:
+  # Freestanding targets (wasm32 standalone): no filesystem. Existence
+  # queries answer honestly (nothing exists); the mutating verb traps.
+  # Compile-clean-trap-loudly, per the wasm bring-up convention.
+  proc fileExists*(filename: string): bool {.tags: [ReadDirEffect], sideEffect.} =
+    false
+  proc dirExists*(dir: string): bool {.tags: [ReadDirEffect], sideEffect.} =
+    false
+  proc symlinkExists*(link: string): bool {.tags: [ReadDirEffect], sideEffect.} =
+    false
+  proc tryMoveFSObject*(source, dest: string, isDir: bool): bool {.raises.} =
+    raiseAssert "no filesystem on a freestanding target"

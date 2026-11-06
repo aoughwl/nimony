@@ -11,28 +11,41 @@ import ".." / lib / [stringviews, symparser]
 import ".." / models / [tags, nimony_tags, callconv_tags]
 export nimony_tags, callconv_tags
 
-template tagEnum*(c: Cursor): TagEnum = cast[TagEnum](tag(c))
+when not defined(nimony):
+  # `alwaysInline` is a nimony proc pragma; give host Nim the nearest thing it
+  # has. (nifcore carries the same shim, but a user pragma is not re-exported.)
+  {.pragma: alwaysInline, inline.}
 
-template tagEnum*(c: PackedToken): TagEnum = cast[TagEnum](tag(c))
+template tagEnum*(c: Cursor): TagEnum =
+  ## Safe on any cursor position: atoms and scope ends yield `InvalidTagId`
+  ## (same contract as nifcdecl.tagEnumOf).
+  (if c.isTagLit: cast[TagEnum](cursorTagId(c)) else: InvalidTagId)
 
-proc stmtKind*(c: PackedToken): NimonyStmt {.inline.} =
-  if c.kind == ParLe and rawTagIsNimonyStmt(tagEnum(c)):
+template tagEnum*(c: NifToken): TagEnum = cast[TagEnum](tagId(c))
+
+proc stmtKind*(c: NifToken): NimonyStmt {.inline.} =
+  if c.isTagLit and rawTagIsNimonyStmt(tagEnum(c)):
     result = cast[NimonyStmt](tagEnum(c))
   else:
     result = NoStmt
 
 proc stmtKind*(c: Cursor): NimonyStmt {.inline.} =
-  result = stmtKind(c.load())
+  # Routed through `c.kind` so a bounded cursor at its scope's end (virtual
+  # ParRi under `-d:virtualParRi`) yields the none-value instead of asserting.
+  if c.isTagLit:
+    result = stmtKind(c.load())
+  else:
+    result = NoStmt
 
 proc pragmaKind*(c: Cursor): NimonyPragma {.inline.} =
-  if c.kind == ParLe:
+  if c.isTagLit:
     let e = tagEnum(c)
     if rawTagIsNimonyPragma(e):
       result = cast[NimonyPragma](e)
     else:
       result = NoPragma
-  elif c.kind == Ident:
-    let tagId = pool.tags.getOrIncl(pool.strings[c.litId])
+  elif c.isIdent:
+    let tagId = globalTags.registerTag(pool.strings[c.strId])
     if tagId.int >= 0 and tagId.int <= high(TagEnum).int and rawTagIsNimonyPragma(cast[TagEnum](tagId)):
       result = cast[NimonyPragma](tagId)
     else:
@@ -40,34 +53,38 @@ proc pragmaKind*(c: Cursor): NimonyPragma {.inline.} =
   else:
     result = NoPragma
 
-proc substructureKind*(c: PackedToken): NimonyOther {.inline.} =
-  if c.kind == ParLe and rawTagIsNimonyOther(tagEnum(c)):
-    result = cast[NimonyOther](tag(c))
+proc substructureKind*(c: NifToken): NimonyOther {.inline.} =
+  if c.isTagLit and rawTagIsNimonyOther(tagEnum(c)):
+    result = cast[NimonyOther](tagId(c))
   else:
     result = NoSub
 
 proc substructureKind*(c: Cursor): NimonyOther {.inline.} =
-  result = substructureKind(c.load())
+  if c.isTagLit:
+    result = substructureKind(c.load())
+  else:
+    result = NoSub
 
-proc typeKind*(c: Cursor): NimonyType {.inline.} =
-  if c.kind == ParLe:
-    if rawTagIsNimonyType(tagEnum(c)):
-      result = cast[NimonyType](tagEnum(c))
-    else:
-      result = NoType
-  elif c.kind == DotToken:
+proc typeKind*(c: Cursor): NimonyType {.alwaysInline.} =
+  ## `tagEnum` is a template that re-tests `isTagLit`, so spelling it twice
+  ## cost three `isTagLit` and two `cursorTagId` where one of each does — the
+  ## Leng sibling in `nifcdecl` already hoists it.
+  if c.isTagLit:
+    let e = cast[TagEnum](cursorTagId(c))
+    result = if rawTagIsNimonyType(e): cast[NimonyType](e) else: NoType
+  elif c.isDotToken:
     result = VoidT
   else:
     result = NoType
 
 proc callConvKind*(c: Cursor): CallConv {.inline.} =
-  if c.kind == ParLe:
+  if c.isTagLit:
     if rawTagIsCallConv(tagEnum(c)):
-      result = cast[CallConv](tag(c))
+      result = cast[CallConv](cursorTagId(c))
     else:
       result = NoCallConv
-  elif c.kind == Ident:
-    let tagId = pool.tags.getOrIncl(pool.strings[c.litId])
+  elif c.isIdent:
+    let tagId = globalTags.registerTag(pool.strings[c.strId])
     if rawTagIsCallConv(cast[TagEnum](tagId)):
       result = cast[CallConv](tagId)
     else:
@@ -75,8 +92,8 @@ proc callConvKind*(c: Cursor): CallConv {.inline.} =
   else:
     result = NoCallConv
 
-proc exprKind*(c: PackedToken): NimonyExpr {.inline.} =
-  if c.kind == ParLe:
+proc exprKind*(c: NifToken): NimonyExpr {.inline.} =
+  if c.isTagLit:
     if rawTagIsNimonyExpr(tagEnum(c)):
       result = cast[NimonyExpr](tagEnum(c))
     else:
@@ -85,10 +102,13 @@ proc exprKind*(c: PackedToken): NimonyExpr {.inline.} =
     result = NoExpr
 
 proc exprKind*(c: Cursor): NimonyExpr {.inline.} =
-  result = exprKind(c.load())
+  if c.isTagLit:
+    result = exprKind(c.load())
+  else:
+    result = NoExpr
 
 proc symKind*(c: Cursor): NimonySym {.inline.} =
-  if c.kind == ParLe:
+  if c.isTagLit:
     if rawTagIsNimonySym(tagEnum(c)):
       result = cast[NimonySym](tagEnum(c))
     else:
@@ -97,7 +117,7 @@ proc symKind*(c: Cursor): NimonySym {.inline.} =
     result = NoSym
 
 proc cfKind*(c: Cursor): ControlFlowKind {.inline.} =
-  if c.kind == ParLe:
+  if c.isTagLit:
     if rawTagIsControlFlowKind(tagEnum(c)):
       result = cast[ControlFlowKind](tagEnum(c))
     else:
@@ -196,151 +216,184 @@ const
   ConvKinds* = {HconvX, ConvX, DconvX, CastX}
   TypeclassKinds* = {ConceptT, TypekindT, OrdinalT, OrT, AndT, NotT}
   RoutineTypes* = {ProcT, FuncT, IteratorT, TemplateT, MacroT, ConverterT, MethodT, ProctypeT, ItertypeT}
+  TupleTypes* = {TupleT, ClosureTupleT}
+    ## Both tags have the *same* structure — a flat list of (optionally
+    ## `(kv name T)`-wrapped) element types — so every pass that only cares
+    ## about the layout (hooks, sizeof, mangling, codegen) matches on this set.
+    ## Only lambda lifting and the coroutine transform tell them apart; see
+    ## `ClosureTupleT`.
 
-proc addParLe*[T: TypeKind|SymKind|ExprKind|StmtKind|SubstructureKind|ControlFlowKind|CallConv|PragmaKind](
-    dest: var TokenBuf; kind: T; info = NoLineInfo) =
-  dest.add parLeToken(cast[TagId](kind), info)
+proc addParLe*[T: enum](dest: var TokenBuf; kind: T; info = NoLineInfo) {.nifOpens.} =
+  ## Open a tag from a kind enum (TypeKind/StmtKind/… all share TagEnum
+  ## ordinals). A plain `enum` constraint so `ord` type-checks (a union
+  ## constraint does not admit `ord`/`uint32` under nimony's Nim-2 generics).
+  dest.addParLe(cast[TagId](uint32(ord(kind))), info)
 
-proc addParPair*[T: TypeKind|PragmaKind|ExprKind|StmtKind|SubstructureKind|CallConv](
-    dest: var TokenBuf; kind: T; info = NoLineInfo) =
-  dest.add parLeToken(cast[TagId](kind), info)
+proc addParPair*[T: enum](dest: var TokenBuf; kind: T; info = NoLineInfo) =
+  dest.addParLe(cast[TagId](uint32(ord(kind))), info)
   dest.addParRi()
 
-proc parLeToken*[T: TypeKind|SymKind|ExprKind|StmtKind|SubstructureKind|PragmaKind](
-    kind: T; info = NoLineInfo): PackedToken =
-  parLeToken(cast[TagId](kind), info)
+template setTagAt*(dest: var TokenBuf; pos: int; tag: TagId) =
+  ## In-place retag of the token at `pos` (nifcore's `dest[pos]` yields a value,
+  ## so it must be read, mutated, and written back).
+  var t = dest[pos]
+  setTag(t, tag)
+  dest[pos] = t
+template setSymIdAt*(dest: var TokenBuf; pos: int; sym: SymId) =
+  var t = dest[pos]
+  setSymId(t, sym)
+  dest[pos] = t
+proc lastValueStart*(b: TokenBuf): int =
+  ## Index of the head of the last complete value in `b`: skips the trailing
+  ## suffix tokens (line info / extended bits) that follow the value's head.
+  result = b.len - 1
+  while result > 0 and readonlyCursorAt(b, result).kind in {ExtendedSuffix, LineInfoLit}:
+    dec result
 
-proc tagToken*(tag: string; info: PackedLineInfo): PackedToken {.inline.} =
-  parLeToken(pool.tags.getOrIncl(tag), info)
+proc retagAt*[T: enum](dest: var TokenBuf; pos: int; kind: T; info = NoLineInfo) =
+  ## Rewrite the tag of an already-emitted open token at `pos`, preserving its
+  ## sealed jump/body (the classic `dest[pos] = parLeToken(kind, info)` idiom).
+  var t = dest[pos]
+  setTag(t, cast[TagId](uint32(ord(kind))))
+  dest[pos] = t
+proc addParLe*(dest: var TokenBuf; tag: string; info = NoLineInfo) {.inline, nifOpens.} =
+  ## Open a tag by name (replaces the classic `dest.add tagToken(tag)`).
+  dest.addParLe(globalTags.registerTag(tag), info)
 
 template copyIntoKind*(dest: var TokenBuf; kind: TypeKind|SymKind|ExprKind|StmtKind|SubstructureKind|PragmaKind;
-                       info: PackedLineInfo; body: untyped) =
-  dest.add parLeToken(kind, info)
+                       info: NifLineInfo; body: untyped) =
+  {.nifWrap.}
+  dest.addParLe(kind, info)
   body
   dest.addParRi()
 
-template copyIntoKinds*(dest: var TokenBuf; kinds: array[2, StmtKind]; info: PackedLineInfo; body: untyped) =
-  dest.add parLeToken(kinds[0], info)
-  dest.add parLeToken(kinds[1], info)
+template copyIntoKinds*(dest: var TokenBuf; kinds: array[2, StmtKind]; info: NifLineInfo; body: untyped) =
+  {.nifWrap.}
+  dest.addParLe(kinds[0], info)
+  dest.addParLe(kinds[1], info)
   body
   dest.addParRi()
   dest.addParRi()
 
 proc skipParRi(n: var Cursor) =
-  assert n.kind == ParRi, "expected ')'"
+  assert not n.hasMore, "expected ')'"
   consumeParRi n
 
 template copyInto*(dest: var TokenBuf; n: var Cursor; body: untyped) =
-  assert n.kind == ParLe
-  dest.add n
+  assert n.isTagLit
+  dest.addParLe(n.cursorTagId, n.info)
   n.into:
     body
   dest.addParRi()
 
-proc isAtom*(n: Cursor): bool {.inline.} = n.kind < ParLe
+template takeInto*(dest: var TokenBuf; n: var Cursor; body: untyped) =
+  ## Like `copyInto`, but the emitted closing `)` keeps the input close's
+  ## line info — the exact behavior of the classic `takeTree`/`takeParRi`
+  ## pair. Downstream sem phases read close infos (e.g. `addReturnResult`),
+  ## so rewrites of `takeParRi` must use this, not `copyInto`. Under
+  ## `-d:virtualParRi` an elided close yields NoLineInfo.
+  assert n.isTagLit
+  dest.addParLe(n.cursorTagId, n.info)
+  n.into:
+    body
+    dest.addParRi(n.endInfo)
 
-proc copyIntoSymUse*(dest: var TokenBuf; s: SymId; info: PackedLineInfo) {.inline.} =
-  dest.add symToken(s, info)
+proc isAtom*(n: Cursor): bool {.inline.} = n.hasMore and not n.isTagLit
 
-proc copyTree*(dest: var TokenBuf; src: TokenBuf) {.inline.} =
+proc isChildless*(n: Cursor): bool {.inline.} =
+  ## True for a sealed `TagLit` with an empty body, like the bare `proc`
+  ## typeclass `(proctype)` written as `[T: proc]`. `hasMore` on the node
+  ## ITSELF answers a different question -- "are there more tokens left in
+  ## this scope" -- and is true of every node that is there at all; only the
+  ## body cursor carries the child count.
+  n.isTagLit and not sub(n).hasMore
+
+proc copyIntoSymUse*(dest: var TokenBuf; s: SymId; info: NifLineInfo) {.inline, nifEmits: "Y".} =
+  dest.addSymUse(s, info)
+
+proc copyTree*(dest: var TokenBuf; src: TokenBuf) {.inline, nifEmits: "Any".} =
   dest.add src
 
-proc copyTree*(dest: var TokenBuf; src: Cursor) {.inline.} =
+proc copyTree*(dest: var TokenBuf; src: Cursor) {.inline, nifEmits: "Any".} =
   dest.addSubtree src
 
-proc addEmpty*(dest: var TokenBuf; info: PackedLineInfo = NoLineInfo) =
-  dest.add dotToken(info)
+proc addEmpty*(dest: var TokenBuf; info: NifLineInfo = NoLineInfo) {.nifEmits: "Dot".} =
+  dest.addDotToken(info)
 
-proc addEmpty2*(dest: var TokenBuf; info: PackedLineInfo = NoLineInfo) =
-  dest.add dotToken(info)
-  dest.add dotToken(info)
+proc addEmpty2*(dest: var TokenBuf; info: NifLineInfo = NoLineInfo) =
+  dest.addDotToken(info)
+  dest.addDotToken(info)
 
-proc addEmpty3*(dest: var TokenBuf; info: PackedLineInfo = NoLineInfo) =
-  dest.add dotToken(info)
-  dest.add dotToken(info)
-  dest.add dotToken(info)
+proc addEmpty3*(dest: var TokenBuf; info: NifLineInfo = NoLineInfo) =
+  dest.addDotToken(info)
+  dest.addDotToken(info)
+  dest.addDotToken(info)
 
-proc symNameId(s: SymId): StrId =
-  var name = pool.syms[s]
-  extractBasename name
-  pool.strings.getOrIncl(name)
+proc symNameId(s: SymId): StrId = pool.symNameId(s)
+
+proc sameTreesNC(a, b: Cursor): bool =
+  ## Structural equality on nifcore cursors, ignoring sparse line-info
+  ## suffixes (they are not iterated as children).
+  if a.hasMore != b.hasMore: return false
+  if not a.hasMore: return true
+  let ka = a.load.kind
+  if ka != b.load.kind: return false
+  case ka
+  of TagLit:
+    if cursorTagId(a) != cursorTagId(b): return false
+    var ca = childCursor(a)
+    var cb = childCursor(b)
+    while ca.hasMore and cb.hasMore:
+      if not sameTreesNC(ca, cb): return false
+      skip ca
+      skip cb
+    result = ca.hasMore == cb.hasMore
+  of Symbol, SymbolDef: result = symId(a) == symId(b)
+  of IntLit:            result = intVal(a) == intVal(b)
+  of UIntLit:           result = uintVal(a) == uintVal(b)
+  of FloatLit:          result = floatVal(a) == floatVal(b)
+  of StrLit, Ident:     result = strId(a) == strId(b)
+  of CharLit:           result = charLit(a) == charLit(b)
+  of DotToken:          result = true
+  of ExtendedSuffix, LineInfoLit, UnknownToken, EofToken, ParLe, ParRi: result = true
+
+proc sameTreesIgnoreSymIdsNC(a, b: Cursor): bool =
+  let aName = a.hasMore and a.load.kind in {nifcore.Symbol, nifcore.SymbolDef, nifcore.Ident}
+  let bName = b.hasMore and b.load.kind in {nifcore.Symbol, nifcore.SymbolDef, nifcore.Ident}
+  if aName or bName:
+    if not (aName and bName): return false
+    let an = if a.load.kind == nifcore.Ident: a.strId else: symNameId(a.symId)
+    let bn = if b.load.kind == nifcore.Ident: b.strId else: symNameId(b.symId)
+    return an == bn
+  if a.hasMore != b.hasMore: return false
+  if not a.hasMore: return true
+  let ka = a.load.kind
+  if ka != b.load.kind: return false
+  case ka
+  of TagLit:
+    if cursorTagId(a) != cursorTagId(b): return false
+    var ca = childCursor(a)
+    var cb = childCursor(b)
+    while ca.hasMore and cb.hasMore:
+      if not sameTreesIgnoreSymIdsNC(ca, cb): return false
+      skip ca
+      skip cb
+    result = ca.hasMore == cb.hasMore
+  of IntLit:            result = intVal(a) == intVal(b)
+  of UIntLit:           result = uintVal(a) == uintVal(b)
+  of FloatLit:          result = floatVal(a) == floatVal(b)
+  of StrLit:            result = strId(a) == strId(b)
+  of CharLit:           result = charLit(a) == charLit(b)
+  of DotToken:          result = true
+  of Symbol, SymbolDef, Ident, ExtendedSuffix, LineInfoLit,
+     UnknownToken, EofToken, ParLe, ParRi: result = true
 
 proc sameTrees*(a, b: Cursor): bool =
-  var a = a
-  var b = b
-  var nested = 0
-  let isAtom = a.kind != ParLe
-  while true:
-    if a.kind != b.kind: return false
-    case a.kind
-    of ParLe:
-      if a.tagId != b.tagId: return false
-      inc nested
-    of ParRi:
-      dec nested
-      if nested == 0: return true
-    of Symbol, SymbolDef:
-      if a.symId != b.symId: return false
-    of IntLit:
-      if a.intId != b.intId: return false
-    of UIntLit:
-      if a.uintId != b.uintId: return false
-    of FloatLit:
-      if a.floatId != b.floatId: return false
-    of StringLit, Ident:
-      if a.litId != b.litId: return false
-    of CharLit, UnknownToken:
-      if a.uoperand != b.uoperand: return false
-    of DotToken, EofToken: discard "nothing else to compare"
-    if isAtom: return true
-    inc a
-    inc b
-  return false
-
+  return sameTreesNC(a, b)
 proc sameTreesButIgnoreSymIds*(a, b: Cursor): bool =
   ## Like `sameTrees` but maps symbols back to their base identifier names.
   ## Used for forward declaration matching and concept requirement comparison.
-  var a = a
-  var b = b
-  var nested = 0
-  let isAtom = a.kind != ParLe
-  while true:
-    # Handle symbol/ident comparison specially
-    let aIsName = a.kind in {Symbol, SymbolDef, Ident}
-    let bIsName = b.kind in {Symbol, SymbolDef, Ident}
-    if aIsName and bIsName:
-      let aName = if a.kind == Ident: a.litId else: symNameId(a.symId)
-      let bName = if b.kind == Ident: b.litId else: symNameId(b.symId)
-      if aName != bName: return false
-    elif aIsName or bIsName:
-      return false  # one is name, other is not
-    elif a.kind != b.kind:
-      return false
-    else:
-      case a.kind
-      of ParLe:
-        if a.tagId != b.tagId: return false
-        inc nested
-      of ParRi:
-        dec nested
-        if nested == 0: return true
-      of IntLit:
-        if a.intId != b.intId: return false
-      of UIntLit:
-        if a.uintId != b.uintId: return false
-      of FloatLit:
-        if a.floatId != b.floatId: return false
-      of StringLit:
-        if a.litId != b.litId: return false
-      of CharLit, UnknownToken:
-        if a.uoperand != b.uoperand: return false
-      of DotToken, EofToken: discard
-      of Symbol, SymbolDef, Ident: discard  # handled above
-    if isAtom: return true
-    inc a
-    inc b
-  return false
-
+  return sameTreesIgnoreSymIdsNC(a, b)
 proc isDeclarative*(n: Cursor): bool =
   case n.stmtKind
   of FromimportS, ImportS, ExportS, IncludeS, ImportexceptS, TypeS, CommentS, TemplateS:
@@ -374,7 +427,7 @@ const
 
 proc extractPragma*(n: Cursor; kind: PragmaKind): Cursor =
   var n = n
-  if n.kind != DotToken:
+  if not n.isDotToken:
     n.into:  # (pragmas …)
       while n.hasMore:
         if pragmaKind(n) == kind:
@@ -388,18 +441,27 @@ proc hasPragma*(n: Cursor; kind: PragmaKind): bool =
 
 proc hasPragmaOfValue*(n: Cursor; kind: PragmaKind; val: string): bool =
   let p = extractPragma(n, kind)
-  result = not cursorIsNil(p) and p.kind == StringLit and pool.strings[p.litId] == val
+  result = not cursorIsNil(p) and p.isStringLit and pool.strings[p.strId] == val
 
 const
   TypeModifiers* = {MutT, OutT, LentT, SinkT, StaticT}
 
 proc removeModifier*(a: var Cursor) =
-  if a.kind == ParLe and a.typeKind in TypeModifiers:
+  if a.isTagLit and a.typeKind in TypeModifiers:
     inc a
 
 proc skipModifier*(a: Cursor): Cursor =
   result = a
   removeModifier(result)
+
+proc skipOwned*(a: Cursor): Cursor {.inline.} =
+  ## `owned T` is a `T` for everything but ownership (RFC #575).
+  result = a
+  if result.isTagLit and result.typeKind == OwnedT:
+    inc result
+
+proc skipModifierAndOwned*(a: Cursor): Cursor {.inline.} =
+  result = skipOwned(skipModifier(a))
 
 const
   LocalDecls* = {VarS, LetS, ConstS, ResultS, CursorS, PatternvarS, GvarS, TvarS, GletS, TletS}
@@ -429,6 +491,9 @@ proc skipToReturnType*(n: var Cursor) =
 proc procHasPragma*(typ: Cursor; kind: PragmaKind): bool =
   var typ = typ
   if typ.typeKind in RoutineTypes:
+    # A childless routine type is the bare `proc` typeclass, as written in
+    # `[T: proc]`: nothing to walk to, and no pragmas to find.
+    if isChildless(typ): return false
     skipToReturnType typ
     skip typ, SkipType # return type
     result = hasPragma(typ, kind)
@@ -451,9 +516,42 @@ proc whichEffect*(k: StmtKind; pragmas: Cursor): Effect =
   else:
     result = HasSideEffect
 
+proc calleeEffect*(calleeType: Cursor; pragmas: Cursor): Effect =
+  ## The effect of CALLING something of type `calleeType`. `calleeType` is
+  ## what `getType` answers for the callee: a routine decl tag
+  ## (`proc`/`func`/`iterator`/…) or a routine TYPE form
+  ## (`proctype`/`itertype`). `iterator` is `noSideEffect` by default
+  ## (doc/language.md), and the itertype of a first-class closure-iterator
+  ## value says the same thing about the routine behind it — otherwise a
+  ## `for` loop over an iter VALUE would be rejected inside any `func` or
+  ## iterator body, while the same loop over the iter SYM is accepted.
+  if calleeType.typeKind == ItertypeT:
+    whichEffect(IteratorS, pragmas)
+  else:
+    whichEffect(calleeType.stmtKind, pragmas)
+
+proc isAddrOfAconstrUarray*(n: Cursor): bool =
+  ## True when `n` points at `(addr (aconstr (uarray T) …))`, the
+  ## static-uarray-pointer shape `exprexec` produces for an evaluated
+  ## const payload. `lengcgen` hoists exactly this shape into a module
+  ## level `(const <anon> …)` and rewrites the site to
+  ## `cast[ptr T](addr <anon>)`, so it is what makes the storage static;
+  ## anything failing this test is an ordinary address-of. The `uarray`
+  ## slot is the discriminator -- do not drop it.
+  ## Checks the `addr` tag itself so the test is safe to apply to an
+  ## arbitrary expression, not only inside an already-matched addr case.
+  result = false
+  if n.exprKind in {AddrX, HaddrX}:
+    var inner = n
+    inc inner # past addr tag
+    if inner.exprKind == AconstrX:
+      var typSlot = inner
+      inc typSlot # past aconstr tag
+      result = typSlot.typeKind == UarrayT
+
 proc isNilAnnotation*(n: Cursor): bool {.inline.} =
   ## Returns true if `n` is a `(notnil)`, `(nil)`, or `(unchecked)` annotation.
-  n.kind == ParLe and n.substructureKind in {NotnilU, NilU, UncheckedU}
+  n.isTagLit and n.substructureKind in {NotnilU, NilU, UncheckedU}
 
 proc skipNilAnnotation*(n: var Cursor) {.inline.} =
   ## Skip a trailing nil annotation `(notnil)`, `(nil)`, or `(unchecked)`
@@ -461,3 +559,65 @@ proc skipNilAnnotation*(n: var Cursor) {.inline.} =
   ## may have appended when an importc'd pointer alias was inlined.
   while n.hasMore:
     skip n
+
+proc needsTemp*(n: Cursor): bool =
+  ## Must `n` be bound to a temporary to be evaluated more than once? A
+  ## literal or a location built from symbols is read again for free; anything
+  ## with a call or a constructor in it is not.
+  # Pre-initialise: the contract analyser drops the `IfFalse cf s`
+  # implication for the leaving-path cfvar raised inside the inner
+  # while-loop, so it cannot prove `result` is set on the normal exit of
+  # the AtX branch. `result = false` here is the bool default anyway —
+  # run `bin/nimony c --verbose src/hexer/desugar.nim` (with this line
+  # removed) to see the Final IR that trips the checker.
+  result = false
+  case n.kind
+  of Symbol, IntLit, UIntLit, FloatLit, CharLit, StrLit:
+    result = false
+  of TagLit:
+    var n = n
+    case n.exprKind
+    of NilX, FalseX, TrueX, InfX, NeginfX, NanX, SizeofX, CanFormCyclesX, SupportsCopyMemX:
+      result = false
+    of ExprX:
+      n = sub(n)  # throwaway copy; bounds the probe under vpr
+      let first = n
+      skip n
+      if not n.hasMore:
+        # single element expr
+        result = needsTemp(first)
+      else:
+        result = true
+    of SufX:
+      inc n
+      result = needsTemp(n)
+    of DconvX:
+      inc n
+      skip n
+      result = needsTemp(n)
+    of AtX, PatX, ArratX, TupatX, DotX, DdotX, ParX, AddrX, HaddrX:
+      result = false
+      n = sub(n)  # throwaway copy; bounds the walk under vpr
+      while n.hasMore:
+        if needsTemp(n):
+          return true
+        skip n
+    of ErrX, DerefX, AndX, OrX, XorX, NotX, NegX, AlignofX,
+        OffsetofX, OconstrX, AconstrX, BracketX, CurlyX, CurlyatX,
+        OvfX, AddX, SubX, SuccX, PredX, MulX, DivX, ModX, ShrX, ShlX, BitandX,
+        BitorX, BitxorX, BitnotX, EqX, NeqX, LeX, LtX, CastX,
+        ConvX, CallX, CmdX, CchoiceX, OchoiceX, PragmaxX, QuotedX,
+        HderefX, NewrefX, NewobjX, TupX, TupconstrX, SetconstrX,
+        TabconstrX, AshrX, BaseobjX, HconvX, CallstrlitX, InfixX,
+        PrefixX, HcallX, CompilesX, StaticX, DeclaredX, DefinedX, AstToStrX, BindSymX, BindSymNameX,
+        InstanceofX, ProccallX, HighX, LowX, TypeofX, UnpackX,
+        FieldsX, FieldpairsX, EnumtostrX, IsmainmoduleX, InstantiationinfoX,
+        DefaultobjX, DefaulttupX, DefaultdistinctX, DelayX,
+        Delay0X, SuspendX, DoX, PlussetX, MinussetX, MulsetX,
+        XorsetX, EqsetX, LesetX, LtsetX, InsetX, CardX, EmoveX,
+        DestroyX, DupX, CopyX, WasmovedX, SinkhX, TraceX,
+        InternalTypeNameX, InternalFieldPairsX, FailedX, IsX,
+        EnvpX, KvX, ToClosureX, PluginCallX, NoExpr:
+      result = true
+  else:
+    result = true

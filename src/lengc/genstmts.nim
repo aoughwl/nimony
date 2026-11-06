@@ -12,7 +12,8 @@
 proc genEmitStmt(c: var GeneratedCode; n: var Cursor) =
   n.loopInto:
     if n.kind == StrLit:
-      c.add c.m.pool.strings[n.litId]
+      let code = c.m.pool.strings[n.litId]
+      c.add code
       inc n
     else:
       genx c, n
@@ -94,7 +95,7 @@ proc genIte(c: var GeneratedCode; n: var Cursor) =
       c.genStmt n # then-part is always taken
       # emit the label:
       if isLast:
-        c.add mangleToC(c.m.pool.syms[vflag])
+        c.add mangleToC(c.m.pool.symString(vflag))
         c.add Colon
         c.add Semicolon
       skip n      # else-part is always ignored
@@ -118,6 +119,7 @@ proc genIte(c: var GeneratedCode; n: var Cursor) =
   c.add Semicolon
 
 proc genLoop(c: var GeneratedCode; n: var Cursor) =
+  ## `(loop body)`: infinite, left only by a `break`/`jmp` inside the body.
   let oldInToplevel = c.inToplevel
   c.inToplevel = false
   n.into:
@@ -128,17 +130,6 @@ proc genLoop(c: var GeneratedCode; n: var Cursor) =
     c.add ParRi
     c.add Space
     c.add CurlyLe
-    c.genStmt n # pre condition statements
-    c.add IfKeyword
-    c.add Space
-    c.add ParLe
-    c.add "!"
-    c.add ParLe
-    c.genx n # loop condition
-    c.add ParRi
-    c.add ParRi
-    c.add BreakKeyword
-    c.add Semicolon
     c.genStmt n # loop body
     c.add CurlyRi
     while n.hasMore: skip n
@@ -290,7 +281,7 @@ proc genCaseCond(c: var GeneratedCode; n: var Cursor) =
 proc genLabel(c: var GeneratedCode; n: var Cursor) =
   n.into:
     if n.kind == SymbolDef:
-      let name = mangleToC(c.m.pool.syms[n.symId])
+      let name = mangleToC(c.m.pool.symString(n.symId))
       c.add name
       c.add Colon
       c.add Semicolon
@@ -302,7 +293,7 @@ proc genLabel(c: var GeneratedCode; n: var Cursor) =
 proc genGoto(c: var GeneratedCode; n: var Cursor) =
   n.into:
     if n.kind == Symbol:
-      let name = mangleToC(c.m.pool.syms[n.symId])
+      let name = mangleToC(c.m.pool.symString(n.symId))
       c.add GotoKeyword
       c.add name
       c.add Semicolon
@@ -368,7 +359,7 @@ proc genMflagDecl(c: var GeneratedCode; n: var Cursor) =
       c.m.registerLocal(s, createIntegralType(c.m, "(bool)"))
       c.add "NB8"
       c.add Space
-      c.add mangleToC(c.m.pool.syms[s])
+      c.add mangleToC(c.m.pool.symString(s))
       c.add Semicolon
       inc n
     else:
@@ -398,7 +389,7 @@ proc genJtrue(c: var GeneratedCode; n: var Cursor) =
         if not n.hasMore:
           # last symbol becomes a target goto:
           c.add GotoKeyword
-          c.add mangleToC(c.m.pool.syms[s])
+          c.add mangleToC(c.m.pool.symString(s))
           c.add Semicolon
       else:
         error c.m, "expected Symbol but got: ", n
@@ -421,10 +412,11 @@ proc genVar(c: var GeneratedCode; n: var Cursor; vk: VarKind; toExtern = false; 
       genVarDecl c, n, IsConst, toExtern, useStatic
 
 proc genKeepOverflow(c: var GeneratedCode; n: var Cursor) =
-  n.into:  # (keepovf …)
+  n.into:  # (keepovf <op> <dest>)
     let op = n.exprKind
     var gcc = ""
     var prefix = "__builtin_"
+    var checkable = true
     case op
     of AddC:
       gcc.add "add"
@@ -439,63 +431,74 @@ proc genKeepOverflow(c: var GeneratedCode; n: var Cursor) =
       gcc.add "mod_"
       prefix = "_Qlengc_"
     else:
-      error c.m, "expected arithmetic operation but got: ", n
-    var isLongLong = false
-    n.into:  # (add | sub | mul | … <type> lhs rhs)
-      if n.typeKind == IT:
-        gcc = prefix & "s" & gcc
-      elif n.typeKind == UT:
-        gcc = prefix & "u" & gcc
-      else:
-        error c.m, "expected integer type but got: ", n
-      n.into:  # (i bits) | (u bits)
-        if n.kind == IntLit:
-          let bits = intVal(n)
-          if bits == 64 or (bits == -1 and c.bits == 64):
-            gcc.add "ll"
-            isLongLong = true
-          inc n
-        else:
-          error c.m, "expected integer literal but got: ", n
-        while n.hasMore: skip n
+      # The operation is gone: an optimizer rewrite replaced it with something
+      # that cannot overflow. `(mul T x 1)` and `(add T x 0)` collapse to `x`,
+      # `(mul T x 0)` and `(sub T x x)` to `0`, and constant folding turns
+      # literal operands into a literal. Every rewrite that can leave a
+      # non-arithmetic node here yields a value that provably cannot overflow,
+      # so there is no check to emit: store the value and clear the flag, this
+      # `keepovf` did not overflow. Erroring out instead made `newSeq[T](1)`
+      # fail to compile at `-d:release`, where `(mul T 1 (sizeof T))` folds to
+      # `(sizeof T)`.
+      checkable = false
+    if not checkable:
+      var value = n
+      skip n            # the value
+      genLvalue c, n    # the destination
+      c.add AsgnOpr
+      genx c, value
+      c.add Semicolon
       c.currentProc.needsOverflowFlag = true
-      c.add IfKeyword
-      c.add ParLe
-      gcc.add "_overflow"
-      c.add gcc
-      c.add ParLe
-      genx c, n
+      c.add OvfToken
+      c.add AsgnOpr
+      c.add "NIM_FALSE"
+      c.add Semicolon
+    else:
+      var isLongLong = false
+      let opName = gcc
+      n.into:  # (add | sub | mul | … <type> lhs rhs)
+        if n.typeKind == IT:
+          gcc = prefix & "s" & gcc
+        elif n.typeKind == UT:
+          gcc = prefix & "u" & gcc
+        else:
+          error c.m, "expected integer type but got: ", n
+        n.into:  # (i bits) | (u bits)
+          if n.kind == IntLit:
+            let bits = intVal(n)
+            if bits == 64 or (bits == -1 and c.bits == 64):
+              gcc.add "ll"
+              isLongLong = true
+            elif (bits == 8 or bits == 16) and prefix == "__builtin_":
+              # `__builtin_[su]add_overflow` stores an `int` through its
+              # pointer; the type-generic builtin stores the narrow type and
+              # reports an overflow of that type
+              gcc = prefix & opName
+            inc n
+          else:
+            error c.m, "expected integer literal but got: ", n
+          while n.hasMore: skip n
+        c.currentProc.needsOverflowFlag = true
+        # Not sticky: the flag is this operation's verdict alone.
+        c.add OvfToken
+        c.add AsgnOpr
+        gcc.add "_overflow"
+        c.add gcc
+        c.add ParLe
+        genx c, n
+        c.add Comma
+        genx c, n
+        while n.hasMore: skip n
       c.add Comma
-      genx c, n
-      while n.hasMore: skip n
-    c.add Comma
-    if isLongLong:
-      c.add "(long long int*)"
-      c.add ParLe
-    c.add Amp
-    genLvalue c, n
-    if isLongLong:
+      if isLongLong:
+        c.add "(long long int*)"
+        c.add ParLe
+      c.add Amp
+      genLvalue c, n
+      if isLongLong:
+        c.add ParRi
       c.add ParRi
-    c.add ParRi
-    c.add ParRi # end of condition
-    c.add CurlyLe
-    c.add OvfToken
-    c.add AsgnOpr
-    c.add OvfToken
-    c.add " || "
-    c.add "NIM_TRUE"
-    c.add Semicolon
-    c.add CurlyRi
-    while n.hasMore: skip n
-
-proc genStore(c: var GeneratedCode; n: var Cursor) =
-  n.into:
-    var rhs = n
-    skip n
-    genLvalue c, n
-    c.add AsgnOpr
-    genx c, rhs
-    c.add Semicolon
+      c.add Semicolon
     while n.hasMore: skip n
 
 proc genStmt(c: var GeneratedCode; n: var Cursor) =
@@ -505,7 +508,7 @@ proc genStmt(c: var GeneratedCode; n: var Cursor) =
       inc n
     else:
       error c.m, "expected statement but got: ", n
-  of StmtsS:
+  of StmtsS, AlwaysS:
     n.loopInto:
       genStmt(c, n)
   of ScopeS:
@@ -515,6 +518,9 @@ proc genStmt(c: var GeneratedCode; n: var Cursor) =
     c.inToplevel = oldInToplevel
   of CallS:
     genCall c, n
+    c.add Semicolon
+  of InstrS:
+    genInstr c, n
     c.add Semicolon
   of VarS:
     genVar c, n, IsLocal
@@ -538,7 +544,6 @@ proc genStmt(c: var GeneratedCode; n: var Cursor) =
       genx c, n
       c.add Semicolon
       while n.hasMore: skip n
-  of StoreS: genStore c, n
   of IfS: genIf c, n
   of IteS, ItecS: genIte c, n
   of WhileS: genWhile c, n

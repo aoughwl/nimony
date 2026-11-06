@@ -1,13 +1,45 @@
 import std/syncio
 
-template assert*(cond: bool; msg = "") =
-  if not cond:
-    echo "[Assertion Failure] ", msg
-    quit 1
+const assertionsEnabled* = not defined(danger) and not defined(noAssertions)
+  ## Whether `assert` expands to anything at all. Follows Nim's convention:
+  ## `-d:release` KEEPS assertions, `-d:danger` removes them, and
+  ## `-d:noAssertions` removes them on its own — the last one so a build can drop
+  ## the checks without also turning off bound checks and overflow checks, which
+  ## is what you want when profiling: an `assert` costs a compare, a branch and a
+  ## string literal at every call site, and those are not what is being measured.
 
 proc raiseAssert*(msg: string) {.noreturn.} =
   echo "[Assertion Failure] ", msg
   quit 1
+
+proc failedAssertImpl*(msg: string) {.noinline, noSideEffect, noreturn.} =
+  ## Raises an assertion failure, but is hidden from the effect system: the
+  ## process terminates, so a failed assertion cannot return a side effect to
+  ## its caller. Mirrors upstream Nim's `failedAssertImpl`, and keeps `assert`
+  ## usable inside `func` (and therefore inside read-only accessors).
+  {.cast(noSideEffect).}:
+    raiseAssert(msg)
+
+template assert*(cond: bool; msg = "") =
+  when assertionsEnabled:
+    # The failure path is a single `noreturn` CALL, never inlined code. Expanding
+    # `echo`+`quit` at every site added ~30 instructions of cold code to procs
+    # whose hot body is two — which bloats the image, wrecks I-cache density and
+    # (worse) pushes tiny accessors like `nifcore.kind` over the inliner's size
+    # cap, so they stay real calls forever.
+    if not cond:
+      failedAssertImpl(msg)
+  else:
+    # Compiled out entirely. `assert` is a run-time debugging aid and nothing
+    # more: a claim the contract prover may rely on is `{.assert: cond.}`, which
+    # is judged at compile time and cannot be switched off.
+    discard
+
+template rcOf[T](r: ref T): int =
+  ## The zero-based count in the header word at offset 0. A runtime that keeps
+  ## flags in its low bits (Nim's `orc`) says how many with `nimRcShift`.
+  when declared(nimRcShift): cast[ptr int](r)[] shr nimRcShift
+  else: cast[ptr int](r)[]
 
 template assertRc*[T](r: ref T; expected: int; tag: string = "") =
   ## Diagnostic for ref-count tracking. `r` is a `ref T`, internally a
@@ -18,7 +50,7 @@ template assertRc*[T](r: ref T; expected: int; tag: string = "") =
   ## `assertRc(myRef, 0)` after construction or `assertRc(myRef, n)` after
   ## n duplications to catch over- or under-counting before the symptom
   ## (UAF, double-free, leak) drifts far from the cause.
-  let actualRc = cast[ptr int](r)[]
+  let actualRc = rcOf(r)
   if actualRc != expected:
     echo "[assertRc] ", tag, " rc=", actualRc, " expected=", expected,
          " ptr=", cast[int](r)
@@ -32,7 +64,7 @@ template assertRcAlive*[T](r: ref T; tag: string = "") =
   ## absolute rc) since arcDec'd-into-positive-billions still indicates the
   ## block was reused for an unrelated allocation.
   if r != nil:
-    let actualRc = cast[ptr int](r)[]
+    let actualRc = rcOf(r)
     # Plausible rc values are in [-1, ~10000]. Anything else is corruption.
     if actualRc < -1 or actualRc > 10_000:
       echo "[assertRcAlive] ", tag, " rc=", actualRc, " (corrupt)",

@@ -6,6 +6,9 @@
 
 ## Logic for mapping a (file, line, col) key to the file's content.
 
+when defined(nimony):
+  {.feature: "assumeSync".}  # compiler-internal globals; single threaded
+
 import std / syncio
 import std/[tables, hashes, strutils]
 
@@ -31,7 +34,9 @@ proc loadFile*(filename: string) {.canRaise.} =
   var nl = find(entry.content, '\n')
   while nl > 0:
     entry.lineStarts.add nl
-    nl = find(entry.content, '\n', nl + 1)
+    let next = nl + 1
+    {.assume: 0 <= next.} # `find` returns an index of `entry.content`: no wrap
+    nl = find(entry.content, '\n', next)
   gFileLineCache.files[filename] = ensureMove entry
 
 proc extract*(filename: string; start, finish: FilePosition): string {.canRaise.} =

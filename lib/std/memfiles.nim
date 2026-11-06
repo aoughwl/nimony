@@ -10,6 +10,14 @@ when defined(windows):
   import widestrs
 elif defined(posix):
   import posix / posix
+
+  when defined(osx):
+    proc createOpen(path: cstring; flags: cint): cint {.varargs, importc: "open", sideEffect.}
+      ## `posix.open` with a variadic C prototype, like libc's. `posix.open` is
+      ## fixed-arity, and on Apple arm64 a variadic argument goes on the stack
+      ## rather than in a register, so libc would read a garbage `mode`.
+  else:
+    template createOpen(path: cstring; flags: cint; mode: Mode): cint = open(path, flags, mode)
 else:
   {.error: "the memfiles module is not supported on your operating system!".}
 
@@ -202,7 +210,7 @@ proc open*(filename: string, mode: FileMode = fmRead,
       let fc = filename.toCString()
       if fc.isNil:
         raise OutOfMemError
-      result.handle = cint(pcall(open(fc, flags, permissionsMode)))
+      result.handle = cint(pcall(createOpen(fc, flags, permissionsMode)))
       if result.handle >= 0:
         if (let e = setFileSize(result.handle, newFileSize);
             e != 0.OSErrorCode): fail(e, "error setting file size")
@@ -232,7 +240,7 @@ proc open*(filename: string, mode: FileMode = fmRead,
       result.flags = result.flags or MAP_SHARED
 
     let pr = if readonly: PROT_READ else: PROT_READ or PROT_WRITE
-    result.mem = mmap(nil, result.size, pr, result.flags, result.handle, offset)
+    result.mem = mmap(nil, csize_t(result.size), pr, result.flags, result.handle, offset)
     if mmapFailed(result.mem):
       fail(OSErrorCode(mmapErrno(result.mem)), "file mapping failed")
 
@@ -258,7 +266,7 @@ proc close*(f: var MemFile) {.raises.} =
       if error:
         lastErr = osLastError()
   else:
-    let mr = pcall(munmap(f.mem, f.size))
+    let mr = pcall(munmap(f.mem, csize_t(f.size)))
     error = mr < 0
     lastErr = if mr < 0: OSErrorCode(int32(0 - mr)) else: OSErrorCode(0)
     if f.handle >= 0:

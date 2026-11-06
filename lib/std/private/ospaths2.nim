@@ -247,6 +247,10 @@ proc isAbsolute*(path: string): bool {.noSideEffect, raises: [].} =
     result = path[0] == '/'
   elif defined(nodejs):
     {.emit: [result," = require(\"path\").isAbsolute(",path.cstring,");"].}
+  elif defined(standalone):
+    # freestanding (wasm32): no real filesystem — paths are host-virtual and
+    # posix-shaped by convention
+    result = path[0] == '/'
   else:
     raiseAssert "unreachable" # if ever hits here, adapt as needed
 
@@ -871,17 +875,16 @@ when not defined(nimscript) and supportedSystem:
       var bufsize = 1024 # should be enough
       result = newString(bufsize)
       while true:
-        if getcwd(result.toCString(), bufsize) != nil:
+        let r = tryGetcwd(result.toCString(), bufsize)
+        if r == 0:
           setLen(result, len(result.toCString()))   # libc-free `len(cstring)` (system/stringimpl)
           break
+        elif r == -clong(ERANGE):
+          bufsize = bufsize shl 1
+          assert(bufsize >= 0)
+          result = newString(bufsize)
         else:
-          let err = osLastError()
-          if err.int32 == ERANGE:
-            bufsize = bufsize shl 1
-            assert(bufsize >= 0)
-            result = newString(bufsize)
-          else:
-            raiseOSError(osLastError())
+          raiseOSError(OSErrorCode(-r))
 
 proc absolutePath*(path: string, root = when supportedSystem: getCurrentDir() else: ""): string {.raises.} =
   ## Returns the absolute path of `path`, rooted at `root` (which must be absolute;

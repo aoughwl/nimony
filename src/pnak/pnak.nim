@@ -63,7 +63,7 @@ package. The block is delimited by sentinel comments so user content
 in `nim.cfg` is preserved across runs.
 ]##
 
-import std / [os, osproc, parseopt, strutils, syncio, assertions, tables, deques, algorithm, json, sets, times, terminal, streams]
+import std / [os, osproc, parseopt, strutils, syncio, assertions, tables, deques, algorithm, json, sets, times, terminal, streams, tempfiles]
 
 import ".." / lib / [nifcore, nifcoreparse]
 import ".." / lib / tooldirs
@@ -255,16 +255,20 @@ proc parseNimbleViaNifler(nimbleFile: string): TokenBuf =
   let nifler = findTool("nifler")
   if nifler.len == 0 or not fileExists(nifler):
     quit "cannot find nifler tool; build it with `hastur build nifler`"
-  let outFile = getTempDir() / "pnak_" &
-                extractFilename(nimbleFile).changeFileExt("nif")
+  # A directory of our own: a fixed name in the shared temp dir could be
+  # pre-created (as a symlink, say) by another user of the machine.
+  let tmpDir = createTempDir("pnak_", "")
+  let outFile = tmpDir / extractFilename(nimbleFile).changeFileExt("nif")
   let cmd = quoteShell(nifler) & " parse " &
             quoteShell(nimbleFile) & " " & quoteShell(outFile)
   let (output, exitCode) = execCmdEx(cmd)
   if exitCode != 0:
+    removeDir(tmpDir)
     quit "nifler failed on " & nimbleFile & ": " & output
   # `parseFromFile` consumes the `(.nif…)` header directives and reads the
   # whole tree into a fresh nifcore TokenBuf (with the PnakTag-seeded pool).
   result = parseFromFile(outFile, sharedTags = pnakTags())
+  removeDir(tmpDir)
 
 # ---------------------------------------------------------------------------
 # Cursor-based traversal of the parsed nimble file
@@ -385,6 +389,21 @@ proc parsePnakNif(nifFile: string): NimbleSpec =
 proc run(cmd: string): bool =
   execShellCmd(cmd) == 0
 
+proc checkGitArg(s, what: string) =
+  ## URLs and commits come from `.nimble` files, `pnak.nif` lockfiles and
+  ## packages.json -- other people's text. Quoting keeps the shell out of them,
+  ## but git still reads a word that starts with `-` as an option
+  ## (`--upload-pack=<cmd>` runs a command), so such a word is refused.
+  if s.startsWith("-"):
+    fatal "refusing ", what, " that starts with '-': ", s
+
+proc checkPkgName(name: string) =
+  ## A package name becomes a directory under `deps/`; one that is not a
+  ## single plain path component would put the clone somewhere else.
+  if name.len == 0 or name == "." or name == ".." or name.startsWith("-") or
+      name.contains({'/', '\\', '\0'}):
+    fatal "refusing package name: ", name
+
 proc gitFetch(pkgDir, url: string) =
   if not run("git -C " & quoteShell(pkgDir) & " fetch --tags origin"):
     quit "git fetch failed for " & url
@@ -408,13 +427,15 @@ proc gitClone(url, dest, commit: string; shallow: bool) =
   ## `--shallow-submodules` mirrors the depth=1 choice down into them so
   ## a shallow request stays shallow throughout. Both are no-ops on repos
   ## that don't carry a `.gitmodules`.
+  checkGitArg(url, "URL")
+  checkGitArg(commit, "commit")
   createDir(dest.parentDir)
   var cmd = "git clone --recurse-submodules "
   if shallow:
     cmd.add "--depth 1 --shallow-submodules "
     if commit.len > 0:
       cmd.add "--branch " & quoteShell(commit) & " "
-  cmd.add quoteShell(url) & " " & quoteShell(dest)
+  cmd.add "-- " & quoteShell(url) & " " & quoteShell(dest)
   if not run(cmd):
     quit "git clone failed for " & url
 
@@ -452,6 +473,7 @@ proc gitSync(pkgDir, commit: string) =
   ## `reset --hard` is appropriate here: dependency directories should not
   ## carry local edits, and the BFS treats updates as equivalent to a
   ## fresh checkout.
+  checkGitArg(commit, "commit")
   var target = ""
   if commit.len == 0:
     let b = gitDefaultBranch(pkgDir)
@@ -758,6 +780,8 @@ type
     pkgDir: string
 
 proc startGitClone(req: Requirement; pkgDir: string; shallow: bool): Process =
+  checkGitArg(req.url, "URL")
+  checkGitArg(req.commit, "commit")
   createDir(pkgDir.parentDir)
   var args = @["clone", "--quiet", "--recurse-submodules"]
   if shallow:
@@ -767,6 +791,7 @@ proc startGitClone(req: Requirement; pkgDir: string; shallow: bool): Process =
     if req.commit.len > 0:
       args.add "--branch"
       args.add req.commit
+  args.add "--"
   args.add req.url
   args.add pkgDir
   startProcess("git", args = args, options = {poUsePath, poStdErrToStdOut})
@@ -830,6 +855,7 @@ proc tryDispatch(c: var Context; queue: var Deque[PendingNode];
       continue
     if dedupHit(c, p): continue
 
+    checkPkgName(p.req.name)
     let entry = c.depsDir / p.req.name
     if fileExists(entry):
       let target = readLinkFile(entry)
@@ -929,32 +955,47 @@ const
   CfgBegin = "# >>> pnak begin (managed block — do not edit) <<<"
   CfgEnd = "# <<< pnak end >>>"
 
-proc cfgPathSpec(c: Context; r: Resolved; cfgDir: string): string =
-  ## Path to use in a `--path:` directive — relative to `cfgDir` when
-  ## possible (so the project is movable), else absolute.
-  let target = if r.srcDir.len > 0: r.dir / r.srcDir else: r.dir
+proc cfgPathSpecOf(target, cfgDir: string): string =
+  ## Path to use in a `--path:` directive — relative to `cfgDir` so the
+  ## project stays movable, including `..` for sibling link targets (a
+  ## sibling checkout is the normal co-development layout). Falls back to
+  ## absolute only when no relative path exists (e.g. a different drive).
   result = relativePath(target.normalizedPath(),
                         cfgDir.absolutePath, '/')
-  if result.startsWith("..") or isAbsolute(result):
-    # outside cfgDir (typical for link-file targets) — keep absolute form
+  if result.len == 0 or isAbsolute(result):
     result = target.normalizedPath()
 
-proc generateBlock(c: Context; cfgPath: string; kind: ConfigKind): string =
+proc cfgPathSpec(c: Context; r: Resolved; cfgDir: string): string =
+  let target = if r.srcDir.len > 0: r.dir / r.srcDir else: r.dir
+  result = cfgPathSpecOf(target, cfgDir)
+
+proc emitPath(result: var string; p: string; kind: ConfigKind) =
+  # The path is written into a config file inside quotes (nim.cfg) or as a
+  # whole line (nimony.paths); a quote or line break in it -- a directory
+  # named by a dependency -- would end it and start an option of its own.
+  if p.contains({'"', '\n', '\r', '\0'}):
+    fatal "refusing to write path into config: ", p.escape
+  case kind
+  of NimCfg: result.add "--path:\"" & p & "\"\n"
+  of NimonyPaths: result.add p & "\n"
+
+proc generateBlock(c: Context; cfgPath, rootDir, rootSrcDir: string;
+                   kind: ConfigKind): string =
   let cfgDir = cfgPath.parentDir
   result = CfgBegin & "\n"
-  # Sort by name for deterministic output across runs.
+  # The consuming package's own source dir first, so its modules resolve
+  # without a separate hand-maintained entry. A srcDir-less root already
+  # resolves from the compile cwd — emitting "." for it is pure noise
+  # (and tpaths_basic pins the srcDir-only behavior).
+  if rootSrcDir.len > 0:
+    emitPath(result, cfgPathSpecOf(rootDir / rootSrcDir, cfgDir), kind)
+  # Then the resolved dependencies, sorted by name for deterministic output.
   var names: seq[string] = @[]
   for k in c.resolved.keys: names.add k
   names.sort(cmp[string])
   for name in names:
     let r = c.resolved[name]
-    let p = cfgPathSpec(c, r, cfgDir)
-    case kind
-    of NimCfg:
-      result.add "--path:\"" & p & "\"\n"
-    of NimonyPaths:
-      result.add p
-      result.add "\n"
+    emitPath(result, cfgPathSpec(c, r, cfgDir), kind)
   result.add CfgEnd & "\n"
 
 proc patchNimCfg(cfgPath, blockText: string) =
@@ -1062,6 +1103,7 @@ proc translateCmd(c: var Context; pkg, version: string) =
   if not resolveUrl(c, req):
     fatal "cannot resolve ", pkg
 
+  checkPkgName(req.name)
   let repo = lookupRepoDir(req.name)
   if not dirExists(repo):
     say mInfo, "cloning ", req.url, " -> ", repo
@@ -1201,7 +1243,8 @@ proc handleCmdLine() =
         if cfgFile.len > 0: cfgFile
         else: cfgAnchor / "nimony.paths"
       let kind = if cfgPath.endsWith(".cfg"): NimCfg else: NimonyPaths
-      patchNimCfg(cfgPath, generateBlock(ctx, cfgPath, kind))
+      patchNimCfg(cfgPath, generateBlock(ctx, cfgPath, cfgAnchor,
+                                         rootSpec.srcDir, kind))
   of "pin":
     # Resolve the full closure from the `.nimble` truth, then freeze it into
     # a `pnak.nif` lockfile listing every direct and indirect dependency at

@@ -9,14 +9,18 @@
 
 ## Inter-module inliner for generated NIFC.
 ##
-## Hexer's `intramodinliner` annotates each `.inline` proc's pragma with a
-## threshold followed by per-parameter weights (see `intramodinliner`'s
-## `computeInlineInfo`). This pass consumes those annotations and splices
-## qualifying calls at NIFC level — both same-module and cross-module:
-## cross-module bodies live in the matching `.x.nif` files, picked up via
-## `intramodinliner`'s lazy foreign-module loader (`xnifDir` plus a one-level-up
-## search, so the main module's `.x.nif` inside `<nimcache>/<backend>/` and
-## non-main modules' `.x.nif` directly in `<nimcache>/` are both found).
+## The inlining policy lives in `intramodinliner.computeInlineInfo` and is
+## derived from each proc's body at module-load time (tiny bodies always
+## inline, `.noinline` never, bigger bodies go through the per-call-site
+## weighted-score heuristic; the `.inline` annotation is ignored). This pass
+## applies that policy and splices qualifying calls at NIFC level — both
+## same-module and cross-module:
+## cross-module bodies are taken from the callee module's post-DCE `.c.nif`,
+## picked up via `intramodinliner`'s lazy foreign-module loader (`xnifDir` plus
+## a one-level-up search, so the main module's copy inside
+## `<nimcache>/<backend>/` and non-main modules' directly in `<nimcache>/` are
+## both found). `deps.nim` makes those files inputs of the `optimize` node so
+## they exist by the time we look.
 ##
 ## In addition to the full splice, this pass detects a *partial-inline
 ## prologue* — the guarded early-return shape
@@ -27,9 +31,8 @@
 ## guard does not fire the original call is made instead. That captures
 ## the common-case speedup without paying to inline the cold tail.
 
-import std / [tables, assertions, os]
+import std / [tables, assertions]
 include "../../lib" / nifprelude
-import "../../lib" / [nifstreams, nifcursors]
 import ".." / leng_model
 import ".." / ".." / hexer / intramodinliner
 import ".." / ".." / lib / symparser
@@ -51,13 +54,11 @@ proc tryDetectGuardPrologue(body: Cursor; shape: var GuardShape): bool =
   ## length-1 `(stmts …)`); there must be exactly one `elif` (no further
   ## branches, no `else`). Returns true on match and fills `shape`.
   ##
-  ## Implementation note: walks via `firstSon` + `into` + `hasMore` so it
-  ## works equally under `-d:virtualParRi` (where closing parens are
-  ## elided and only the bounded child loop terminates correctly) and
-  ## without it.
-  if body.kind != ParLe or body.stmtKind != StmtsS: return false
-  let firstStmt = body.firstSon
-  if firstStmt.kind != ParLe or firstStmt.stmtKind != IfS: return false
+  ## Implementation note: walks via `childCursor` + `into` + `hasMore`
+  ## so the bounded child loop terminates correctly.
+  if not body.isTagLit or body.stmtKind != StmtsS: return false
+  let firstStmt = childCursor(body)
+  if not firstStmt.isTagLit or firstStmt.stmtKind != IfS: return false
 
   # The if must contain exactly one branch, and it must be an elif.
   var theElif = default(Cursor)
@@ -67,7 +68,7 @@ proc tryDetectGuardPrologue(body: Cursor; shape: var GuardShape): bool =
   ifn.into:
     while ifn.hasMore:
       inc branchCount
-      if branchCount == 1 and ifn.kind == ParLe and
+      if branchCount == 1 and ifn.isTagLit and
          ifn.substructureKind == ElifU:
         theElif = ifn
       else:
@@ -76,14 +77,14 @@ proc tryDetectGuardPrologue(body: Cursor; shape: var GuardShape): bool =
   if rejected or branchCount != 1: return false
 
   # Inside (elif COND BODY): grab COND and BODY.
-  let condCur = theElif.firstSon
+  let condCur = childCursor(theElif)
   shape.cond = condCur
   var elifBody = condCur
   skip elifBody                                # past condition, on body
 
   # Optionally unwrap a single-statement `(stmts (ret …))`.
   var retCur = elifBody
-  if retCur.kind == ParLe and retCur.stmtKind == StmtsS:
+  if retCur.isTagLit and retCur.stmtKind == StmtsS:
     var saved = default(Cursor)
     var stmtCount = 0
     var inner = retCur
@@ -95,8 +96,8 @@ proc tryDetectGuardPrologue(body: Cursor; shape: var GuardShape): bool =
     if stmtCount != 1: return false
     retCur = saved
 
-  if retCur.kind != ParLe or retCur.stmtKind != RetS: return false
-  let retVal = retCur.firstSon                 # `.` for void, else the value
+  if not retCur.isTagLit or retCur.stmtKind != RetS: return false
+  let retVal = childCursor(retCur)             # `.` for void, else the value
   shape.retVal = retVal
   shape.voidReturn = retVal.kind == DotToken
   result = true
@@ -111,13 +112,13 @@ proc runInterModuleInliner*(buf: var TokenBuf; suffix: string;
   ## `trySpliceVarInit` at every statement-position call and bound-form
   ## `(var :t … (call …))`. The cross-module body fetch is automatic once
   ## `xnifDir` is set — `lookupBody` resolves the callee's module via the
-  ## symbol name (`extractModule`) and lazy-loads the foreign `.x.nif`.
-  var infos = initTable[string, ModuleAnalysis]()
-  # Record the current module's OWN inline info so same-module `.inline` callees
-  # are recognised — `lookupInlineInfo` only consults `infos`, and the foreign
-  # path never populates the suffix we're processing.
-  infos[suffix] = analyzeModule(buf)
-  var ctx = initInlinerCtx(suffix, addr buf, addr infos,
+  ## symbol's module suffix (`pool.symModule`) and lazy-loads the foreign
+  ## `.c.nif`.
+  ##
+  ## The size-driven policy (`computeInlineInfo`) bounds what gets spliced:
+  ## the bodies measured here are the post-flattening `.c.nif` bodies, i.e.
+  ## exactly what a splice would copy.
+  var ctx = initInlinerCtx(suffix, addr buf,
                            xnifDir = xnifDir,
                            maxDepth = 4,
                            counterPrefix = "x")
@@ -127,19 +128,18 @@ proc runInterModuleInliner*(buf: var TokenBuf; suffix: string;
   var dest = createTokenBuf(buf.len + buf.len div 8)
   var n = beginRead(buf)
   trIntra(ctx, dest, n)
-  endRead(buf)
   result = dest.len != originalLen
   buf = ensureMove(dest)
+  when defined(inlinerStats): dumpInlinerStats(suffix)
 
 # ---- self-tests ----------------------------------------------------------
 
 when isMainModule:
   proc parse(src: string): TokenBuf =
-    var stream = nifstreams.openFromBuffer(src, "M")
-    result = fromStream(stream)
+    result = parseFromBuffer(src, "M")
 
   for s in ["x.0.M", "cond.0.M"]:
-    discard pool.syms.getOrIncl(s)
+    discard pool.symId(s)
 
   block matches_guard_prologue:
     var buf = parse(

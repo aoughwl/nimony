@@ -18,6 +18,7 @@
 ##
 ##   (link
 ##     (apptype "console")               ; console | gui | lib | staticlib
+##     (linker "gcc")                    ; the C compiler driver nimony compiled with
 ##     (output "path/to/app")
 ##     (file "a.o"   (kind "obj"))       ; linked directly
 ##     (file "b.c"   (kind "csrc"))      ; compiled, then linked
@@ -33,7 +34,7 @@
 ## overrides the manifest's `(output …)`).
 
 import std / [os, syncio, strutils]
-import ".." / "lib" / [nifcore, nifcoreparse]
+import ".." / "lib" / [nifcore, nifcoreparse, argsfinder]
 
 type
   LinkFile = object
@@ -42,6 +43,7 @@ type
 
   Manifest = object
     apptype: string
+    linker: string        ## the driver the objects were compiled with
     output: string
     objs: seq[LinkFile]   ## `kind "obj"` — linked directly
     csrcs: seq[LinkFile]  ## `kind "csrc"` — compiled to an object, then linked
@@ -87,7 +89,7 @@ proc readFileEntry(c: var Cursor; tags: TagPool; pool: Pool): tuple[file: LinkFi
   result = (file, kind)
 
 proc parseManifest(path: string): Manifest =
-  result = Manifest(apptype: "console", output: "",
+  result = Manifest(apptype: "console", linker: "", output: "",
                     objs: @[], csrcs: @[], flags: @[])
   var b = parseFromFile(path)
   var c = b.beginRead()
@@ -99,6 +101,8 @@ proc parseManifest(path: string): Manifest =
         case tagName(b.tags, c.cursorTagId)
         of "apptype":
           result.apptype = readStrChild(c, b.pool)
+        of "linker":
+          result.linker = readStrChild(c, b.pool)
         of "output":
           result.output = readStrChild(c, b.pool)
         of "file":
@@ -168,7 +172,18 @@ proc main =
   if output.len == 0:
     quit "niflink: no output path (in the manifest or on the command line)"
 
-  let cc = getEnv("CC", "cc")
+  # `cc` is the POSIX driver name; Windows has none (MinGW ships `gcc`), so
+  # default there to what the rest of the toolchain defaults to (`NifConfig.cc`).
+  # The Nim-built nimony happens to export CC=gcc before spawning nifmake, but
+  # `deps.nim` gates that on `not defined(nimony)` — so a *self-hosted* nimony
+  # (every `hastur boot` stage past the first) left niflink reaching for a `cc`
+  # that does not exist. Found by running the suite under Wine.
+  #
+  # A manifest names its driver, and that one wins: it is the one nimony
+  # compiled the objects with, so a `--cc` or a wrapper on the PATH (the i386
+  # CI job's `gcc -m32`) links what it compiled. `cc` knew neither.
+  const DefaultCC = when defined(windows): "gcc" else: "cc"
+  let cc = if m.linker.len > 0: m.linker else: getEnv("CC", DefaultCC)
   var objs = m.objs
 
   # Compile any C sources to an object next to the source, then link them too
@@ -192,11 +207,14 @@ proc main =
       args.add o.path
       for f in o.flags: args.add f
     if m.apptype == "lib": args.add "-shared"
-    # On Windows the toolchain links with clang, whose native PE TLS layout is
-    # mishandled by ld.bfd; LLD lays out `.tls$` the way the loader expects, so
-    # native TLS survives to runtime. Mirror the old link step's `-fuse-ld=lld`.
+    # On Windows a clang toolchain needs LLD: clang emits native PE TLS, which
+    # ld.bfd lays out incorrectly (startup segfaults); LLD matches the loader.
+    # But only under clang — forcing `-fuse-ld=lld` on gcc fails outright when
+    # LLD isn't installed (`collect2: fatal error: cannot find 'ld'`), and
+    # gcc's default emutls doesn't need it. Mirror deps.nim's gating.
     when defined(windows):
-      args.add "-fuse-ld=lld"
+      if extractCCKey(cc) == "clang":
+        args.add "-fuse-ld=lld"
     for f in m.flags: args.add f
     args.add "-o"
     args.add output

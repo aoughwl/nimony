@@ -1,3 +1,9 @@
+# `lenientnils`, exactly as `typenav.nim` itself carries: the scope chain this
+# mirrors is nilable (`current` is nil until the first `openScope` and again
+# once `closeScope` pops the outermost one), and modelling that is not what the
+# repro is about.
+{.feature: "lenientnils".}
+
 ## Nimony-compiled repro for the stage-2 boot UAF
 ## (`bug_stage2_typecache_destroy_uaf.md`). Mirrors `typenav.nim`'s
 ## TypeCache → TypeScope → Table[SymId, LocalInfo] → Cursor shape and
@@ -14,8 +20,7 @@
 ## already torn down earlier in the chain.
 
 import std / [tables, syncio, assertions]
-include "../../../src/lib/nifprelude"
-include "../../../src/lib/compat2"
+import "../../../src/lib/nifcore"
 
 type
   SymKind = enum
@@ -66,8 +71,8 @@ proc getLocalInfo(c: var TypeCache; s: SymId): LocalInfo =
 
 proc addTypeBuf(c: var TypeCache; tagName: string): Cursor =
   var buf = createTokenBuf(4)
-  buf.add parLeToken(pool.tags.getOrIncl(tagName), NoLineInfo)
-  buf.addParRi()
+  buf.openTag buf.tags.registerTag(tagName)
+  buf.closeTag()
   c.mem.add ensureMove buf
   result = cursorAt(c.mem[c.mem.len-1], 0)
 

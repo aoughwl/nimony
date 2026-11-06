@@ -11,64 +11,274 @@
 ##
 ## Restrictions in this first cook:
 ##   - statement-position calls only (call as a direct stmts child);
-##   - single-return procs only (no `(ret …)` mid-body);
-##   - `.inline` pragma callees only (threshold == 0 in `InlineInfo`);
-##   - same-module callees only — cross-module body fetch via the NIF
-##     index is a follow-up.
+##   - single-return procs only (no `(ret …)` mid-body).
+##
+## The inlining POLICY is size-driven, not annotation-driven, and it asks the
+## question of the CALLEE, once (see `computeInlineInfo`): a body of at most
+## `InlineTinyBound` tokens is inlinable — that covers forwarders, accessors
+## and hooks whether or not the author wrote `.inline` — a `.noinline` proc
+## never is, and anything bigger is not inlinable either unless the
+## module-level small-total rule lifts it (`InlineSmallTotalBound`: all its
+## call sites in the module together add at most that many tokens). The
+## `.inline` annotation is a bounded hint (`InlineHintBound`): it raises the
+## bound and is ignored beyond it, so an ill-considered `.inline` on a fat
+## proc cannot blow the program up, while a proc nobody thought to annotate
+## still inlines when it is trivially cheap. `.alwaysInline` is the escape
+## hatch for the rest, and the only way to inline a big body.
+##
+## "Inlinable" always means "within the caller's growth budget" (`growthLeft`):
+## every splice, tiny ones included, is charged to that one pot, which is what
+## keeps the cross-module pass from compounding. Be aware of the shape of that
+## arrangement before adding anything here: the pot, not the policy, is what
+## actually decides. The rules above ask for about 1.5x the program in splices
+## and the pot grants about half of it, first-come-first-served in source
+## order (numbers in `computeInlineInfo` and `growthLeft`). So a rule that
+## admits more candidates does not produce more inlining — it produces
+## different, and mostly worse, inlining, because it spends the same pot on
+## bigger bodies. That is how the weighted-score tier that used to live here
+## managed to cost 22 % of all spliced tokens while being 3.4 % of the splices.
+##
+## Two passes share this machinery, one per pipeline stage, and each stays in
+## the file format of its stage:
+##   - `intraModuleInline` runs inside hexer, pre-DCE, on the tree that becomes
+##     this module's `.x.nif`. Its own module only (`xnifDir` unset).
+##   - `runInterModuleInliner` (shoggoth) runs after DCE, on the `.c.nif`s, and
+##     is the one that crosses module borders: `foreignProc` parses just the
+##     callee's decl out of its `.c.nif`, via the file's embedded index.
+##
+## Either way the decision is derived from the same file the body comes out
+## of: `computeInlineInfo` measures the very decl a splice would copy (for the
+## own module in `indexProcBodies`, for a callee in `lookupInlineInfo`), so
+## what is scored is exactly what would be spliced (hexer's flattening of
+## tiny bodies happens *before* the `.c.nif` is written — a proc that grows
+## past the bound by having its own callees spliced into it is re-measured,
+## and demoted, by every importer).
 ##
 ## The splice introduces a `(scope …)` block, declares one fresh `(var)`
 ## per parameter initialised from the argument, renames every local in
 ## the inlined body to fresh symbols, and drops the trailing `(ret X)`
 ## (its result is discarded at statement position).
 
-import std / [tables, assertions, os, sets, hashes]
+import std / [tables, assertions, os, sets, hashes, syncio]
+when defined(inlinerTrace) or defined(inlinerDeny): import std / [strutils]
 include ".." / lib / nifprelude
 include ".." / lib / compat2
 import ".." / lib / symparser
+import ".." / lib / foreignmodules
 import ".." / lengc / [leng_model]
 
 type
-  InlineWeights* = seq[int]
   InlineInfo* = object
-    threshold*: int
-    weights*: InlineWeights
-    guardThreshold*: int
-    guards*: InlineWeights
-  ModuleAnalysis* = object
-    inlineInfo*: Table[SymId, InlineInfo]
+    size*: int                 ## body token count; what a splice would cost
+    inlinable*: bool           ## the policy says yes, subject to the budget
+    forced*: bool              ## `{.alwaysInline.}`: splice regardless of size
+                               ## and growth budget
+    banned*: bool              ## a veto no rule may lift: `.noinline`, no body,
+                               ## importc, varargs
+  ModuleAnalysis = object
+    ## Hexer-stage scratch: the inlinable procs `analyzeModule` found, so
+    ## `intraModuleInline` knows which bodies to flatten. Importers never see
+    ## this type — they re-derive the same information from the `.c.nif` they
+    ## parse anyway (`indexProcBodies`).
+    ## (Not exported: `dce1` has an unrelated `ModuleAnalysis` and both
+    ## modules are imported together by `pipeline`.)
+    inlineInfo: Table[SymId, InlineInfo]
 
 const
-  DefaultInlineInfo* = InlineInfo(threshold: 100, weights: @[],
-                                  guardThreshold: 100, guards: @[])
+  DefaultInlineInfo* = InlineInfo(size: 0, inlinable: false, forced: false,
+                                  banned: true)
+    ## What a callee we know nothing about gets: not inlinable. A proc with no
+    ## `InlineInfo` in the table is one `indexProcBodies` declined to store.
+  InlineTinyBound* = 100
+    ## Bodies of at most this many tokens are spliced unconditionally: at that
+    ## size the body is on the order of the call sequence it replaces (a
+    ## forwarder, an accessor with its assert, a hook's nil-test-and-call), so
+    ## inlining cannot lose. Measured evidence for the value: capping splices
+    ## at 100 tokens on a full nimsem build shrank the optimized IR 6x and the
+    ## binary 4x while the produced compiler ran slightly FASTER — beyond this
+    ## size, inlining pays icache, not wins.
+  InlineHintBound* = 2 * InlineTinyBound
+    ## A body the author marked `.inline` is spliced unconditionally up to this
+    ## many tokens. The C backend never needed this: `.inline` procs are emitted
+    ## `static inline` and the C compiler splices them anyway. The native
+    ## backend has no second inliner behind it, so a body the C path would have
+    ## inlined stayed a call there (measured on `bench/nifbench.nim`: `copyMem`,
+    ## `isValid`, `kind` and the like were call frames in the native profile
+    ## and absent from the C one). The bound is deliberately tight, and
+    ## measured: at 500 tokens nifcore's `inc` (275) and the seq accessors got
+    ## spliced everywhere and the parse phase went from 1.59x to 1.90x of the C
+    ## build — arkham's per-proc allocator pays for every body it has to hold
+    ## in registers, so a medium body inlined into a hot loop spills the loop.
+    ## At 200 the same build is faster than the original on every phase. Fat
+    ## `.inline` procs (nifcore's `pool`/`tags`, 800–1700 tokens) stay calls,
+    ## which is why the annotation used to be ignored outright.
+  InlineSmallTotalBound* = 2 * InlineTinyBound
+    ## A proc whose splices, taken together, add at most this many tokens to
+    ## the module — body size times the number of call sites the module holds —
+    ## is spliced at every one of them. This is the module-level twin of the
+    ## tiny rule: it does not matter that one body is 119 tokens when there is
+    ## one caller and the proc's whole footprint is 119. Measured on the native
+    ## `nifbench` build: nifreader's `skipWhitespace` (119 tokens, just over
+    ## `InlineTinyBound`) was 17% of the parse phase as a call frame the C
+    ## build had folded into `next`. At 400 the rule
+    ## also pulled medium helpers into `addAcrossPools` and cost the reintern
+    ## phase 10% (same allocator pressure as `InlineHintBound`); 200 keeps the
+    ## win and not the loss.
 
-proc shouldInline*(info: InlineInfo; argScores: openArray[int]): bool =
-  var sum = 0
-  for i, score in argScores:
-    if i < info.weights.len:
-      sum += (info.weights[i] * score) div 100
-  result = sum >= info.threshold
+proc hasVarargsParam(params: Cursor): bool =
+  ## A `(varargs)` parameter cannot be bound to a `(var …)` at a splice site
+  ## (the type has no size), so such procs are never inlined.
+  result = false
+  if not params.isTagLit: return false
+  var p = params
+  p.into:
+    while p.hasMore:
+      if p.substructureKind == ParamU:
+        var q = p
+        inc q                       # into the param: at the name
+        if q.isSymbolDef:
+          inc q                     # past name
+          skip q                    # past pragmas
+          if q.typeKind == VarargsT: result = true
+      skip p
 
-proc readModuleAnalysis*(infile: string): ModuleAnalysis =
-  discard infile
-  result = ModuleAnalysis(inlineInfo: initTable[SymId, InlineInfo]())
+proc tokenCountAux(n: var Cursor): int =
+  case n.kind
+  of TagLit:
+    result = 1
+    n.into:
+      while n.hasMore:
+        result += tokenCountAux(n)
+  else:
+    result = 1
+    inc n
+
+proc tokenCount(n: Cursor): int =
+  ## Tokens in the subtree rooted at `n` (closing parens not counted — they
+  ## may be virtual anyway). A stable cost measure for the policy below.
+  var c = n
+  result = tokenCountAux(c)
+
+proc computeInlineInfo*(procDecl: Cursor): InlineInfo =
+  ## The whole inlining policy, derived from the proc decl itself, and it is
+  ## a size question only:
+  ##   - no body / `.noinline` / importc / assembler / interrupt / varargs
+  ##     → BANNED, no rule may lift it;
+  ##   - body ≤ `InlineTinyBound` tokens, or `.inline` and ≤ `InlineHintBound`
+  ##     → inlinable;
+  ##   - `.alwaysInline` → inlinable and `forced` (it also skips the budget);
+  ##   - anything bigger → NOT inlinable, unless the module-level small-total
+  ##     rule (`applySmallTotalRule`) lifts it afterwards.
+  ##
+  ## There used to be a fourth tier here: bodies above the bounds went through
+  ## a per-call-site weighted score (a `weightOfUse` walk over the body, an
+  ## argument score per call, a threshold growing as `size div 4`, a weight
+  ## cap to keep the two from cancelling). It is gone, and the measurement
+  ## that removed it is worth keeping: traced over a full `nimony n -d:danger`
+  ## build of nimsem, that tier produced **386 of 11,433 splices (3.4 %) but
+  ## 115,306 of 513,204 spliced tokens (22 %)** — average body 299 tokens,
+  ## largest 1,337. It spent the caller's growth budget on the biggest bodies
+  ## in the program, and the budget is a fixed pot checked before anything
+  ## else, so what it really bought was 6,450 REFUSED splices of bodies ≤ 100
+  ## tokens — the class that cannot lose — starved because a 300-token body
+  ## reached the pot first. Deleting it: `.c.nif` −19.8 %, `.oc.nif` −22.5 %,
+  ## nimsem image −17.8 %, and 12,076 splices instead of 11,433 (MORE
+  ## inlining, 17 % fewer tokens). The gate (`nimony check nimsem.nim`, 135
+  ## nimsem invocations under callgrind) went 42,104,669,900 → 41,986,537,540
+  ## Ir = −0.28 %. nifbench says +1.8 % on the native build, which is the
+  ## documented nifbench-lies-about-inlining trap: it is leaf- and
+  ## prologue-heavy, so it overvalues splicing by ~3x.
+  result = DefaultInlineInfo
+  var p = procDecl
+  let pd = takeProcDecl(p)
+  var forced = false
+  if not pd.body.isTagLit:
+    return                                  # extern/no body: nothing to splice
+  var hinted = false
+  var vetoed = false
+  if pd.pragmas.isTagLit:
+    var pr = pd.pragmas
+    pr.into:                            # scan all pragmas (no early break: the
+      while pr.hasMore:                 # `into` epilogue needs the scope drained)
+        if pr.isTagLit and pr.pragmaKind == AlwaysInlineP:
+          forced = true
+        if pr.isTagLit and pr.pragmaKind == InlineP:
+          hinted = true
+        if pr.isTagLit and pr.pragmaKind in {NoinlineP, ImportcP, ImportcppP, ImportjsP,
+                                             AssemblerP, NakedP, InterruptP}:
+          # importc: the decl's `(stmts .)` "body" is a PLACEHOLDER — the real
+          # code is external. Splicing it deletes the call (measured: memfiles
+          # inlined posix `open`'s empty shell and never called open(2)).
+          # assembler: the body is machine-level (register-pinned locals, 1:1
+          # instructions) — meaningless spliced into ordinary code, and the
+          # splice strands `{.register.}` pragmas where no backend accepts
+          # them (measured: tcbackend's firstBit spliced + DCE'd, so the C
+          # backend saw a bare register-pinned local instead of rejecting the
+          # assembler proc).
+          # interrupt: the proc IS a interrupt-table entry, so it must keep an
+          # address of its own. Splicing it into some ordinary caller (which
+          # would have to have called it explicitly) leaves the table pointing
+          # at whatever survived.
+          vetoed = true
+        skip pr
+  if vetoed: return                         # `banned` stays set
+  if hasVarargsParam(pd.params): return
+
+  result.banned = false
+  let size = tokenCount(pd.body)
+  result.size = size
+  if forced:
+    # `{.alwaysInline.}` — no size bound, like MSVC's `__forceinline`. The
+    # size bounds below are a PROXY for cost; the annotation is a direct
+    # statement about it, so the proxy has no standing. `trySplice`'s
+    # `inProgress` cycle guard still applies: that is termination, not policy.
+    # `.noinline` above still wins, because a proc carrying both is a
+    # contradiction the author must resolve, and refusing is the safe reading.
+    result.inlinable = true
+    result.forced = true
+  elif size <= InlineTinyBound or (hinted and size <= InlineHintBound):
+    result.inlinable = true
 
 type
-  ForeignModule* = object
-    buf*: TokenBuf
-    bodies*: Table[SymId, int]              # sym → offset of its (proc …) in `buf`
-
   InlinerCtx* = object
     moduleSuffix*: string
     counter: int                            # fresh-name suffix
     counterPrefix: string                   # disambiguates passes (hexer vs dce2)
     bodies: Table[SymId, int]               # same-module callee → offset in `src`
+    ownInfo: Table[SymId, InlineInfo]       # same-module `(inline …)` annotations
     src: ptr TokenBuf                       # the module's parsed buffer
-    infos: ptr Table[string, ModuleAnalysis] # cross-module sidecars
-    xnifDir: string                         # directory holding `.x.nif`/`.dce.nif`
+    xnifDir: string                         # directory holding the `.c.nif`s
     maxDepth*: int                          # 0 = unlimited; cross-module mode sets a cap
-    foreign: Table[string, ref ForeignModule]
-      # Cached cross-module bodies. `ref` so growing the table doesn't
-      # invalidate cursors that point into a previously-fetched buffer.
+    growthLeft*: int
+      # Remaining tokens the proc currently being walked may gain from
+      # splices. Set per top-level `(proc …)` from `growthBudget` (a caller
+      # may roughly double), decremented by each committed splice — including
+      # the splices `trIntra` performs while re-walking spliced content, so a
+      # depth-N cascade draws from the same pot. This is the hard backstop
+      # that keeps program growth linear no matter what the per-call
+      # heuristic thinks: without it a chain of individually-approved
+      # splices compounds multiplicatively (measured: 8.4x IR blowup and
+      # multi-GB hexer RSS on nimsem).
+      #
+      # ONE pot, and every class draws on it — tiny bodies included. Exempting
+      # the tiny ones (and giving the threshold-0 class a 4x pot of its own)
+      # looks harmless per module and is not: `shoggoth`'s inter-module inliner
+      # runs this same policy across module boundaries at `maxDepth = 4`, where
+      # an uncharged class compounds. Measured on nimsem, `.c.nif` → `.oc.nif`:
+      # 2.65x with one charged pot, 7.15x with tiny free (51 MB → 197 MB of
+      # optimized IR, a 3.96 MB binary → 9.55 MB). What the exemption bought
+      # was ~4% on `bench/nifbench` (69 ms against 72 ms here, best of 7
+      # interleaved runs; the pre-hint policy is 75 ms), which is not worth 4x
+      # the program — and the native boot pays for it twice, in 55.4s against
+      # 28.7s.
+    foreign: Table[string, ForeignModule]
+      # Opened callee modules, by module suffix. A `ForeignModule` is a `ref`
+      # that owns each decl it parsed, so the cursors `lookupBody` hands out
+      # stay valid as this grows.
+    noForeign: HashSet[string]
+      # Module suffixes with no `.c.nif` to open (asked once, not per call).
+    foreignInfo: Table[SymId, InlineInfo]
+      # Cross-module policy verdicts, computed on first ask per callee.
     inProgress*: HashSet[SymId]
       # Currently-being-spliced procs. Recursive `.inline` (direct or
       # mutual) would otherwise cause the splice + re-tr loop in dce2 to
@@ -81,39 +291,90 @@ type
       # cross-module cascade is rarely a win and risks runaway growth.
 
 proc initInlinerCtx*(moduleSuffix: string; src: ptr TokenBuf;
-                     infos: ptr Table[string, ModuleAnalysis];
                      xnifDir = ""; maxDepth = 0;
                      counterPrefix = "i"): InlinerCtx =
-  ## `counterPrefix` is woven into fresh local sym names (`base.0i<n>`,
-  ## `returnLabel.0i<n>`). The hexer same-module pass uses `"h"` and
+  ## `counterPrefix` is woven into fresh local sym names (`` base`i.<n> ``,
+  ## `` returnLabel`i.<n> ``). The hexer same-module pass uses `"h"` and
   ## dce2's cross-module pass uses `"d"` so freshly-minted dce2 syms
   ## can never collide with hexer-minted syms that survive in the
   ## `.x.nif` body dce2 is rewriting.
-  InlinerCtx(moduleSuffix: moduleSuffix, src: src, infos: infos,
+  InlinerCtx(moduleSuffix: moduleSuffix, src: src,
              bodies: initTable[SymId, int](),
+             ownInfo: initTable[SymId, InlineInfo](),
              xnifDir: xnifDir,
              maxDepth: maxDepth,
+             growthLeft: high(int),
              counterPrefix: counterPrefix,
-             foreign: initTable[string, ref ForeignModule](),
+             foreign: initTable[string, ForeignModule](),
+             noForeign: initHashSet[string](),
+             foreignInfo: initTable[SymId, InlineInfo](),
              inProgress: initHashSet[SymId]())
 
-proc indexProcBodies(buf: var TokenBuf; bodies: var Table[SymId, int]) =
-  ## Walks the top-level `(stmts …)` and records `(proc :sym …)` decls
-  ## by sym → byte offset into `buf`.
+proc growthBudget*(bodySize: int): int =
+  ## How many spliced tokens a proc of `bodySize` may absorb: it may about
+  ## double, and small procs get a floor so a forwarder can still swallow a
+  ## couple of tiny callees.
+  max(1000, bodySize)
+
+proc countCalls(n: var Cursor; counts: var Table[SymId, int]) =
+  ## `(call f …)` sites per callee under `n`, statement or expression position.
+  case n.kind
+  of TagLit:
+    if n.stmtKind == CallS:
+      var callee = n
+      inc callee
+      if callee.isSymbol:
+        counts[callee.symId] = counts.getOrDefault(callee.symId) + 1
+    n.into:
+      while n.hasMore:
+        countCalls(n, counts)
+  else:
+    inc n
+
+proc applySmallTotalRule(buf: var TokenBuf; infos: var seq[(SymId, InlineInfo)]) =
+  ## `InlineSmallTotalBound`: a proc too big for the size bounds, but whose
+  ## call sites in this module would together add no more than the bound,
+  ## becomes inlinable. `banned` is a veto this cannot lift.
+  var counts = initTable[SymId, int]()
   var n = beginRead(buf)
+  countCalls(n, counts)
+  for entry in mitems(infos):
+    let info = addr entry[1]
+    if not info.banned and not info.inlinable and
+       counts.getOrDefault(entry[0]) * info.size <= InlineSmallTotalBound:
+      info.inlinable = true
+
+proc indexProcBodies(buf: var TokenBuf; bodies: var Table[SymId, int];
+                     infos: var Table[SymId, InlineInfo]) =
+  ## Walks the module's own top-level `(stmts …)` and records `(proc :sym …)`
+  ## decls by sym → byte offset into `buf`, along with each proc's
+  ## `InlineInfo`, computed right here from the body we are indexing
+  ## (`computeInlineInfo` walks it once — a linear pass over a buffer we just
+  ## parsed anyway). No pragma transport is involved: a foreign callee goes
+  ## through the same `computeInlineInfo` (`lookupInlineInfo`), so the size
+  ## that is scored is the size of the exact body a splice would copy.
+  var n = beginRead(buf)
+  var found: seq[(SymId, InlineInfo)] = @[]
   if n.stmtKind == StmtsS:
     n.into:
       while n.hasMore:
-        if n.kind == ParLe and n.stmtKind == ProcS:
-          let nameCur = n.firstSon            # the (proc :sym …) name child
-          if nameCur.kind == SymbolDef:
+        if n.isTagLit and n.stmtKind == ProcS:
+          let nameCur = n.childCursor            # the (proc :sym …) name child
+          if nameCur.isSymbolDef:
             bodies[nameCur.symId] = cursorToPosition(buf, n)
+            found.add((nameCur.symId, computeInlineInfo(n)))
         skip n
-  endRead(buf)
+  # The small-total rule needs the module's call sites, and only the module
+  # being rewritten has them all in view: a foreign module's internal count says
+  # nothing about how often ITS callers reach for the proc (measured: applied to
+  # foreign modules it turned every once-called 400-token helper into an
+  # always-splice for the whole program). Hence foreign procs never get it.
+  applySmallTotalRule(buf, found)
+  for (sym, info) in found:
+    if info.inlinable: infos[sym] = info
 
 proc collectProcBodies*(c: var InlinerCtx) =
-  ## Index the current module's own bodies.
-  indexProcBodies(c.src[], c.bodies)
+  indexProcBodies(c.src[], c.bodies, c.ownInfo)
 
 proc findForeignFile(c: InlinerCtx; modul, ext: string): string =
   ## Search the caller's dir first, then the parent — system modules
@@ -128,257 +389,203 @@ proc findForeignFile(c: InlinerCtx; modul, ext: string): string =
   if fileExists(parent): return parent
   return ""
 
-proc loadForeignAnalysis(c: var InlinerCtx; modul: string): bool =
-  ## Cheap: load only the `.dce.nif` sidecar (inline info, uses, offers).
-  ## Used by `lookupInlineInfo` to decide whether a call is splice-worthy
-  ## before paying the cost of parsing the full `.x.nif`. For a typical
-  ## module that calls many non-`.inline` procs from `sysvq0asl`, the
-  ## sidecar is ~17× smaller than the `.x.nif`; parsing the latter eagerly
-  ## here used to dominate dceEmit wall time on large builds.
-  if modul == c.moduleSuffix: return true
-  if c.infos == nil: return false
-  if modul in c.infos[]: return true
-  let dpath = findForeignFile(c, modul, ".dce.nif")
-  if dpath.len == 0: return false
-  c.infos[][modul] = readModuleAnalysis(dpath)
+proc openedForeign(c: var InlinerCtx; modul: string): bool =
+  ## Opens the callee module `modul` into `c.foreign` on first use; false when
+  ## there is no `.c.nif` for it.
+  ##
+  ## The `.c.nif`, because only this pass runs that late: it is post-DCE, so
+  ## its generic instances already name the module that won the merge and a
+  ## body copies into any other module unchanged. The `.x.nif` still names the
+  ## callee's own module for instances the merge later moves elsewhere; that
+  ## is the intra-module pass's world, not this one's.
+  if modul in c.foreign: return true
+  if modul in c.noForeign: return false
+  let xpath = findForeignFile(c, modul, ".c.nif")
+  if xpath.len == 0:
+    c.noForeign.incl modul
+    return false
+  let fm = openForeignModule(xpath)
+  if not fm.hasEmbeddedIndex:
+    quit "inter-module inliner: " & xpath & " carries no embedded index"
+  c.foreign[modul] = fm
   result = true
 
-proc loadForeign(c: var InlinerCtx; modul: string): bool =
-  ## Lazy-load the foreign `.x.nif` (procedure bodies) — only called from
-  ## the actual splice path (`lookupBody`), after `shouldInlineCall` has
-  ## already approved the inline. The matching `.dce.nif` is loaded by
-  ## `loadForeignAnalysis`; we reuse it via the same cache.
-  if modul == c.moduleSuffix: return true
-  if modul in c.foreign: return true
-  let xpath = findForeignFile(c, modul, ".x.nif")
-  if xpath.len == 0: return false
-  var fm: ref ForeignModule
-  new fm
-  fm.buf = parseFromFile(xpath)
-  indexProcBodies(fm.buf, fm.bodies)
-  c.foreign[modul] = fm
-  if c.infos != nil and modul notin c.infos[]:
-    discard loadForeignAnalysis(c, modul)
-  result = true
+proc foreignProc(c: var InlinerCtx; calleeSym: SymId; decl: var Cursor): bool =
+  ## Parses the ONE `(proc …)` decl of `calleeSym` out of its module, through
+  ## the module's embedded index. This used to parse the whole callee module
+  ## and score every proc in it — including just to learn that the callee is
+  ## not inlinable. Measured on a native release build of nimsem: 2,620
+  ## whole-module parses, 393 MB, 3.83 s of 10.5 s of optimizer time, for at
+  ## most 11.8 % of the tokens ever being used; `std/syncio` alone was parsed
+  ## 88 times for 51 body fetches.
+  let modul = pool.symModule(calleeSym)
+  if not openedForeign(c, modul): return false
+  let fm = c.foreign.getOrQuit(modul)
+  let key = pool.symString(calleeSym)
+  if not fm.hasDecl(key): return false
+  # Interned into the global pool/tags so the SymIds and tag ids line up with
+  # the module being rewritten; dense, seeded line info because a splice copies
+  # it into the output.
+  decl = fm.getDecl(key, globalTags, pool, withLineInfo = true)
+  result = decl.stmtKind == ProcS
 
 proc lookupBody(c: var InlinerCtx; calleeSym: SymId; outCur: var Cursor): bool =
   ## Resolves a callee sym to a cursor pointing at its `(proc …)` decl.
   ## The cursor's refcount keeps the underlying buffer alive for as
-  ## long as the cursor is held — `c.foreign` stores `ref
-  ## ForeignModule`, so subsequent table growth can't move the
-  ## TokenBuf out from under us. Returns false when we don't have a
-  ## body for `calleeSym` (extern decl, missing `.x.nif`, etc.).
-  let modul = extractModule(pool.syms[calleeSym])
+  ## long as the cursor is held; a foreign decl's buffer is owned by its
+  ## `ForeignModule` besides. Returns false when we don't have a body for
+  ## `calleeSym` (extern decl, missing `.c.nif`, etc.).
+  let modul = pool.symModule(calleeSym)
   if modul == c.moduleSuffix:
     if calleeSym in c.bodies:
       outCur = cursorAt(c.src[], c.bodies.getOrQuit(calleeSym))
       return true
     return false
-  if not loadForeign(c, modul): return false
-  let fm = c.foreign.getOrQuit(modul)
-  if calleeSym notin fm.bodies: return false
-  outCur = cursorAt(fm.buf, fm.bodies.getOrQuit(calleeSym))
-  result = true
+  # No further vetting here: the only bodies that reach this point already
+  # passed `shouldInlineCall`, i.e. the size-driven policy in
+  # `computeInlineInfo` (tiny → always, big → scored, `.noinline` → never).
+  result = foreignProc(c, calleeSym, outCur)
 
 proc freshSym(c: var InlinerCtx; orig: SymId): SymId =
-  ## Mint a fresh local sym for an inlined body's local. Local names must
-  ## have ≤ 1 dot (per `isLocalName`) so dce2's per-module rewrite emits
-  ## them unconditionally instead of consulting the global live set —
-  ## these syms were minted post-`markLive` and aren't tracked there.
-  ## The `0<prefix>` prefix on the counter avoids colliding with existing
-  ## numeric-suffixed locals like `result.26`; the `prefix` further
-  ## disambiguates between the hexer-stage same-module pass and the
-  ## dce2-stage cross-module pass so the latter's fresh syms can't
-  ## collide with hexer-minted ones already baked into the `.x.nif`.
+  ## Mint a fresh local sym for an inlined body's local. The name must carry
+  ## NO module suffix, so dce2's per-module rewrite emits it unconditionally
+  ## instead of consulting the global live set — these syms were minted
+  ## post-`markLive` and aren't tracked there.
+  ## The pass letter goes INTO the identifier (`` result`i.5 ``), which is what
+  ## keeps it out of the DISAMBIGUATOR, where a NIF symbol is specified to carry
+  ## a number and nothing else (#2457). The backtick makes the result
+  ## unspellable, so it can collide neither with a user's `result.26` nor with
+  ## the other passes' fresh syms: the hexer-stage same-module pass, the
+  ## dce2-stage cross-module pass and shoggoth each own a letter, so one pass's
+  ## minted syms can never collide with those already baked into the `.x.nif`
+  ## it is rewriting.
   inc c.counter
-  let original = pool.syms[orig]
+  let original = pool.symString(orig)
   var base = original
   let dotPos = base.find('.')
   if dotPos >= 0: base.setLen dotPos
-  base.add ".0"
-  base.add c.counterPrefix
+  base.add '.'
   base.addInt c.counter
-  result = pool.syms.getOrIncl(base)
+  result = pool.symId(derivedName(base, c.counterPrefix))
 
-proc scoreArg(a: Cursor): int =
-  ## Argument score for the inline heuristic (planned in dce1: 0-100).
-  ## A higher score means substituting this argument into the inlined
-  ## body is likely to expose more optimisation (constant folding,
-  ## branch elimination, etc.).
-  case a.kind
-  of IntLit, UIntLit, FloatLit, CharLit, StringLit: return 100
-  of Symbol: return 50  # treat sym refs as immutable bindings
-  of ParLe:
-    case a.exprKind
-    of TrueC, FalseC, NilC, InfC, NeginfC, NanC: return 100
-    of NegC:
-      var inner = a
-      inc inner
-      if inner.kind in {IntLit, UIntLit, FloatLit}: return 100
-      return 0
-    of DotC, AtC, PatC: return 30  # simple field / index read
-    else: return 0                  # complex expression
-  else: return 0
+proc lookupInlineInfo(c: var InlinerCtx; calleeSym: SymId): InlineInfo =
+  ## The callee's `InlineInfo`, or `DefaultInlineInfo` (not inlinable) when we
+  ## have none — the callee is in another module we cannot find, is an extern
+  ## with no body, or the policy declined it in `indexProcBodies`.
+  let modul = pool.symModule(calleeSym)
+  if modul == c.moduleSuffix:
+    return c.ownInfo.getOrDefault(calleeSym, DefaultInlineInfo)
+  if calleeSym in c.foreignInfo: return c.foreignInfo.getOrQuit(calleeSym)
+  var decl = default(Cursor)
+  result = DefaultInlineInfo
+  if foreignProc(c, calleeSym, decl):
+    # Scored on its own body only — never the small-total rule, see
+    # `indexProcBodies`.
+    let info = computeInlineInfo(decl)
+    if info.inlinable: result = info
+  c.foreignInfo[calleeSym] = result
 
-proc computeArgScores(callNode: Cursor): seq[int] =
-  ## Walks the args of a `(call f arg…)` and builds the per-arg score
-  ## vector for `shouldInline`. Uses `into` so the walk is bounded by the
-  ## call's own subtree (the closing `)` is virtual under `virtualParRi`).
-  result = @[]
+proc argContainsConstructor(callNode: Cursor): bool =
+  ## `(oconstr/aconstr …)` anywhere in an argument. The C backend renders an
+  ## address-taken aggregate constructor as a block-scope compound literal;
+  ## a splice wraps its param bindings in a `(scope …)` — a C block — cutting
+  ## that literal's lifetime short whenever its address escapes the splice
+  ## (measured: `static Shape[N]` params — the openArray built over
+  ## `&(Shape){…}.bounds` read dead stack after the scope closed). Until the
+  ## splicer hoists such temporaries out of its scope, decline the site.
+  proc walk(n: var Cursor): bool =
+    case n.kind
+    of TagLit:
+      if n.exprKind in {OconstrC, AconstrC}:
+        skip n
+        return true
+      result = false
+      n.into:
+        while n.hasMore:
+          if walk(n): result = true
+    else:
+      result = false
+      inc n
   var a = callNode
+  result = false
   a.into:
     skip a                                # past the callee sym
     while a.hasMore:
-      result.add scoreArg(a)
-      skip a
-
-proc lookupInlineInfo(c: var InlinerCtx; calleeSym: SymId): InlineInfo =
-  ## Lazy-loads the foreign module's analysis sidecar (cheap — `.dce.nif`
-  ## only, no `.x.nif`) and returns the InlineInfo (or `DefaultInlineInfo`
-  ## if unknown). The full `.x.nif` is loaded later by `lookupBody`, only
-  ## once we've decided this call is actually splice-worthy.
-  result = DefaultInlineInfo
-  if c.infos == nil: return
-  let modul = extractModule(pool.syms[calleeSym])
-  if modul != c.moduleSuffix and modul notin c.infos[]:
-    discard loadForeignAnalysis(c, modul)
-  if not c.infos[].hasKey(modul): return
-  result = c.infos[].getOrQuit(modul).inlineInfo.getOrDefault(calleeSym, DefaultInlineInfo)
+      if walk(a): result = true
 
 proc shouldInlineCall(c: var InlinerCtx; calleeSym: SymId;
                       callNode: Cursor): bool =
-  ## Decides whether to splice a call to `calleeSym` at this call site.
-  ## `.inline` (threshold 0) always wins; `.noinline` (threshold
-  ## ≥ 10000) always loses; everything else goes through the per-call
-  ## weighted-score heuristic against the proc's `InlineInfo`.
+  ## Decides whether to splice a call to `calleeSym` at this call site. The
+  ## policy (`computeInlineInfo`) has already answered the question for the
+  ## CALLEE; all that is left here is the two per-SITE questions: is the
+  ## splice legal (`argContainsConstructor`), and is there budget for it.
   let info = lookupInlineInfo(c, calleeSym)
-  if info.threshold == 0: return true
-  if info.threshold >= 10000: return false
-  let scores = computeArgScores(callNode)
-  result = shouldInline(info, scores)
+  template decide(v: bool; why: string): untyped =
+    when defined(inlinerTrace):
+      stderr.writeLine "[inliner] ", pool.syms[calleeSym], " -> ", v, " (", why,
+        "; size=", info.size, " growthLeft=", c.growthLeft, ")"
+    return v
+  if not info.inlinable: decide(false, "policy")
+  when defined(inlinerTrace) or defined(inlinerDeny):
+    # bisect aid: INLINER_DENY="name1,name2," refuses those callees outright
+    let denyList = getEnv("INLINER_DENY")
+    if denyList.len > 0:
+      let nm = pool.syms[calleeSym]
+      let base = nm[0 ..< max(nm.find('.'), 0)]
+      if denyList.contains(base & ","): decide(false, "denied")
+  # `argContainsConstructor` is a CORRECTNESS gate, not policy (an escaping
+  # compound literal dies with the splice's `(scope …)`), so even a forced
+  # splice has to respect it. The growth budget is the opposite — a
+  # compile-resource backstop — so `{.alwaysInline.}` overrides it and is still
+  # charged, keeping the budget honest for every ordinary decision after it.
+  if argContainsConstructor(callNode): decide(false, "ctor arg")
+  if info.forced: decide(true, "forced")
+  # Every class — tiny, `.inline` within `InlineHintBound`, small-total — is
+  # bounded by the one pot; see `growthLeft` for what an exempt class costs
+  # cross-module. NOTE: the pot is spent first-come-first-served in source
+  # order, which is a real weakness — on a traced nimsem build 6,888 splices
+  # are refused here, 4,007 of them bodies ≤ 100 tokens, because a call site
+  # earlier in the same proc got there first. Spending it best-first (cost all
+  # the caller's candidates, then commit cheapest-per-benefit until the pot is
+  # gone) is the next move.
+  if info.size > c.growthLeft: decide(false, "growth budget")   # pot is spent
+  decide(true, "inlinable")
 
-proc collectParamSyms(params: Cursor): seq[SymId] =
-  result = @[]
-  if params.kind != ParLe: return @[]
-  var p = params
-  p.into:
-    while p.hasMore:
-      if p.substructureKind == ParamU:
-        var q = p
-        inc q
-        if q.kind == SymbolDef:
-          result.add q.symId
-      skip p
+proc chargeSplice(c: var InlinerCtx; calleeSym: SymId) =
+  ## Book the committed splice against the current caller's growth budget.
+  let size = lookupInlineInfo(c, calleeSym).size
+  c.growthLeft = max(0, c.growthLeft - max(size, 1))
 
-proc weightOfUse(n: Cursor): int =
-  case n.exprKind
-  of EqC, NeqC, LeC, LtC: 30
-  of AddC, SubC, MulC, DivC, ModC, ShrC, ShlC,
-     BitandC, BitorC, BitxorC, BitnotC, NegC,
-     AndC, OrC, NotC: 20
-  of AtC, PatC: 40
-  of CallC: 10
-  else:
-    case n.stmtKind
-    of IfS, WhileS, CaseS, IteS, ItecS, LoopS: 50
-    of CallS: 10
-    else: 0
-
-proc walkInlineWeights(n: var Cursor; params: Table[SymId, int];
-                       weights: var seq[int]; inherited: int) =
-  case n.kind
-  of Symbol:
-    if params.hasKey(n.symId):
-      weights[params.getOrQuit(n.symId)] += inherited
-    inc n
-  of ParLe:
-    let w = max(inherited, weightOfUse(n))
-    n.into:
-      while n.hasMore:
-        walkInlineWeights(n, params, weights, w)
-  of ParRi:
-    discard
-  else:
-    inc n
-
-proc subtreeTokenCount(n: Cursor; limit: int): int =
-  result = 0
-  var n = n
-  if n.kind != ParLe:
-    return 1
-  var nested = 0
-  while true:
-    inc result
-    if result > limit:
-      return result
-    case n.kind
-    of ParLe:
-      inc nested
-      inc n
-    of ParRi:
-      dec nested
-      inc n
-      if nested == 0:
-        return result
-    of EofToken:
-      return result
-    else:
-      inc n
-
-proc computeInlineInfo*(procDecl: Cursor): InlineInfo =
-  result = DefaultInlineInfo
-  var p = procDecl
-  let pd = takeProcDecl(p)
-  let params = collectParamSyms(pd.params)
-  result.weights = newSeq[int](params.len)
-
-  var hasInline = false
-  if pd.pragmas.kind == ParLe:
-    var pr = pd.pragmas
-    pr.into:                            # scan all pragmas (no early break: the
-      while pr.hasMore:                 # `into` epilogue needs the scope drained)
-        if pr.kind == ParLe and pr.pragmaKind == InlineP:
-          hasInline = true
-        skip pr
-  if not hasInline:
-    return
-
-  result.threshold = 0
-  var lookup = initTable[SymId, int]()
-  for i, s in params:
-    lookup[s] = i
-  if lookup.len > 0 and pd.body.kind == ParLe:
-    var body = pd.body
-    walkInlineWeights(body, lookup, result.weights, 0)
-
-proc analyzeModule*(buf: var TokenBuf): ModuleAnalysis =
+proc analyzeModule(buf: var TokenBuf): ModuleAnalysis =
   result = ModuleAnalysis(inlineInfo: initTable[SymId, InlineInfo]())
   var n = beginRead(buf)
+  var found: seq[(SymId, InlineInfo)] = @[]
   if n.stmtKind == StmtsS:
     n.into:
       while n.hasMore:
-        if n.kind == ParLe and n.stmtKind == ProcS:
-          let nameCur = n.firstSon
-          if nameCur.kind == SymbolDef:
-            let info = computeInlineInfo(n)
-            if info.threshold == 0:
-              result.inlineInfo[nameCur.symId] = info
+        if n.isTagLit and n.stmtKind == ProcS:
+          let nameCur = n.childCursor
+          if nameCur.isSymbolDef:
+            found.add((nameCur.symId, computeInlineInfo(n)))
         skip n
-  endRead(buf)
+  applySmallTotalRule(buf, found)
+  for (sym, info) in found:
+    if info.inlinable:
+      result.inlineInfo[sym] = info
 
 proc collectParams(params: Cursor; outSyms: var seq[SymId];
 
                    outTypes: var seq[Cursor]) =
   outSyms.setLen 0
   outTypes.setLen 0
-  if params.kind != ParLe: return
+  if not params.isTagLit: return
   var p = params
   p.into:
     while p.hasMore:
       if p.substructureKind == ParamU:
         var inner = p
         inc inner                      # past `param` tag
-        if inner.kind != SymbolDef:
+        if not inner.isSymbolDef:
           skip p
           continue
         outSyms.add inner.symId
@@ -392,6 +599,49 @@ type
     rename: Table[SymId, SymId]      ## original param/local sym -> fresh sym
     subst: Table[SymId, Cursor]      ## read-only param sym -> argument subtree
                                      ## to splice at uses (no copy emitted)
+    dropDecl: SymId                  ## the callee's RESULT local (every `(ret X)`
+                                     ## returns it): renamed to the splice
+                                     ## destination, so its `(var …)` decl folds
+                                     ## to an assignment (or vanishes) and the
+                                     ## ret's `dest = result'` self-copy is
+                                     ## elided. SymId(0) = no forwarding.
+    dropDecl2: SymId                 ## the local the result was copied FROM in a
+                                     ## `(asgn result L) (ret result)` tail — renamed
+                                     ## to the destination as well, so its decl folds
+                                     ## away too and the copy becomes a self-assign
+                                     ## that `emitRenamed` drops. See `tailCopySource`.
+
+proc isForwarded(bnd: Bindings; nameSlot: Cursor): bool {.inline.} =
+  ## Is `nameSlot` (a `(var :NAME …)`'s name slot) one of the callee locals whose
+  ## storage the splice destination took over? Both such decls fold away.
+  nameSlot.isSymbolDef and
+    ((bnd.dropDecl != SymId(0) and nameSlot.symId == bnd.dropDecl) or
+     (bnd.dropDecl2 != SymId(0) and nameSlot.symId == bnd.dropDecl2))
+
+proc isSelfAsgn(bnd: Bindings; n: Cursor): bool =
+  ## `(asgn A B)` where A and B are bare symbols that RENAME to the same one — the
+  ## residue of forwarding both ends of the callee's `result = tmp` tail copy to the
+  ## destination. A self-assignment of a plain symbol has no effect and no side
+  ## effect, so dropping it is unconditional.
+  if not n.isTagLit or n.stmtKind != AsgnS: return false
+  var a = n.childCursor
+  if not a.isSymbol: return false
+  let lhs = bnd.rename.getOrDefault(a.symId, a.symId)
+  skip a
+  if not a.isSymbol: return false
+  let rhs = bnd.rename.getOrDefault(a.symId, a.symId)
+  skip a
+  if a.hasMore: return false                 # a 3rd child: not the shape
+  result = lhs == rhs
+
+proc isForwardedRet(bnd: Bindings; n: Cursor; targetSym: SymId): bool =
+  ## Is `n`, the value of a callee `(ret n)`, the splice destination itself once
+  ## renamed — so the `targetSym = n` copy would be a self-assignment? Only the
+  ## RENAMED symbol may be compared: the callee's own names live in its scope, and
+  ## a callee local can share its name with the caller's destination (both procs
+  ## have a `canRaise.0`) while being a different variable (#2674).
+  result = n.isSymbol and not bnd.subst.hasKey(n.symId) and
+    bnd.rename.getOrDefault(n.symId, n.symId) == targetSym
 
 proc isSubstitutableArg(c: Cursor): bool =
   ## A literal or nullary constant — stable across the whole body, so it can be
@@ -399,28 +649,275 @@ proc isSubstitutableArg(c: Cursor): bool =
   ## NOT included: the inliner cannot prove the caller's variable is unmodified
   ## during the body without alias info.)
   case c.kind
-  of IntLit, UIntLit, FloatLit, CharLit, StringLit: true
-  of ParLe: c.exprKind in {TrueC, FalseC, NilC, InfC, NeginfC, NanC}
+  of IntLit, UIntLit, FloatLit, CharLit, StrLit: true
+  of TagLit: c.exprKind in {TrueC, FalseC, NilC, InfC, NeginfC, NanC}
   else: false
 
+proc isStableDerefArg(c: Cursor): bool =
+  ## `(deref S)` for a bare local/param symbol. Hexer passes by-value objects
+  ## as `(deref ptrParam)`, and binding that to a fresh `(var :p T (deref S))`
+  ## copies the whole object (24 bytes for `Cursor`) before an inlined
+  ## `tokenWidth`/`cursorJump` reads two fields. Substituting instead turns
+  ## those uses into `(dot (deref S) f)` — one load, no copy. Safe for the
+  ## same reason `isStableAddrArg` is: the inlined body cannot assign the
+  ## caller's pointer (that would have put the param in `assigned`).
+  if not c.isTagLit or c.exprKind != DerefC: return false
+  result = c.childCursor.isSymbol
+
+proc isStableAddrArg(c: Cursor): bool =
+  ## `(haddr L)` / `(addr L)` for a bare symbol `L`. The argument is an ADDRESS,
+  ## and a named slot's address is a constant for the whole body — so unlike a
+  ## symbol's *value* this needs no alias reasoning and holds for globals and
+  ## caller params too.
+  ##
+  ## This is the `var`/`out` parameter case, and it is why it matters: `derefs`
+  ## turns `inc i` into `inc((haddr i))`, so binding the argument would leave
+  ## `(var :p (ptr T) (haddr i))` behind and every access routed through
+  ## `(deref p)`. That `(haddr i)` makes `i` address-taken, and an address-taken
+  ## local cannot live in a register — arkham pins it to a stack slot, so a
+  ## `while` loop whose counter is bumped with `inc` pays three memory operations
+  ## per iteration in a proc that had registers to spare. Substituting instead
+  ## leaves `(deref (haddr i))`, which the rewrite engine's `deref_addr` rule
+  ## folds straight back to `i` — no address survives, and the local stays
+  ## register-eligible for every later pass and both allocators.
+  ##
+  ## A compound lvalue (`(haddr (dot o f))`, `(haddr (at a i))`) is excluded: the
+  ## path would be re-evaluated at each use, and the body could write through
+  ## another pointer parameter to a symbol the path mentions.
+  if not c.isTagLit or c.exprKind notin AddrKinds: return false
+  result = c.childCursor.isSymbol
+
+proc slotRootOf(c: Cursor): SymId =
+  ## Like `rootOf`, but a spine that crosses a pointer dereference targets the
+  ## *pointee*, not the named slot: `(*p).f = x` writes through `p`, leaving
+  ## `p`'s own value and address untouched. Such through-pointer lvalues yield
+  ## `SymId(0)`; a plain slot (`x`, `x.f`, `x[i]`, `conv(T, x)`) yields its base
+  ## symbol. This is the deref-aware analogue used by copyprop's `addrRootOf`:
+  ## it lets a param that is only ever *written through* still count as
+  ## value-stable (its pointer value never changes), so its argument can be
+  ## substituted instead of copied.
+  result = SymId(0)
+  var n = c
+  while true:
+    case n.kind
+    of Symbol: return n.symId
+    of TagLit:
+      case n.exprKind
+      of DerefC, PatC: return SymId(0)       # through-pointer: pointee, not the slot
+      of DotC, AtC: inc n                     # field / index: base is the first child
+      of ConvC, CastC:
+        inc n; skip n                         # `(conv/cast Type operand)` — skip the type
+      else: return rootOf(n)                  # unmodelled spine: stay conservative
+    else: return SymId(0)
+
+const PathArgSubstitution* = not defined(inlinerNoPathSubst)
+  ## Substitute a compound-lvalue or global argument into the splice when the
+  ## callee body provably writes nothing the caller can observe
+  ## (`bodyIsCallerReadOnly`). `-d:inlinerNoPathSubst` restores the older, purely
+  ## shape-based rule (literals, `(haddr S)`, `(deref S)`, bare locals) as the
+  ## A/B reference.
+
+const MaxPathSubstUses = 2
+  ## How often a substituted *path* argument may appear in the body. Unlike a
+  ## bare symbol, a path is re-evaluated at each use (`(dot o f)` is a load), so
+  ## substituting it at many sites trades one copy for many loads. Two keeps the
+  ## win — the `var`-parameter case is one or two uses — without that trade.
+  ## (`cse` would re-fold the repeats, but it only runs under `--opt`.)
+
+proc countParamUses(c: Cursor; params: HashSet[SymId]; uses: var Table[SymId, int]) =
+  case c.kind
+  of Symbol:
+    if c.symId in params: uses[c.symId] = uses.getOrDefault(c.symId) + 1
+  of TagLit:
+    var n = c
+    n.into:
+      while n.hasMore:
+        countParamUses(n, params, uses)
+        skip n
+  else: discard
+
+proc isPurePathArg(c: Cursor): bool =
+  ## Is the argument an lvalue path — symbols, fields, indices, derefs, casts —
+  ## with no call and no constructor in it? Such an expression can be spliced at
+  ## a use site and re-evaluated there, PROVIDED nothing writes what it reads;
+  ## that second half is `bodyIsCallerReadOnly`'s job.
+  case c.kind
+  of Symbol, SymbolDef, IntLit, UIntLit, FloatLit, CharLit, StrLit:
+    result = true
+  of TagLit:
+    case c.exprKind
+    of DotC, AtC, DerefC, PatC, AddrC, HaddrC, ConvC, CastC, BaseobjC, ParC:
+      result = true
+      var n = c
+      n.into:
+        while n.hasMore:
+          if not isPurePathArg(n): result = false
+          skip n
+    else:
+      result = false
+  else:
+    result = false
+
+proc writeTargetIsLocalSlot(dst: Cursor): bool =
+  ## True when the written lvalue is a plain slot of a symbol this body owns:
+  ## no deref/index-through-pointer step (`slotRootOf` answers 0 for those), and
+  ## a *local* name, since assigning a global is visible to the caller.
+  let s = slotRootOf(dst)
+  result = s != SymId(0) and pool.symIsLocal(s)
+
 proc scanParamUsage(c: Cursor; params: HashSet[SymId];
-                    assigned, addrTaken: var HashSet[SymId]) =
-  ## Record which parameters are an assignment target's root, or have their
-  ## address taken, anywhere in the body — those cannot be replaced by a value.
-  if c.kind != ParLe: return
-  if c.stmtKind in {AsgnS, StoreS}:
-    var dst = c.firstSon
-    if c.stmtKind == StoreS: skip dst        # `(store value dest)` — dest is 2nd
-    let s = rootOf(dst)
+                    assigned, addrTaken: var HashSet[SymId];
+                    opaqueEffects: var bool) =
+  ## Record which parameters have their *slot* reassigned (a bare `p = …`) or
+  ## their *slot* address taken (`addr p`) anywhere in the body — those cannot
+  ## be replaced by their argument value. Writes and address-of that go
+  ## *through* the pointer (`(*p).f = …`, `addr (*p)`) leave the slot's value
+  ## and address intact, so `slotRootOf` deliberately ignores them.
+  ##
+  ## `opaqueEffects` reports whether the body could write memory the scan
+  ## cannot attribute to a named local slot: a store whose destination root is
+  ## a through-pointer/unmodelled lvalue (`slotRootOf` = 0), or any call
+  ## (whose callee may write through captured pointers). While it stays false,
+  ## the body provably reads — never writes — everything reachable through an
+  ## address it takes, which is what lets an ADDRESS-TAKEN read-only param
+  ## still be substituted by a caller lvalue (see `bindingsFor`).
+  if not c.isTagLit: return
+  if c.stmtKind == AsgnS:
+    let s = slotRootOf(c.childCursor)
     if s in params: assigned.incl s
-  elif c.exprKind == AddrC:
-    let s = rootOf(c.firstSon)
+    elif s == SymId(0): opaqueEffects = true # through-pointer / unmodelled store
+  elif c.exprKind in AddrKinds:
+    let s = slotRootOf(c.childCursor)
     if s in params: addrTaken.incl s
+  elif c.exprKind == CallC or c.stmtKind == CallS:
+    opaqueEffects = true                     # callee may write through pointers
   var n = c
   n.into:
     while n.hasMore:
-      scanParamUsage(n, params, assigned, addrTaken)
+      scanParamUsage(n, params, assigned, addrTaken, opaqueEffects)
       skip n
+
+proc scanRets(n: var Cursor; resultSym: var SymId; found, ok: var bool) =
+  ## Walk one subtree looking for `(ret X)`. `ok` stays true iff EVERY ret
+  ## returns the same bare symbol, reported in `resultSym`; `found` records
+  ## that at least one ret exists. Nested proc decls (if any) are skipped.
+  case n.kind
+  of TagLit:
+    if n.stmtKind == RetS:
+      var hasVal = false
+      var valIsSym = false
+      var valSym = SymId(0)
+      into n:
+        if n.hasMore and not n.isDotToken:
+          hasVal = true
+          if n.isSymbol:
+            valIsSym = true
+            valSym = n.symId
+        while n.hasMore: skip n
+      if not hasVal or not valIsSym:
+        ok = false
+      elif not found:
+        resultSym = valSym
+        found = true
+      elif resultSym != valSym:
+        ok = false
+    elif n.stmtKind == ProcS:
+      skip n
+    else:
+      into n:
+        while n.hasMore: scanRets(n, resultSym, found, ok)
+  else:
+    inc n
+
+proc resultLocalOf(body: Cursor; pSyms: seq[SymId]): SymId =
+  ## The callee's result LOCAL for destination forwarding: every `(ret X)` in
+  ## the body returns the same bare, body-local, non-param symbol (nimsem's
+  ## implicit `result` after lowering). SymId(0) when the pattern doesn't hold.
+  var resultSym = SymId(0)
+  var found = false
+  var ok = true
+  var b = body
+  scanRets(b, resultSym, found, ok)
+  if not (found and ok) or resultSym == SymId(0): return SymId(0)
+  if resultSym in pSyms: return SymId(0)          # a param: bound to its arg
+  if not pool.symIsLocal(resultSym): return SymId(0)
+  result = resultSym
+
+proc countSymUses(n: Cursor; sym: SymId): int =
+  ## Count `Symbol` (use, not `SymbolDef`) occurrences of `sym` within the
+  ## single subtree rooted at `n` (which may be a leaf token).
+  result = 0
+  if n.isSymbol:
+    if n.symId == sym: result = 1
+    return
+  if not n.isTagLit:
+    return
+  var it = n
+  it.into:
+    while it.hasMore:
+      case it.kind
+      of Symbol:
+        if it.symId == sym: inc result
+        inc it
+      of TagLit:
+        result += countSymUses(it, sym)
+        skip it
+      else:
+        inc it
+
+proc tailCopySource(body: Cursor; resultSym: SymId; pSyms: seq[SymId]): SymId =
+  ## The local `L` in a body whose LAST two statements are
+  ##
+  ##   (asgn resultSym L)
+  ##   (ret resultSym)
+  ##
+  ## and which mentions `resultSym` nowhere else. `L`'s storage can then be the
+  ## splice destination just as `resultSym`'s is: it is written where `L` is
+  ## written and read only to feed the return.
+  ##
+  ## This shape is not exotic, it is what every one-expression accessor lowers to
+  ## — nimsem binds the expression to a temp and assigns that to the implicit
+  ## `result`, so `nifcore.kind` arrives as `(var :x …) (asgn x <expr>) (asgn result
+  ## x) (ret result)`. Forwarding only `result` leaves the copy, and the copy is a
+  ## whole extra register: `c.kind` reached its `case` through `and3 x24, …` /
+  ## `mov x22, x24`, in every inlined accessor in the program.
+  ##
+  ## Deliberately narrow. Requiring the copy to be the tail — with the ret its only
+  ## other mention — is what makes the substitution provable without dataflow: on
+  ## that shape `resultSym` is written exactly once and read exactly once, and both
+  ## statements disappear into the destination.
+  if not body.isTagLit or body.stmtKind != StmtsS: return SymId(0)
+  var prev = default(Cursor)
+  var last = default(Cursor)
+  var n = 0
+  var b = body
+  b.into:
+    while b.hasMore:
+      prev = last
+      last = b
+      inc n
+      skip b
+  if n < 2: return SymId(0)                  # no `(asgn …)` before the `(ret …)`
+  # last must be `(ret resultSym)`
+  if not last.isTagLit or last.stmtKind != RetS: return SymId(0)
+  var r = last.childCursor
+  if not r.isSymbol or r.symId != resultSym: return SymId(0)
+  skip r
+  if r.hasMore: return SymId(0)
+  # the one before must be `(asgn resultSym L)`
+  if not prev.isTagLit or prev.stmtKind != AsgnS: return SymId(0)
+  var a = prev.childCursor
+  if not a.isSymbol or a.symId != resultSym: return SymId(0)
+  skip a
+  if not a.isSymbol: return SymId(0)
+  let src = a.symId
+  skip a
+  if a.hasMore: return SymId(0)
+  if src == resultSym or src in pSyms: return SymId(0)
+  if not pool.symIsLocal(src): return SymId(0)
+  # `resultSym` must be mentioned nowhere but those two statements.
+  if countSymUses(body, resultSym) != 2: return SymId(0)
+  result = src
 
 proc emitRenamed(dest: var TokenBuf; body: var Cursor;
                  bnd: Bindings) =
@@ -440,7 +937,7 @@ proc emitRenamed(dest: var TokenBuf; body: var Cursor;
     if bnd.rename.hasKey(body.symId):
       dest.addSymDef bnd.rename.getOrQuit(body.symId), body.info
     else:
-      dest.add body
+      dest.addSubtree body
     inc body
   of Symbol:
     if bnd.subst.hasKey(body.symId):
@@ -449,18 +946,18 @@ proc emitRenamed(dest: var TokenBuf; body: var Cursor;
     elif bnd.rename.hasKey(body.symId):
       dest.addSymUse bnd.rename.getOrQuit(body.symId), body.info
     else:
-      dest.add body
+      dest.addSubtree body
     inc body
-  of ParLe:
+  of TagLit:
     # `into` bounds `body` to this scope so the child loop terminates at the
     # real-or-virtual `)`; `addParRi` emits a fresh closer (the source `)` is
     # elided under `-d:virtualParRi`).
     if body.substructureKind == KvU:
       # `(kv field value [depth])` — field name slot is verbatim.
-      dest.add body
+      dest.addParLe(body.cursorTagId, body.info)
       into body:                            # past `kv` tag
         if body.hasMore:
-          dest.add body                     # field name — no rename
+          dest.addSubtree body              # field name — no rename
           inc body
         while body.hasMore:
           emitRenamed(dest, body, bnd)
@@ -469,26 +966,24 @@ proc emitRenamed(dest: var TokenBuf; body: var Cursor;
     if body.exprKind == DotC:
       # `(dot obj field [depth])` — field slot (the 2nd child) is
       # verbatim; obj and the optional depth are renameable.
-      dest.add body
+      dest.addParLe(body.cursorTagId, body.info)
       into body:                            # past `dot` tag
         if body.hasMore:
           emitRenamed(dest, body, bnd)   # obj
         if body.hasMore:
-          dest.add body                     # field — no rename
+          dest.addSubtree body              # field — no rename
           inc body
         while body.hasMore:
           emitRenamed(dest, body, bnd)   # depth, etc.
       dest.addParRi()
       return
-    dest.add body
+    dest.addParLe(body.cursorTagId, body.info)
     into body:
       while body.hasMore:
         emitRenamed(dest, body, bnd)
     dest.addParRi()
-  of ParRi:
-    discard
   else:
-    dest.add body
+    dest.addSubtree body
     inc body
 
 proc emitRenamedWithRet(dest: var TokenBuf; body: var Cursor;
@@ -507,7 +1002,7 @@ proc emitRenamedWithRet(dest: var TokenBuf; body: var Cursor;
     if bnd.rename.hasKey(body.symId):
       dest.addSymDef bnd.rename.getOrQuit(body.symId), body.info
     else:
-      dest.add body
+      dest.addSubtree body
     inc body
   of Symbol:
     if bnd.subst.hasKey(body.symId):
@@ -516,61 +1011,115 @@ proc emitRenamedWithRet(dest: var TokenBuf; body: var Cursor;
     elif bnd.rename.hasKey(body.symId):
       dest.addSymUse bnd.rename.getOrQuit(body.symId), body.info
     else:
-      dest.add body
+      dest.addSubtree body
     inc body
-  of ParLe:
+  of TagLit:
     # See `emitRenamed`: `into` bounds the scope (the closing `)` may be
     # virtual under `-d:virtualParRi`), `addParRi` emits a fresh closer.
     if body.stmtKind == RetS:
       let info = body.info
       into body:                            # enter (ret …)
-        if body.hasMore and body.kind != DotToken and targetSym != SymId(0):
-          dest.addParLe TagId(AsgnS), info
-          dest.addSymUse targetSym, info
-          emitRenamed(dest, body, bnd)  # the returned expression
-          dest.addParRi()
+        if body.hasMore and not body.isDotToken and targetSym != SymId(0):
+          if bnd.isForwardedRet(body, targetSym):
+            skip body                       # `ret result`: dest IS result (forwarded)
+          else:
+            dest.addParLe TagId(AsgnS), info
+            dest.addSymUse targetSym, info
+            emitRenamed(dest, body, bnd)  # the returned expression
+            dest.addParRi()
         else:
           while body.hasMore: skip body     # discard the value
       dest.addParLe TagId(JmpS), info
       dest.addSymUse returnLabel, info
       dest.addParRi()
       return
+    if body.stmtKind == VarS and bnd.isForwarded(body.childCursor):
+      # The callee's result var (or the local its tail copies from): its storage IS
+      # the splice destination (renamed), so the decl folds away — an initializer
+      # becomes a plain assignment to the destination.
+      let vinfo = body.info
+      into body:
+        skip body                           # name
+        skip body                           # pragmas
+        skip body                           # type
+        if body.hasMore and not body.isDotToken:
+          dest.addParLe TagId(AsgnS), vinfo
+          dest.addSymUse targetSym, vinfo
+          emitRenamed(dest, body, bnd)      # the initializer expression
+          dest.addParRi()
+        while body.hasMore: skip body       # drain (`.` initializer / extras)
+      return
+    if bnd.isSelfAsgn(body):
+      # `(asgn L L)` after renaming — both sides forwarded to the destination. The
+      # copy the forwarding collapsed; emitting it would be a `dest = dest` store.
+      skip body
+      return
     if body.substructureKind == KvU:
       # See `emitRenamed`: field-name slot of `(kv …)` is verbatim to
       # avoid collisions with body-locals that share the field name.
       # Inner subtrees still get the ret-rewrite treatment in case the
       # value side hides a `(ret …)`.
-      dest.add body
+      dest.addParLe(body.cursorTagId, body.info)
       into body:
         if body.hasMore:
-          dest.add body                     # field name — verbatim
+          dest.addSubtree body              # field name — verbatim
           inc body
         while body.hasMore:
           emitRenamedWithRet(dest, body, bnd, targetSym, returnLabel)
       dest.addParRi()
       return
     if body.exprKind == DotC:
-      dest.add body
+      dest.addParLe(body.cursorTagId, body.info)
       into body:
         if body.hasMore:
           emitRenamedWithRet(dest, body, bnd, targetSym, returnLabel)
         if body.hasMore:
-          dest.add body                     # field — verbatim
+          dest.addSubtree body              # field — verbatim
           inc body
         while body.hasMore:
           emitRenamedWithRet(dest, body, bnd, targetSym, returnLabel)
       dest.addParRi()
       return
-    dest.add body
+    dest.addParLe(body.cursorTagId, body.info)
     into body:
       while body.hasMore:
         emitRenamedWithRet(dest, body, bnd, targetSym, returnLabel)
     dest.addParRi()
-  of ParRi:
-    discard
   else:
-    dest.add body
+    dest.addSubtree body
     inc body
+
+proc emitTailStmt(dest: var TokenBuf; body: var Cursor; bnd: Bindings;
+                  targetSym: SymId; returnLabel: SymId) =
+  ## Emit a statement that is in TAIL position — the last statement reached
+  ## before the inline body's `(lab :returnLabel)`. A tail `(ret X)` becomes its
+  ## `(asgn targetSym X)` with NO `(jmp returnLabel)` (control falls straight into
+  ## the label). A tail `stmts`/`scope` recurses so ITS last statement inherits
+  ## the tail position; anything else is handled by the general `(ret)`-rewriter
+  ## (interior returns still jump). Mirrors the arkham value-core's tail handling.
+  if body.isTagLit and body.stmtKind == RetS:
+    let rinfo = body.info
+    into body:
+      if body.hasMore and not body.isDotToken and targetSym != SymId(0):
+        if bnd.isForwardedRet(body, targetSym):
+          skip body                          # `ret result`: dest IS result (forwarded)
+        else:
+          dest.addParLe TagId(AsgnS), rinfo
+          dest.addSymUse targetSym, rinfo
+          emitRenamed(dest, body, bnd)       # the returned expression
+          dest.addParRi()
+      else:
+        while body.hasMore: skip body        # void return: discard the value
+  elif body.isTagLit and body.stmtKind in {StmtsS, ScopeS}:
+    dest.addParLe(body.cursorTagId, body.info)       # copy the (stmts/(scope opener
+    into body:
+      while body.hasMore:
+        var nx = body; skip nx
+        if not nx.hasMore: emitTailStmt(dest, body, bnd, targetSym, returnLabel)
+        else: emitRenamedWithRet(dest, body, bnd, targetSym, returnLabel)
+    dest.addParRi()
+  else:
+    emitRenamedWithRet(dest, body, bnd, targetSym, returnLabel)
 
 proc emitBody(c: var InlinerCtx; dest: var TokenBuf; body: var Cursor;
               bnd: Bindings; targetSym: SymId) =
@@ -579,27 +1128,91 @@ proc emitBody(c: var InlinerCtx; dest: var TokenBuf; body: var Cursor;
   ## `(asgn targetSym X)` for a bound non-void splice), and append the
   ## matching `(lab :returnLabel)` after the body's last statement.
   ##
-  ## A `.inline` proc with a single tail return produces a redundant
-  ## `(jmp) (lab)` pair which a C compiler trivially optimises away —
-  ## that cost buys us uniform handling of arbitrarily-many `(ret X)`
-  ## points so no body shape disqualifies the splice.
-  if body.kind != ParLe or body.stmtKind != StmtsS:
+  ## A tail `(ret X)` — the last statement of the body — is emitted as its
+  ## `(asgn targetSym X)` alone: control then falls straight through to the
+  ## trailing `(lab :returnLabel)`, so the `(jmp returnLabel)` would be dead.
+  ## gcc drops that dead jump for free, but arkham renders `(jmp)`/`(lab)`
+  ## verbatim, so eliding it at the source keeps the native output tight while
+  ## preserving uniform handling of any interior `(ret X)` points. The label is
+  ## still emitted unconditionally (it costs zero machine bytes) so interior
+  ## returns' jumps always resolve.
+  if not body.isTagLit or body.stmtKind != StmtsS:
     emitRenamed(dest, body, bnd)
     return
   let info = body.info
   inc c.counter
-  let returnLabel = pool.syms.getOrIncl(
-    "returnLabel.0" & c.counterPrefix & $c.counter)
-  dest.addParLe TagId(StmtsS), info
+  let returnLabel = pool.symId(
+    derivedName("returnLabel." & $c.counter, c.counterPrefix))
+  # Emit the inlined body as a real variable SCOPE, not a bare `(stmts)`: the
+  # callee's fresh locals then belong to *this* scope frame, so the backend frees
+  # their registers at the inlined body's end instead of leaking their live range
+  # to the end of the *caller* (arkham measures a local's `freeAfter` at its
+  # enclosing scope; a `stmts` is not a scope). Without this, N sequential inline
+  # sites keep N sets of locals simultaneously live → false register pressure.
+  # The `returnLabel` stays INSIDE the scope so every early-return path reaches the
+  # scope's exit (its variable kills), never jumping out of a still-open scope.
+  dest.addParLe TagId(ScopeS), info
   into body:                                # bounded: source `)` may be virtual
     while body.hasMore:
-      emitRenamedWithRet(dest, body, bnd, targetSym, returnLabel)
+      var nx = body; skip nx
+      if not nx.hasMore:                     # last statement → tail position
+        emitTailStmt(dest, body, bnd, targetSym, returnLabel)
+      else:
+        emitRenamedWithRet(dest, body, bnd, targetSym, returnLabel)
   dest.addParLe TagId(LabS), info
   dest.addSymDef returnLabel, info
   dest.addParRi()
-  dest.addParRi()                           # close (stmts …)
+  dest.addParRi()                           # close (scope …)
 
-proc bindingsFor(pSyms: seq[SymId]; argCursors: seq[Cursor];
+proc calleeIsNoReturn(c: var InlinerCtx; calleeSym: SymId): bool =
+  ## `(attr "noreturn")` on the callee — `lengcgen` carries Nimony's noreturn
+  ## that way. Control never comes back, so nothing such a call writes can be
+  ## observed by a later use in the body that called it. `panic` is the case
+  ## that matters: every lowered bounds check contains one.
+  var decl = default(Cursor)
+  if not lookupBody(c, calleeSym, decl): return false
+  var p = decl
+  let pd = takeProcDecl(p)
+  if not pd.pragmas.isTagLit: return false
+  var pr = pd.pragmas
+  pr.into:
+    while pr.hasMore:
+      if pr.isTagLit and pr.pragmaKind == AttrP:
+        var a = pr
+        inc a
+        if a.kind == StrLit and pool.strings[a.strId] == "noreturn": return true
+      skip pr
+  result = false
+
+proc bodyIsCallerReadOnly(c: var InlinerCtx; body: Cursor): bool =
+  ## Can this body change ANY memory its caller can observe?
+  ##
+  ## It cannot when every write goes to a plain slot of one of its own locals
+  ## (never through a pointer, never to a global) and every call it makes is one
+  ## that does not return. Such a body leaves every caller-side expression
+  ## exactly as it found it — so an argument that is a pure path
+  ## (`isPurePathArg`) has the same value at every use site inside the splice,
+  ## and can be substituted instead of copied into a parameter.
+  ##
+  ## This is the fact the two "cannot prove it without alias info" refusals in
+  ## `isSubstitutableArg` / `isStableAddrArg` were missing. It is answered from
+  ## the body about to be spliced — no summaries, no types, no alias partition.
+  if not body.isTagLit: return false
+  result = true
+  var n = body
+  if n.stmtKind == AsgnS:
+    if not writeTargetIsLocalSlot(n.childCursor): return false
+  elif n.stmtKind == CallS or n.exprKind == CallC:
+    var callee = n.childCursor
+    if callee.kind != Symbol: return false
+    if not calleeIsNoReturn(c, callee.symId): return false
+  var m = n
+  m.into:
+    while m.hasMore:
+      if not bodyIsCallerReadOnly(c, m): return false
+      skip m
+
+proc bindingsFor(c: var InlinerCtx; pSyms: seq[SymId]; argCursors: seq[Cursor];
                  body: Cursor; rename: Table[SymId, SymId]): Bindings =
   ## Bundle the param→fresh-sym rename with the set of params that can be
   ## replaced by their argument value (read-only, not addr-taken, substitutable
@@ -609,11 +1222,68 @@ proc bindingsFor(pSyms: seq[SymId]; argCursors: seq[Cursor];
   for s in pSyms: paramSet.incl s
   var assigned = initHashSet[SymId]()
   var addrTaken = initHashSet[SymId]()
-  scanParamUsage(body, paramSet, assigned, addrTaken)
+  var opaqueEffects = false
+  scanParamUsage(body, paramSet, assigned, addrTaken, opaqueEffects)
+  # Two different "this body cannot disturb the caller" facts, for two
+  # different substitutions — neither implies the other:
+  #
+  # - `opaqueEffects` (above, free: it rides the same walk) is about writes
+  #   *through pointers*. It tolerates a write to a named GLOBAL slot, so the
+  #   address-taken substitution below is restricted to caller LOCALS.
+  # - `bodyIsCallerReadOnly` is about caller-observable memory at large: it
+  #   forbids the global write, but tolerates calls that do not return. That is
+  #   what a pure PATH argument needs to be stable across the splice.
+  var uses = initTable[SymId, int]()
+  var callerReadOnly = false
+  when PathArgSubstitution:
+    var anyPathArg = false
+    for i in 0 ..< pSyms.len:
+      if pSyms[i] notin assigned and pSyms[i] notin addrTaken and
+         not argCursors[i].isSymbol and isPurePathArg(argCursors[i]):
+        anyPathArg = true
+        break
+    if anyPathArg:
+      callerReadOnly = bodyIsCallerReadOnly(c, body)
+      if callerReadOnly: countParamUses(body, paramSet, uses)
   for i in 0 ..< pSyms.len:
-    if isSubstitutableArg(argCursors[i]) and
-       pSyms[i] notin assigned and pSyms[i] notin addrTaken:
-      result.subst[pSyms[i]] = argCursors[i]
+    if pSyms[i] in assigned:
+      continue                               # slot mutated → copy
+    let arg = argCursors[i]
+    if pSyms[i] in addrTaken:
+      # The body takes the param's ADDRESS — but if it provably never writes
+      # through any pointer (`opaqueEffects` false: no store the scan can't
+      # attribute to a named local slot, and no call), everything reachable
+      # through that address is only READ, so the copy and the caller's own
+      # slot are indistinguishable and the copy can go. This is the SSO string
+      # case: `hashStr`/`[]`/`==` take `haddr s` purely to reach the packed
+      # bytes, and binding forced a whole-string copy per call PLUS an
+      # address-taken stack object that poisoned copyprop/CSE around every
+      # call site. The argument must be a bare LOCAL lvalue: `(haddr arg)` is
+      # spliced verbatim, so a literal or compound is unusable, and a global
+      # is excluded because the body may assign a global directly (that write
+      # targets a named slot, so it does not set `opaqueEffects`) — a local
+      # cannot be written by any means the scan admits.
+      if not opaqueEffects and arg.isSymbol and pool.symIsLocal(arg.symId):
+        result.subst[pSyms[i]] = arg
+      continue                               # else: address observed → copy
+    # A read-only param (value-stable per `scanParamUsage`) may be replaced by
+    # its argument at every use instead of bound to a fresh `(var)` copy.
+    # Pool are always stable. A bare *local* symbol is stable too: the
+    # inlined body only ever assigns fresh-renamed locals, never a caller local,
+    # so the substituted symbol's value cannot change across the body. Globals
+    # are excluded — a nested call in the body could mutate one between uses,
+    # whereas the copy captured its entry value.
+    if isSubstitutableArg(arg) or isStableAddrArg(arg) or isStableDerefArg(arg) or
+       (arg.isSymbol and pool.symIsLocal(arg.symId)):
+      result.subst[pSyms[i]] = arg
+    elif callerReadOnly and isPurePathArg(arg) and
+         uses.getOrDefault(pSyms[i]) <= MaxPathSubstUses:
+      # A compound lvalue (`(haddr (dot o f))`, `(at a i)`) or a global: stable
+      # here because this body writes nothing the caller can observe. Splicing
+      # it leaves `(deref (haddr (dot o f)))` at the use, which the rewrite
+      # engine's `deref_addr` rule folds back to `(dot o f)` — the same reason
+      # `isStableAddrArg` exists, now without the bare-symbol restriction.
+      result.subst[pSyms[i]] = arg
 
 proc seedRenameWalk(c: var InlinerCtx; n: var Cursor;
                     rename: var Table[SymId, SymId]) =
@@ -627,7 +1297,7 @@ proc seedRenameWalk(c: var InlinerCtx; n: var Cursor;
         if not rename.hasKey(n.symId):
           rename[n.symId] = c.freshSym(n.symId)
         inc n
-      of ParLe:
+      of TagLit:
         seedRenameWalk(c, n, rename)
       else:
         inc n
@@ -637,148 +1307,185 @@ proc seedRenameFromBody(c: var InlinerCtx; body: Cursor;
   ## Walk every token in the body and mint a fresh sym for each
   ## SymbolDef found, so local var declarations don't collide between
   ## inline copies in the same scope.
-  if body.kind != ParLe: return
+  if not body.isTagLit: return
   var n = body
   seedRenameWalk(c, n, rename)
 
-proc trySplice*(c: var InlinerCtx; dest: var TokenBuf; n: var Cursor): int =
-  ## If `n` points at a `(call f arg…)` statement we can inline, emit
-  ## the splice into `dest`, advance `n` past the call, and return the
-  ## number of top-level subtrees emitted (one `(scope …)` here).
-  ## Otherwise leave `n` and `dest` untouched and return 0.
-  if n.kind != ParLe or n.stmtKind != CallS: return 0
+when defined(inlinerStats):
+  import std / [algorithm, syncio]
+  var inlinerStats*: Table[string, tuple[count, tokens: int]]
 
-  let entry = n
-  var probe = n
+  proc recordSplice(calleeSym: SymId; tokens: int) =
+    let nm = pool.symString(calleeSym)
+    var e = inlinerStats.getOrDefault(nm)
+    inc e.count
+    e.tokens += tokens
+    inlinerStats[nm] = e
+
+  proc dumpInlinerStats*(label: string) =
+    var rows: seq[(int, int, string)] = @[]
+    for k, v in inlinerStats:
+      rows.add (v.tokens, v.count, k)
+    rows.sort(SortOrder.Descending)
+    stderr.writeLine "--- inliner stats " & label & " ---"
+    for (t, cnt, k) in rows:
+      stderr.writeLine $t & "\t" & $cnt & "\t" & k
+
+type
+  SpliceSite = object
+    ## What `prepareSplice` resolved about one inlinable call: the callee, its
+    ## decl, its parameters and the cursors of the call's actual arguments.
+    ## Resolving is split from emitting because a caller may have to write
+    ## something of its own BEFORE the splice (`trySpliceVarInit` re-emits the
+    ## `(var …)` first) and must be able to refuse without having emitted
+    ## anything.
+    calleeSym: SymId
+    pd: ProcDecl
+    pSyms: seq[SymId]
+    pTypes: seq[Cursor]
+    argCursors: seq[Cursor]
+
+proc prepareSplice(c: var InlinerCtx; call: Cursor; site: var SpliceSite): bool =
+  ## Every refusal a call position has in common: the cycle and depth guards,
+  ## the policy decision, the callee's body, its parameters, and an arity check
+  ## against the arguments actually passed. Emits nothing and charges nothing;
+  ## `false` leaves `site` unusable and the call alone.
+  if not call.isTagLit or call.stmtKind != CallS: return false
+  var probe = call
   inc probe                                # past `call` tag
-  if probe.kind != Symbol: return 0
+  if not probe.isSymbol: return false
   let calleeSym = probe.symId
-  if calleeSym in c.inProgress: return 0     # cycle guard
-  if c.maxDepth > 0 and c.inProgress.len >= c.maxDepth: return 0
-  if not shouldInlineCall(c, calleeSym, entry): return 0
+  if calleeSym in c.inProgress: return false # cycle guard
+  if c.maxDepth > 0 and c.inProgress.len >= c.maxDepth: return false
+  if not shouldInlineCall(c, calleeSym, call): return false
   var pcur = default(Cursor)
-  if not lookupBody(c, calleeSym, pcur): return 0
-  let pd = takeProcDecl(pcur)
+  if not lookupBody(c, calleeSym, pcur): return false
 
-  var pSyms: seq[SymId] = @[]
-  var pTypes: seq[Cursor] = @[]
-  collectParams(pd.params, pSyms, pTypes)
+  site.calleeSym = calleeSym
+  site.pd = takeProcDecl(pcur)
+  site.pSyms = @[]
+  site.pTypes = @[]
+  collectParams(site.pd.params, site.pSyms, site.pTypes)
 
-  # Arity check against the call's actual arguments. `into` bounds the walk
-  # to the call's own subtree (its closing `)` is virtual under virtualParRi).
-  var argScan = entry
+  # Arity check. `into` bounds the walk to the call's own subtree (its closing
+  # `)` is virtual under virtualParRi).
+  var argScan = call
   var argCount = 0
   argScan.into:
     skip argScan                           # past callee sym
     while argScan.hasMore:
       skip argScan
       inc argCount
-  if argCount != pSyms.len: return 0
+  if argCount != site.pSyms.len: return false
 
-  # All checks passed — build the rename table and emit unconditionally.
-  var rename = initTable[SymId, SymId]()
-  for s in pSyms:
-    rename[s] = c.freshSym(s)
-  seedRenameFromBody(c, pd.body, rename)
-
-  let info = entry.info
-
-  # Capture each argument cursor, then decide which params can be substituted
-  # directly (read-only, not addr-taken, substitutable arg) instead of copied.
-  var argCursors: seq[Cursor] = @[]
+  site.argCursors = @[]
   var ac = probe
   inc ac                                   # past callee sym
-  for i in 0 ..< pSyms.len:
-    argCursors.add ac
+  for i in 0 ..< site.pSyms.len:
+    site.argCursors.add ac
     skip ac
-  let bnd = bindingsFor(pSyms, argCursors, pd.body, rename)
+  result = true
+
+proc emitSplice(c: var InlinerCtx; dest: var TokenBuf; site: SpliceSite;
+                target: SymId; forwardResult: bool; info: NifLineInfo) =
+  ## The splice itself, identical whatever call position asked for it:
+  ##
+  ##   (scope
+  ##     (var :p_fresh <pragmas> <ptype> <arg>)…   — substituted params get none
+  ##     …body with every `(ret X)` rewritten against `target`…)
+  ##
+  ## `target` is where a returned value lands (`SymId(0)`: the result is
+  ## discarded, as at statement position). `forwardResult` additionally hands
+  ## the callee's result local — and the local a tail `result = L` copies from —
+  ## the target's storage, so their decls fold away and the `target = result'`
+  ## self-copy never appears. That is only sound when nothing reads the target
+  ## while the body runs: a fresh temp, or a caller local no argument mentions
+  ## (`trySpliceAsgn`). Otherwise it is written at the `(ret …)` points and
+  ## nowhere else, exactly as the call would have.
+  ##
+  ## Charges the caller's growth budget: every commit point goes through here.
+  var rename = initTable[SymId, SymId]()
+  for s in site.pSyms:
+    rename[s] = c.freshSym(s)
+  seedRenameFromBody(c, site.pd.body, rename)
+
+  var resultLocal = SymId(0)
+  var tailCopy = SymId(0)
+  if forwardResult:
+    resultLocal = resultLocalOf(site.pd.body, site.pSyms)
+    if resultLocal != SymId(0):
+      rename[resultLocal] = target         # overrides the seed walk's fresh sym
+      tailCopy = tailCopySource(site.pd.body, resultLocal, site.pSyms)
+      if tailCopy != SymId(0):
+        rename[tailCopy] = target
+
+  var bnd = bindingsFor(c, site.pSyms, site.argCursors, site.pd.body, rename)
+  bnd.dropDecl = resultLocal
+  bnd.dropDecl2 = tailCopy
 
   dest.addParLe TagId(ScopeS), info
 
   # Param bindings: NIFC `(var :p_fresh <pragmas> <type> <value>)`. Substituted
   # params get no binding — their argument is spliced at each use.
-  for i in 0 ..< pSyms.len:
-    if bnd.subst.hasKey(pSyms[i]): continue
+  for i in 0 ..< site.pSyms.len:
+    if bnd.subst.hasKey(site.pSyms[i]): continue
     dest.addParLe TagId(VarS), info
-    dest.addSymDef rename.getOrQuit(pSyms[i]), info
+    dest.addSymDef rename.getOrQuit(site.pSyms[i]), info
     dest.addDotToken()                     # pragmas
-    var t = pTypes[i]
+    var t = site.pTypes[i]
     dest.takeTree t                        # parameter type
-    dest.addSubtree argCursors[i]          # initializer
+    dest.addSubtree site.argCursors[i]     # initializer
     dest.addParRi()                        # close (var …)
 
-  # Splice the body. Void splice: every (ret …) becomes (jmp returnLabel).
-  var body = pd.body
-  emitBody(c, dest, body, bnd, SymId(0))
+  var body = site.pd.body
+  emitBody(c, dest, body, bnd, target)
 
   dest.addParRi()                          # close (scope …)
+  chargeSplice c, site.calleeSym
+  when defined(inlinerStats): recordSplice(site.calleeSym, dest.len)
 
-  # Advance the caller's cursor past the original call.
+proc trySplice*(c: var InlinerCtx; dest: var TokenBuf; n: var Cursor): int =
+  ## Statement-position `(call f arg…)`: the result, if any, is discarded. On
+  ## success emits the splice into `dest`, advances `n` past the call and
+  ## returns the number of top-level subtrees emitted (one `(scope …)`);
+  ## otherwise leaves `n` and `dest` untouched and returns 0.
+  if not n.isTagLit or n.stmtKind != CallS: return 0
+  let entry = n
+  var site = SpliceSite()
+  if not prepareSplice(c, entry, site): return 0
+  emitSplice(c, dest, site, SymId(0), forwardResult = false, entry.info)
   n = entry
   skip n
-  result = 1                               # one `(scope …)` emitted
+  result = 1
 
 proc trySpliceVarInit*(c: var InlinerCtx; dest: var TokenBuf; n: var Cursor): int =
-  ## If `n` is `(var :tmp <pragmas> <type> (call f arg…))` (the bound
-  ## form xelim produces for non-void calls in expression position) and
-  ## the call is inlinable, emit:
+  ## `(var :tmp <pragmas> <type> (call f arg…))` — the bound form xelim
+  ## produces for non-void calls in expression position. Emits
   ##
   ##   (var :tmp <pragmas> <type> .)
-  ##   (scope
-  ##     (var :p_fresh <pragmas> <ptype> <arg>)…
-  ##     …body with `(ret X)` rewritten to `(asgn tmp X)`…)
+  ##   (scope …)
   ##
-  ## Advances `n` past the original `(var …)` and returns the number of
-  ## top-level subtrees emitted (2 here). Otherwise leaves `n` and `dest`
-  ## untouched and returns 0.
-  if n.kind != ParLe or n.stmtKind != VarS: return 0
+  ## and returns 2. The temp is fresh and unobservable, so the callee's result
+  ## local takes over its storage (`forwardResult`) instead of copying into it:
+  ## that residue is assignment-shaped under control flow, which shoggoth's
+  ## copyprop cannot clean, so it must not be produced in the first place.
+  if not n.isTagLit or n.stmtKind != VarS: return 0
   let entry = n
   var probe = n
   inc probe                                # past `var` tag
-  if probe.kind != SymbolDef: return 0
+  if not probe.isSymbolDef: return 0
   let tmpSym = probe.symId
   # Local syms only — global vars with call initializers are out of
   # scope for this splice (their lifetime / module placement differs).
-  if not isLocalName(pool.syms[tmpSym]): return 0
+  if not pool.symIsLocal(tmpSym): return 0
   inc probe                                # past name
   let pragmasCursor = probe
   skip probe                               # past pragmas slot
   let typeCursor = probe
   skip probe                               # past type slot
-  if probe.kind != ParLe or probe.stmtKind != CallS: return 0
-  let valueCursor = probe
 
-  var callProbe = valueCursor
-  inc callProbe                            # past `call` tag
-  if callProbe.kind != Symbol: return 0
-  let calleeSym = callProbe.symId
-  if calleeSym in c.inProgress: return 0     # cycle guard
-  if c.maxDepth > 0 and c.inProgress.len >= c.maxDepth: return 0
-  if not shouldInlineCall(c, calleeSym, valueCursor): return 0
-  var pcur = default(Cursor)
-  if not lookupBody(c, calleeSym, pcur): return 0
-  let pd = takeProcDecl(pcur)
-
-  var pSyms: seq[SymId] = @[]
-  var pTypes: seq[Cursor] = @[]
-  collectParams(pd.params, pSyms, pTypes)
-
-  # `into` bounds the arity walk to the call's own subtree (its closing `)`
-  # is virtual under virtualParRi).
-  var argScan = valueCursor
-  var argCount = 0
-  argScan.into:
-    skip argScan                           # past callee sym
-    while argScan.hasMore:
-      skip argScan
-      inc argCount
-  if argCount != pSyms.len: return 0
-
-  # All checks passed — emit unconditionally.
-  var rename = initTable[SymId, SymId]()
-  for s in pSyms:
-    rename[s] = c.freshSym(s)
-  seedRenameFromBody(c, pd.body, rename)
+  var site = SpliceSite()
+  if not prepareSplice(c, probe, site): return 0
 
   let info = entry.info
 
@@ -792,38 +1499,474 @@ proc trySpliceVarInit*(c: var InlinerCtx; dest: var TokenBuf; n: var Cursor): in
   dest.addDotToken()                       # no initializer
   dest.addParRi()
 
-  # 2. Emit the inlined body wrapped in a (scope …) with param bindings.
-  var argCursors: seq[Cursor] = @[]
-  var ac = callProbe
-  inc ac                                   # past callee sym
-  for i in 0 ..< pSyms.len:
-    argCursors.add ac
-    skip ac
-  let bnd = bindingsFor(pSyms, argCursors, pd.body, rename)
+  # 2. The body, with every `(ret X)` binding into the temp.
+  emitSplice(c, dest, site, tmpSym, forwardResult = true, info)
 
-  dest.addParLe TagId(ScopeS), info
-
-  for i in 0 ..< pSyms.len:
-    if bnd.subst.hasKey(pSyms[i]): continue
-    dest.addParLe TagId(VarS), info
-    dest.addSymDef rename.getOrQuit(pSyms[i]), info
-    dest.addDotToken()                     # pragmas
-    var t = pTypes[i]
-    dest.takeTree t
-    dest.addSubtree argCursors[i]
-    dest.addParRi()
-
-  # Splice the body; every `(ret X)` becomes `(asgn tmpSym X) (jmp …)`,
-  # with a matching `(lab …)` appended at the tail.
-  var body = pd.body
-  emitBody(c, dest, body, bnd, tmpSym)
-
-  dest.addParRi()                          # close (scope …)
-
-  # Advance past the original var decl.
   n = entry
   skip n
   result = 2                               # `(var …)` + `(scope …)`
+
+proc trySpliceAsgn*(c: var InlinerCtx; dest: var TokenBuf; n: var Cursor): int =
+  ## `(asgn lhs (call f arg…))` with a symbol `lhs` — Final IR's "a call binds
+  ## directly to its destination" form, which is how a non-void call reaches
+  ## this pass whenever its result had a home already (`x = f(y)`; every
+  ## `result = f(…)` of a caller). It was the one call position with no splice
+  ## (measured: 16 `isValid` call frames left in the native `nifbench` build,
+  ## all of this shape). Emits one `(scope …)` and returns 1.
+  ##
+  ## `lhs` is the natural target and takes the result over (`forwardResult`)
+  ## unless an argument mentions it: a substituted argument is evaluated inside
+  ## the body, after the result was first written. The body cannot name a caller
+  ## local otherwise. Like NRVO, reading `lhs` through a raw pointer while the
+  ## body runs sees the partial result: `y = f(addr y)` is the programmer's
+  ## problem. A global `lhs` keeps the copy: the body may read it.
+  if not n.isTagLit or n.stmtKind != AsgnS: return 0
+  let entry = n
+  var probe = n
+  inc probe                                # past `asgn` tag
+  if not probe.isSymbol: return 0
+  let lhsSym = probe.symId
+  inc probe                                # past lhs
+
+  var site = SpliceSite()
+  if not prepareSplice(c, probe, site): return 0
+  var forward = pool.symIsLocal(lhsSym)
+  for a in site.argCursors:
+    if forward and countSymUses(a, lhsSym) > 0: forward = false
+  emitSplice(c, dest, site, lhsSym, forward, entry.info)
+
+  n = entry
+  skip n
+  result = 1
+
+# ---- Condition-splice: inline body straight into an `if`/`elif` guard ----
+
+proc effectiveReturnExpr(body: Cursor; outVal: var Cursor): bool =
+  ## True when `body` computes a single value with no side effect other than
+  ## producing it, in one of the shapes nimony emits for `result = X` /
+  ## `return X` inline bodies:
+  ##
+  ##   (ret X)
+  ##   (var :R T X) (ret R)
+  ##   (var :R T .) (asgn R X) (ret R)
+  ##
+  ## (each optionally wrapped in length-1 `(stmts …)`/`(scope …)`). On success
+  ## `outVal` is the cursor at `X`. The result var `R` must not appear inside
+  ## `X`, so splicing `X` where `R` would have been read is sound.
+  var b = body
+  # Peel single-child stmts/scope wrappers to reach the real statement list.
+  while b.isTagLit and b.stmtKind in {StmtsS, ScopeS}:
+    var cnt = 0
+    var only = default(Cursor)
+    var inner = b
+    inner.into:
+      while inner.hasMore:
+        inc cnt
+        if cnt == 1: only = inner
+        skip inner
+    if cnt == 1:
+      b = only
+    else:
+      break
+  # Gather the (up to 3) statements of the reached list.
+  var stmts: seq[Cursor] = @[]
+  if b.isTagLit and b.stmtKind in {StmtsS, ScopeS}:
+    var it = b
+    it.into:
+      while it.hasMore:
+        stmts.add it
+        skip it
+        if stmts.len > 3: return false     # too many statements → not the idiom
+  else:
+    stmts.add b                            # a bare `(ret …)` etc.
+
+  proc retSym(s: Cursor; outR: var SymId): bool =
+    # `(ret R)` returning a plain symbol → R.
+    if not s.isTagLit or s.stmtKind != RetS: return false
+    let v = s.childCursor
+    if v.isSymbol:
+      outR = v.symId
+      return true
+    return false
+
+  case stmts.len
+  of 1:
+    # (ret X) with X a value expression (not a bare `(ret sym)` handled below).
+    let s = stmts[0]
+    if s.isTagLit and s.stmtKind == RetS:
+      let v = s.childCursor
+      if not v.isDotToken and not v.isSymbol:
+        outVal = v
+        return true
+    return false
+  of 2:
+    # (var :R T X) (ret R)
+    var R = SymId(0)
+    if not retSym(stmts[1], R): return false
+    let vdecl = stmts[0]
+    if not vdecl.isTagLit or vdecl.stmtKind != VarS: return false
+    var p = vdecl
+    inc p                                  # past `var`
+    if not p.isSymbolDef or p.symId != R: return false
+    inc p                                  # past name
+    skip p                                 # past pragmas
+    skip p                                 # past type
+    if p.isDotToken: return false    # no initializer here
+    if countSymUses(p, R) != 0: return false
+    outVal = p
+    return true
+  of 3:
+    # (var :R T .) (asgn R X) (ret R)
+    var R = SymId(0)
+    if not retSym(stmts[2], R): return false
+    let vdecl = stmts[0]
+    if not vdecl.isTagLit or vdecl.stmtKind != VarS: return false
+    var p = vdecl
+    inc p
+    if not p.isSymbolDef or p.symId != R: return false
+    inc p                                  # past name
+    skip p                                 # past pragmas
+    skip p                                 # past type
+    # The result var must have NO initializer — otherwise `X` is not the sole
+    # value of `R` and a side-effecting initializer would be dropped.
+    if not p.isDotToken: return false
+    let asgn = stmts[1]
+    if not asgn.isTagLit or asgn.stmtKind != AsgnS: return false
+    var a = asgn
+    inc a                                  # past `asgn`
+    if not a.isSymbol or a.symId != R: return false
+    skip a                                 # past LHS (R)
+    if countSymUses(a, R) != 0: return false
+    outVal = a
+    return true
+  else:
+    return false
+
+proc trySpliceCond*(c: var InlinerCtx; dest: var TokenBuf; n: var Cursor;
+                    calleeSym: var SymId): int =
+  ## Fuse xelim's condition-temp lowering back into the guard when the call
+  ## inlines to a single expression. Matches the *adjacent* pair
+  ##
+  ##   (var :tmp <pragmas> <type> (call f arg…))
+  ##   (if (elif tmp BODY) …rest…)          — or (elif (not tmp) BODY)
+  ##
+  ## where `f`'s body is exactly `result = X`, every parameter is
+  ## substitutable, and `tmp` is read as that first `elif`'s condition and
+  ## nowhere else in its scope. It then emits
+  ##
+  ##   (if (elif X' BODY) …rest…)           — X' negated if the guard was
+  ##
+  ## dropping the temp entirely, so arkham's `emitCond2` fuses the compare
+  ## into the branch (`cmp; jcc`) instead of materialising a boolean and
+  ## re-testing it. This is a purely local, single-use rewrite: correctness
+  ## follows from `var t = X; if t:` ≡ `if X:` (the first `elif` condition is
+  ## evaluated unconditionally, exactly where the temp was), so no purity or
+  ## dataflow analysis is needed. Returns the number of top-level subtrees
+  ## emitted (1: the rewritten `if`) or 0 (leaving `n`/`dest` untouched).
+  if not n.isTagLit or n.stmtKind != VarS: return 0
+  let entry = n
+
+  # --- parse `(var :tmp <pragmas> <type> (call f arg…))` ---
+  var probe = n
+  inc probe                                # past `var` tag
+  if not probe.isSymbolDef: return 0
+  let tmpSym = probe.symId
+  if not pool.symIsLocal(tmpSym): return 0
+  inc probe                                # past name
+  skip probe                               # past pragmas
+  skip probe                               # past type
+  if not probe.isTagLit or probe.stmtKind != CallS: return 0
+  let valueCursor = probe
+
+  # --- peek the next sibling: must be `(if (elif tmp …) …)` guarding on tmp ---
+  var nextCur = entry
+  skip nextCur                             # past the whole var decl
+  if not nextCur.isTagLit or nextCur.stmtKind != IfS: return 0
+  let firstElif = nextCur.childCursor
+  if not firstElif.isTagLit or firstElif.substructureKind != ElifU: return 0
+  var condCur = firstElif.childCursor
+  # The guard may be the temp itself or its negation — xelim's two-target
+  # condition compiler guards early exits with `(not tmp)`. `not` evaluates
+  # its operand unconditionally, so splicing X under it is as sound as the
+  # bare-symbol case; the negation is re-emitted around the spliced X.
+  var negatedGuard = false
+  if condCur.isTagLit and condCur.exprKind == NotC:
+    let inner = condCur.childCursor
+    if inner.hasMore and inner.isSymbol:
+      condCur = inner
+      negatedGuard = true
+  if not condCur.isSymbol or condCur.symId != tmpSym: return 0
+  # The definition is about to disappear, so `tmp` must be read here and
+  # nowhere else. A local's reads live between its declaration and the end of
+  # its scope, and `n` is bounded to that scope (`trIntra` enters `stmts` /
+  # `scope` with `into`), so "the `if` plus the siblings that follow it" is
+  # the whole live range — no dataflow needed, and no guess from the name
+  # about who minted the local either.
+  if countSymUses(nextCur, tmpSym) != 1: return 0
+  var rest = nextCur
+  skip rest                                # past the whole `if`
+  while rest.hasMore:
+    if countSymUses(rest, tmpSym) != 0: return 0
+    skip rest
+
+  # --- heavier inline eligibility checks (only after the shape matched) ---
+  var site = SpliceSite()
+  if not prepareSplice(c, valueCursor, site): return 0
+
+  # Body must reduce to a single returned expression `result = X`.
+  var retVal = default(Cursor)
+  if not effectiveReturnExpr(site.pd.body, retVal): return 0
+
+  # Bind params; require *every* param substitutable so the whole inline
+  # collapses to `X` with no `(var :p = arg)` prologue to emit before the if.
+  # No `seedRenameFromBody` and no `emitSplice`: a body of this shape has no
+  # locals to rename and nothing to emit but `X` itself.
+  var rename = initTable[SymId, SymId]()
+  for s in site.pSyms:
+    rename[s] = c.freshSym(s)
+  let bnd = bindingsFor(c, site.pSyms, site.argCursors, site.pd.body, rename)
+  for i in 0 ..< site.pSyms.len:
+    if not bnd.subst.hasKey(site.pSyms[i]): return 0
+
+  # --- emit the rewritten `if`, splicing X into the first elif's condition ---
+  var ifOpener = nextCur
+  dest.addParLe(ifOpener.cursorTagId, ifOpener.info)  # copy `(if` opener
+  ifOpener.into:
+    var elifn = ifOpener
+    dest.addParLe(elifn.cursorTagId, elifn.info)   # copy `(elif` opener
+    elifn.into:
+      if negatedGuard:
+        dest.addParLe(TagId(NotC), elifn.info)
+      emitRenamed(dest, retVal, bnd)     # X' replaces the tmp condition
+      if negatedGuard:
+        dest.addParRi()
+      skip elifn                           # drop the original tmp/(not tmp) condition
+      while elifn.hasMore:
+        dest.takeTree elifn                # elif body verbatim
+    dest.addParRi()                        # close (elif …)
+    skip ifOpener                          # past the elif we just consumed
+    while ifOpener.hasMore:
+      dest.takeTree ifOpener               # else / further elifs verbatim
+  dest.addParRi()                          # close (if …)
+
+  # Advance past BOTH the var decl and the if we folded into it.
+  n = entry
+  skip n                                   # past var
+  skip n                                   # past if
+  chargeSplice c, site.calleeSym
+  calleeSym = site.calleeSym
+  result = 1
+
+# ---- Splice-time branch pruning ----
+
+type
+  CondVal = enum
+    condUnknown, condFalse, condTrue
+
+proc negated(v: CondVal): CondVal =
+  case v
+  of condTrue: condFalse
+  of condFalse: condTrue
+  of condUnknown: condUnknown
+
+proc litSame(a, b: Cursor): CondVal =
+  ## Literal identity over the operand kinds `isSubstitutableArg` splices;
+  ## anything else — including mixed literal kinds — stays `condUnknown`.
+  if a.kind == IntLit and b.kind == IntLit:
+    (if a.intVal == b.intVal: condTrue else: condFalse)
+  elif a.kind == UIntLit and b.kind == UIntLit:
+    (if a.uintVal == b.uintVal: condTrue else: condFalse)
+  elif a.kind == CharLit and b.kind == CharLit:
+    (if a.charLit == b.charLit: condTrue else: condFalse)
+  elif a.isTagLit and b.isTagLit and
+       a.exprKind in {NilC, TrueC, FalseC} and
+       b.exprKind in {NilC, TrueC, FalseC}:
+    (if a.exprKind == b.exprKind: condTrue else: condFalse)
+  else:
+    condUnknown
+
+proc condVal(n: Cursor): CondVal =
+  ## What a guard evaluates to once argument substitution made it literal:
+  ## `(neq (nil) (nil))` from a spliced `if c != nil` with `c := nil`, or the
+  ## `(not (eq …))` a nested `!=` forwarder splice leaves behind. `and`/`or`
+  ## fold only when BOTH operands decide, so no operand whose evaluation the
+  ## fold would discard is ever left unjudged.
+  result = condUnknown
+  if not n.isTagLit: return
+  case n.exprKind
+  of TrueC: result = condTrue
+  of FalseC: result = condFalse
+  of NotC:
+    let arg = n.childCursor
+    if arg.hasMore:
+      result = negated(condVal(arg))
+  of EqC, NeqC:
+    let a = n.childCursor
+    if a.hasMore:
+      var b = a
+      skip b
+      if b.hasMore:
+        let same = litSame(a, b)
+        result = (if n.exprKind == EqC: same else: negated(same))
+  of AndC, OrC:
+    let a = n.childCursor
+    if a.hasMore:
+      var b = a
+      skip b
+      if b.hasMore:
+        let l = condVal(a)
+        let r = condVal(b)
+        if l != condUnknown and r != condUnknown:
+          if n.exprKind == AndC:
+            result = (if l == condTrue and r == condTrue: condTrue else: condFalse)
+          else:
+            result = (if l == condTrue or r == condTrue: condTrue else: condFalse)
+  else: discard
+
+proc hasAnyDef(n: Cursor): bool =
+  ## Any SymbolDef in the subtree: a `(lab :L)` someone may jump to, or a
+  ## `(var :v …)` declaration later reachable code may reference. Either
+  ## makes a dead statement unsafe to drop.
+  case n.kind
+  of SymbolDef:
+    result = true
+  of TagLit:
+    result = false
+    var it = n.childCursor
+    while it.hasMore:
+      if hasAnyDef(it): return true
+      skip it
+  else:
+    result = false
+
+proc emitPruned(dest: var TokenBuf; n: var Cursor) =
+  ## Copy one subtree, deleting every `(elif …)` arm whose guard `condVal`
+  ## decided. This is a CORRECTNESS duty, not an optimization: the false arm
+  ## of a spliced body may no longer type-check at all — `if c != nil: …c.f…`
+  ## inlined with `c := nil` keeps a `(deref (nil))` there — and a typed
+  ## backend (arkham) must never see it, so the splice that manufactured the
+  ## constant guard deletes the arm too. An `(elif (true) …)` arm demotes to
+  ## the `if`'s final `(else …)` (the arms after it can never run); an `if`
+  ## with no live arm left contributes its `else` body, or nothing.
+  ##
+  ## A decided arm may be deleted with its labels: a jmp into a sibling
+  ## branch is not part of the final IR (try/except lowers to a FLAT goto
+  ## sequence), so any `(lab …)` inside the arm is jumped to only from
+  ## inside it — this inliner's own returnLabel pattern — and the arm takes
+  ## the label and its jumps with it.
+  case n.kind
+  of TagLit:
+    if n.stmtKind == IfS:
+      # Peek pass over the arms: what survives? The cursors index into the
+      # buffer `n` reads, which outlives the re-emit below.
+      var kept: seq[Cursor] = @[]         # elifs with undecided guards
+      var taken = default(Cursor)         # first `(true)` elif, or the else
+      var takenIsElif = false
+      var haveTaken = false
+      var dropped = false                 # anything decided at all?
+      var probe = n
+      probe.into:
+        while probe.hasMore:
+          let sk = probe.substructureKind
+          if haveTaken:
+            dropped = true                # dead branch after a taken one
+          elif sk == ElifU:
+            case condVal(probe.childCursor)
+            of condTrue:
+              taken = probe; takenIsElif = true; haveTaken = true; dropped = true
+            of condFalse:
+              dropped = true
+            of condUnknown:
+              kept.add probe
+          elif sk == ElseU:
+            taken = probe; takenIsElif = false; haveTaken = true
+          else:
+            kept.add probe                # unexpected shape: keep verbatim
+          skip probe
+      if not dropped:
+        # Nothing decided at this level: keep the `if`, but still recurse
+        # into the branch bodies (they may contain prunable ifs).
+        dest.addParLe(n.cursorTagId, n.info)
+        n.into:
+          while n.hasMore:
+            emitPruned(dest, n)
+        dest.addParRi()
+        return
+      if kept.len == 0:
+        # No undecided elifs before the taken branch: the whole `if`
+        # collapses to the taken branch's body (or to nothing).
+        if haveTaken:
+          var b = taken
+          b.into:
+            if takenIsElif and b.hasMore: skip b    # past the guard
+            while b.hasMore:
+              emitPruned(dest, b)
+        skip n
+        return
+      # Some undecided elifs survive: rebuild the `if` from them, a taken
+      # `(true)` elif demoted to the terminal `(else …)`.
+      dest.addParLe(n.cursorTagId, n.info)
+      for arm in kept:
+        var a = arm
+        dest.addParLe(a.cursorTagId, a.info)
+        a.into:
+          while a.hasMore:
+            emitPruned(dest, a)
+        dest.addParRi()
+      if haveTaken:
+        let btag = (if takenIsElif: TagId(ElseU) else: taken.cursorTagId)
+        dest.addParLe(btag, taken.info)
+        var b = taken
+        b.into:
+          if takenIsElif and b.hasMore: skip b      # past the guard
+          while b.hasMore:
+            emitPruned(dest, b)
+        dest.addParRi()
+      dest.addParRi()
+      skip n
+    elif n.stmtKind in {StmtsS, ScopeS}:
+      # Drop UNREACHABLE statements: after an unconditional `(jmp …)`/`(ret …)`
+      # nothing executes until the next `(lab …)`, so def-free statements in
+      # between are dead. The value-splice epilogue produces exactly this —
+      # a callee whose every path returns via `(asgn dest X) (jmp RL)` leaves
+      # the trailing `dest = result` self-copy dead with `result` never
+      # written — and a typed backend verifier rightly rejects the dead read.
+      # A statement that defines anything is kept and ends the dead region
+      # (something can jump into it and fall out of it).
+      dest.addParLe(n.cursorTagId, n.info)
+      var unreachable = false
+      n.into:
+        while n.hasMore:
+          let sk = n.stmtKind
+          if sk == LabS:
+            unreachable = false
+            dest.takeTree n
+          elif unreachable and not hasAnyDef(n):
+            skip n                          # dead: drop
+          else:
+            if unreachable: unreachable = false
+            emitPruned(dest, n)
+            if sk in {JmpS, RetS}: unreachable = true
+      dest.addParRi()
+    elif n.stmtKind == NoStmt and n.substructureKind == NoSub:
+      # An expression subtree cannot contain statements, hence no `if` arms.
+      dest.takeTree n
+    else:
+      dest.addParLe(n.cursorTagId, n.info)
+      n.into:
+        while n.hasMore:
+          emitPruned(dest, n)
+      dest.addParRi()
+  else:
+    dest.takeTree n
+
+proc prunedInto(dest: var TokenBuf; expanded: var TokenBuf) =
+  ## Emit every top-level subtree of `expanded` into `dest` with the decided
+  ## `if` arms deleted (`emitPruned`).
+  var pruner = beginRead(expanded)
+  while pruner.hasMore:
+    emitPruned(dest, pruner)
+  endRead(pruner)
 
 # ---- Same-module inliner pass (called from hexer.nim) ----
 
@@ -833,12 +1976,11 @@ proc trIntra*(c: var InlinerCtx; dest: var TokenBuf; n: var Cursor) =
   ##
   ## Cross-module behaviour: callees in another module are picked up
   ## automatically when the context's `xnifDir` is non-empty —
-  ## `lookupInlineInfo` / `lookupBody` then lazy-load the foreign
-  ## `.dce.nif` / `.x.nif`. With `xnifDir == ""` foreign callees are
-  ## naturally skipped (their `InlineInfo` defaults to threshold 100, so
-  ## `shouldInlineCall` declines).
+  ## `lookupInlineInfo` / `lookupBody` then lazy-load the foreign `.c.nif`.
+  ## With `xnifDir == ""` foreign callees are naturally skipped (their
+  ## `InlineInfo` defaults to threshold 100, so `shouldInlineCall` declines).
   case n.kind
-  of ParLe:
+  of TagLit:
     let sk = n.stmtKind
     case sk
     of StmtsS, ScopeS:
@@ -847,139 +1989,187 @@ proc trIntra*(c: var InlinerCtx; dest: var TokenBuf; n: var Cursor) =
       # scope has no `ParRi` token, so a raw `while n.hasMore` over an
       # unbounded `rem` would walk into siblings. Emit a fresh closer with
       # `addParRi` (the source `)` may be elided).
-      dest.add n
+      dest.addParLe(n.cursorTagId, n.info)
       into n:
         while n.hasMore:
-          if n.kind == ParLe and n.stmtKind == CallS:
+          if n.isTagLit and n.stmtKind == CallS:
             var probe = n
             inc probe
             let calleeSym =
-              if probe.kind == Symbol: probe.symId else: SymId(0)
+              if probe.isSymbol: probe.symId else: SymId(0)
             var spliced = createTokenBuf(32)
             let nEmitted = trySplice(c, spliced, n)
             if nEmitted > 0:
               if calleeSym != SymId(0):
                 c.inProgress.incl calleeSym
+              # Nested splices first, into a scratch buffer; THEN prune the
+              # branches the substituted arguments decided — only after the
+              # nested walk are inlined guards (`!=` forwarders) reduced to
+              # the literal comparisons `condVal` can judge.
+              var expanded = createTokenBuf(spliced.len)
               var inner = beginRead(spliced)
               for _ in 0 ..< nEmitted:
-                trIntra(c, dest, inner)
+                trIntra(c, expanded, inner)
               endRead(inner)
               if calleeSym != SymId(0):
                 c.inProgress.excl calleeSym
+              prunedInto(dest, expanded)
               continue
+          if n.isTagLit and n.stmtKind == VarS:
+            # `(var :tmp T (call …))` immediately guarding an `if` — fold the
+            # inlined condition straight into the guard so no boolean temp is
+            # materialised (see `trySpliceCond`). Peeks the following sibling.
+            var condCallee = SymId(0)
+            var spliced = createTokenBuf(32)
+            let nEmitted = trySpliceCond(c, spliced, n, condCallee)
+            if nEmitted > 0:
+              c.inProgress.incl condCallee
+              var expanded = createTokenBuf(spliced.len)
+              var inner = beginRead(spliced)
+              for _ in 0 ..< nEmitted:
+                trIntra(c, expanded, inner)
+              endRead(inner)
+              c.inProgress.excl condCallee
+              prunedInto(dest, expanded)
+              continue
+          if n.isTagLit and n.stmtKind == AsgnS:
+            # `(asgn lhs (call …))` — the destination-bound call form.
+            var probe = n
+            inc probe
+            var asgnCallee = SymId(0)
+            if probe.isSymbol:
+              inc probe                    # past lhs
+              if probe.isTagLit and probe.stmtKind == CallS:
+                inc probe
+                if probe.isSymbol:
+                  asgnCallee = probe.symId
+            if asgnCallee != SymId(0):
+              var spliced = createTokenBuf(32)
+              let nEmitted = trySpliceAsgn(c, spliced, n)
+              if nEmitted > 0:
+                c.inProgress.incl asgnCallee
+                var expanded = createTokenBuf(spliced.len)
+                var inner = beginRead(spliced)
+                for _ in 0 ..< nEmitted:
+                  trIntra(c, expanded, inner)
+                endRead(inner)
+                c.inProgress.excl asgnCallee
+                prunedInto(dest, expanded)
+                continue
           trIntra(c, dest, n)
       dest.addParRi()
     of VarS, GvarS, TvarS, ConstS, ProcS:
       # `(var :tmp <pragmas> <type> (call …))` is the bound form `xelim`
       # and the new nifcgen complex-init path emit; route it through the
       # var-init splice. Other locals copy verbatim.
+      if sk == ProcS:
+        # Entering a proc decl: give it its own growth budget, sized from its
+        # body, and restore the enclosing one afterwards (procs are top-level
+        # in NIFC, but the restore keeps this correct either way).
+        var probe = n
+        let pd = takeProcDecl(probe)
+        let bodySize = (if pd.body.isTagLit: tokenCount(pd.body) else: 0)
+        let savedGrowth = c.growthLeft
+        c.growthLeft = growthBudget(bodySize)
+        dest.addParLe(n.cursorTagId, n.info)
+        into n:
+          while n.hasMore:
+            trIntra(c, dest, n)
+        dest.addParRi()
+        c.growthLeft = savedGrowth
+        return
       if sk == VarS:
         var probe = n
         inc probe
         var calleeSym = SymId(0)
-        if probe.kind == SymbolDef:
+        if probe.isSymbolDef:
           inc probe          # name
           skip probe         # pragmas
           skip probe         # type
-          if probe.kind == ParLe and probe.stmtKind == CallS:
+          if probe.isTagLit and probe.stmtKind == CallS:
             inc probe
-            if probe.kind == Symbol:
+            if probe.isSymbol:
               calleeSym = probe.symId
         if calleeSym != SymId(0):
           var spliced = createTokenBuf(32)
           let nEmitted = trySpliceVarInit(c, spliced, n)
           if nEmitted > 0:
             c.inProgress.incl calleeSym
+            var expanded = createTokenBuf(spliced.len)
             var inner = beginRead(spliced)
             for _ in 0 ..< nEmitted:
-              trIntra(c, dest, inner)
+              trIntra(c, expanded, inner)
             endRead(inner)
             c.inProgress.excl calleeSym
+            prunedInto(dest, expanded)
             return
-      dest.add n
+      dest.addParLe(n.cursorTagId, n.info)
       into n:
         while n.hasMore:
           trIntra(c, dest, n)
       dest.addParRi()
     else:
-      dest.add n
+      dest.addParLe(n.cursorTagId, n.info)
       into n:
         while n.hasMore:
           trIntra(c, dest, n)
       dest.addParRi()
-  of ParRi:
-    raiseAssert "ParRi should not be encountered here"
   else:
-    dest.takeToken n
-
-proc emitPragmasWithInlineInfo(dest: var TokenBuf; pragmas: Cursor; info: InlineInfo) =
-  var p = pragmas
-  if p.kind != ParLe:
-    dest.addSubtree p
-    return
-
-  dest.add p
-  inc p
-  while p.kind != ParRi:
-    if p.kind == ParLe and p.pragmaKind == InlineP:
-      dest.add p
-      inc p
-      dest.addIntLit info.threshold, p.info
-      for w in info.weights:
-        dest.addIntLit w, p.info
-      while p.kind != ParRi:
-        skip p
-      dest.takeToken p
-    else:
-      dest.takeTree p
-  dest.takeToken p
-
-proc annotateInlinePragmas(dest: var TokenBuf; n: var Cursor;
-                           infos: Table[SymId, InlineInfo]) =
-  case n.kind
-  of ParLe:
-    if n.stmtKind == ProcS:
-      let tag = n.tagId
-      let info = n.info
-      let d = takeProcDecl(n)
-      dest.addParLe(tag, info)
-      dest.addSubtree d.name
-      let sym = d.name.symId
-      dest.addSubtree d.params
-      dest.addSubtree d.returnType
-      if infos.hasKey(sym):
-        emitPragmasWithInlineInfo(dest, d.pragmas, infos.getOrQuit(sym))
-      else:
-        dest.addSubtree d.pragmas
-      dest.addSubtree d.body
-      dest.addParRi()
-    else:
-      dest.takeToken n
-      while n.hasMore:
-        annotateInlinePragmas(dest, n, infos)
-      dest.takeToken n
-  of ParRi:
-    raiseAssert "ParRi should not be encountered here"
-  else:
-    dest.takeToken n
-
-proc annotateInlinePragmas(buf: var TokenBuf; infos: Table[SymId, InlineInfo]) =
-  if infos.len == 0: return
-  var n = beginRead(buf)
-  var dest = createTokenBuf(buf.len)
-  annotateInlinePragmas(dest, n, infos)
-  endRead(buf)
-  buf = ensureMove(dest)
+    dest.takeTree n
 
 proc intraModuleInline*(moduleSuffix: string; buf: var TokenBuf) =
-  ## Same-module inliner pass run as the last step of hexer's `expand`,
-  ## so the `.x.nif` we publish has each `.inline` proc body already
-  ## cascaded against its same-module callees. Cross-module splicing
-  ## (dce2) then needs at most one level of work per call site, since
-  ## the foreign body it pulls is already flat. This eliminates the
-  ## per-importer redundancy where the same cascade was re-walked once
-  ## per dceEmit process.
-  var ma = analyzeModule(buf)
-  var graphs = initTable[string, ModuleAnalysis]()
-  graphs[moduleSuffix] = ensureMove ma
-  annotateInlinePragmas(buf, graphs.getOrQuit(moduleSuffix).inlineInfo)
+  ## Same-module inliner pass run as the last step of hexer's `expand`, so
+  ## the `.x.nif` we publish has each tiny proc body already cascaded
+  ## against its same-module callees. An importer then pulls a flat body, and
+  ## the cascade is walked once per module here instead of once per importer.
+  ## A body that grows past `InlineTinyBound` by this flattening is simply
+  ## re-measured — and demoted to the scored tier — by whoever parses the
+  ## published file (`indexProcBodies`), so the flattening cannot compound:
+  ## what importers splice is what they measured.
+  ##
+  ## Measured on nimsem (126 modules), the flattening redundancy is worth
+  ## little: the chains that matter run *across* modules (`nifcore` →
+  ## `nifpools`), which no same-module flattening can pre-expand, so the
+  ## inter-module pass still needs its depth and its cost is unchanged. Keep
+  ## the numbers in mind before spending anything more here — full rebuild
+  ## 18.66s → 18.87s, nimsem-on-system.nim 80ms → 81ms, binary −4KB.
+  ##
+  ## `xnifDir` stays empty here on purpose. This module's own `.x.nif` is
+  ## pre-DCE, so its generic instances and hexer-minted types still carry the
+  ## own-module shorthand (`seq.0.Ixdx2fh1.`) that dce2 later resolves to one
+  ## canonical owner; a body copied *within* the module keeps meaning the same
+  ## thing, while one copied *across* modules would not. Cross-module splicing
+  ## therefore waits for the `.c.nif` (`shoggoth`'s inter-module pass).
+  let ma = analyzeModule(buf)
+  if ma.inlineInfo.len == 0: return
+
+  # Only the `.inline` bodies are flattened, not every call site in the module:
+  # a call site here is one the importer's own pass would splice anyway, and
+  # doing it twice only inflates the `.x.nif` everything downstream reads.
+  var ctx = initInlinerCtx(moduleSuffix, addr buf, maxDepth = 4,
+                           counterPrefix = "h")
+  collectProcBodies(ctx)
+  var dest = createTokenBuf(buf.len + buf.len div 16)
+  var n = beginRead(buf)
+  if n.stmtKind != StmtsS: return
+  dest.addParLe(n.cursorTagId, n.info)
+  n.into:
+    while n.hasMore:
+      if n.isTagLit and n.stmtKind == ProcS and
+         n.childCursor.isSymbolDef and ma.inlineInfo.hasKey(n.childCursor.symId):
+        let tag = n.cursorTagId
+        let info = n.info
+        let d = takeProcDecl(n)
+        dest.addParLe(tag, info)
+        dest.addSubtree d.name
+        dest.addSubtree d.params
+        dest.addSubtree d.returnType
+        dest.addSubtree d.pragmas
+        var body = d.body
+        ctx.growthLeft = growthBudget(tokenCount(body))
+        trIntra(ctx, dest, body)
+        dest.addParRi()
+      else:
+        dest.takeTree n
+  dest.addParRi()
+  buf = ensureMove(dest)

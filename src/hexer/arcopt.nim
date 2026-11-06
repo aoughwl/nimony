@@ -19,6 +19,11 @@ include ".." / lib / nifprelude
 include ".." / lib / compat2
 import ".." / nimony / [nimony_model, programs]
 from ".." / lengc / leng_model import takeProcDecl
+# `lab`/`jmp` are Leng-only tags, so `nimony_model.stmtKind` reports `NoStmt`
+# for them. Compare raw tag ids instead of routing them through a `StmtKind`.
+# Qualified-only: `LengStmt` shares field names such as `CallS` with
+# `NimonyStmt`, so an unqualified import would be ambiguous.
+from ".." / models / leng_tags import nil
 import ".." / lib / symparser
 import passes
 
@@ -33,7 +38,7 @@ type
   BasicBlock = object
     wasMovedLocs: seq[WasMovedLoc]
     kind: BasicBlockKind
-    hasReturn, hasBreak: bool
+    hasReturn: bool
     label: SymId
     parent: ptr BasicBlock
     symToDel: seq[Cursor]
@@ -42,32 +47,39 @@ type
     somethingTodo: bool
     inFinally: int
     toDelete: IntSet
+    jmpTargets: IntSet
     source: ptr TokenBuf
 
 const
   NoLabel = SymId(0)
 
 proc getAttachedOp(symId: SymId; attachedOp: var AttachedOp): bool =
-  var name = pool.syms[symId]
-  extractBasename(name)
+  var name = pool.symBasename(symId)
+  # A specialized hook is minted by `lifter.generateHookName` as
+  # `=<hookName>_<typeKey>`, so cut the type key off. `hookName` also spells
+  # the op in lower case, hence the second spelling of `wasmoved`/`sinkh`
+  # below. Without both, every specialized hook was invisible here.
+  var i = 0
+  while i < name.len and name[i] != '_': inc i
+  if i < name.len: name.setLen i
 
   attachedOp = case name
     of "=destroy": attachedDestroy
-    of "=wasMoved": attachedWasMoved
+    of "=wasMoved", "=wasmoved": attachedWasMoved
     of "=trace": attachedTrace
     of "=copy": attachedCopy
-    of "=sink": attachedSink
+    of "=sink", "=sinkh": attachedSink
     of "=dup": attachedDup
     else: return false
   result = true
 
 proc peelComparableArg(n: Cursor): Cursor =
   result = n
-  while result.kind == ParLe:
+  while result.isTagLit:
     case result.exprKind
     of ExprX:
       var it = result
-      inc it
+      it = sub(it)  # throwaway copy; bounds the walk under vpr
       while it.hasMore:
         if isLastSon(it):
           result = it
@@ -91,26 +103,10 @@ proc nestedBlock(parent: var BasicBlock; kind = BbOther): BasicBlock =
     wasMovedLocs: @[],
     kind: kind,
     hasReturn: false,
-    hasBreak: false,
     label: NoLabel,
     parent: addr(parent),
     symToDel: @[]
   )
-
-proc breakStmt(b: var BasicBlock; n: Cursor) =
-  var it = addr(b)
-  while it != nil:
-    it.wasMovedLocs.setLen 0
-    it.hasBreak = true
-
-    if n.kind == Symbol:
-      if it.label == n.symId:
-        break
-    else:
-      if it.kind in {BbWhileStmt, BbBlockStmt}:
-        break
-
-    it = it.parent
 
 proc returnStmt(b: var BasicBlock) =
   b.hasReturn = true
@@ -118,6 +114,37 @@ proc returnStmt(b: var BasicBlock) =
   while it != nil:
     it.wasMovedLocs.setLen 0
     it = it.parent
+
+proc joinStmt(b: var BasicBlock) =
+  ## A label that some `jmp` targets is a join: the other predecessors need
+  ## not have run the pending `=wasMoved` calls, so nothing survives it.
+  var it = addr(b)
+  while it != nil:
+    it.wasMovedLocs.setLen 0
+    it = it.parent
+
+proc labelOf(n: Cursor): SymId =
+  ## The label of a `(lab :L)` or the target of a `(jmp L)`.
+  result = NoLabel
+  if n.isTagLit:
+    var it = n
+    it = sub(it)  # throwaway copy; bounds the peek under vpr
+    if it.kind in {Symbol, SymbolDef}:
+      result = it.symId
+
+proc collectJmpTargets(targets: var IntSet; n: var Cursor) =
+  case n.kind
+  of TagLit:
+    if n.cursorTagId == TagId(leng_tags.JmpS):
+      let lab = labelOf(n)
+      if lab != NoLabel: targets.incl int(lab)
+      skip n
+    else:
+      n.into:
+        while n.hasMore and n.kind != EofToken:
+          collectJmpTargets(targets, n)
+  else:
+    inc n
 
 proc invalidateWasMoved(c: var BasicBlock; x: Cursor) =
   var i = 0
@@ -157,9 +184,9 @@ proc intersect(summary: var seq[WasMovedLoc]; branch: seq[WasMovedLoc]) =
 
 proc isExhaustive(n: Cursor; exhaustiveKind: SubstructureKind): bool =
   var it = n
-  if it.kind != ParLe:
+  if not it.isTagLit:
     return false
-  inc it
+  it = sub(it)  # throwaway copy; bounds the walk under vpr
   var lastKind = NoSub
   while it.hasMore:
     lastKind = it.substructureKind
@@ -167,18 +194,18 @@ proc isExhaustive(n: Cursor; exhaustiveKind: SubstructureKind): bool =
   result = lastKind == exhaustiveKind
 
 proc getCallInfo(n: Cursor; attachedOp: var AttachedOp; arg: var Cursor): bool =
-  if n.kind != ParLe:
+  if not n.isTagLit:
     return false
   if n.exprKind notin CallKinds and n.stmtKind notin {CallS, CmdS, HcallS, CallstrlitS, InfixS, PrefixS}:
     return false
   var it = n
-  inc it
+  it = sub(it)  # throwaway copy; bounds the peek under vpr
   if it.kind != Symbol:
     return false
   if not getAttachedOp(it.symId, attachedOp):
     return false
   inc it
-  if it.kind == ParRi:
+  if not it.hasMore:
     return false
   arg = it
   result = true
@@ -197,15 +224,13 @@ proc wasMovedDestroyPair(c: var Con; b: var BasicBlock; d, darg: Cursor) =
 proc analyse(c: var Con; b: var BasicBlock; n: var Cursor)
 
 proc analyseChildren(c: var Con; b: var BasicBlock; n: var Cursor) =
-  assert n.kind == ParLe
-  inc n
-  while n.kind != ParRi and n.kind != EofToken:
-    let before = cursorToPosition(c.source[], n)
-    analyse(c, b, n)
-    if n.kind != ParRi and n.kind != EofToken and cursorToPosition(c.source[], n) == before:
-      skip n
-  if n.kind == ParRi:
-    inc n
+  assert n.isTagLit
+  n.into:
+    while n.hasMore and n.kind != EofToken:
+      let before = cursorToPosition(c.source[], n)
+      analyse(c, b, n)
+      if n.hasMore and n.kind != EofToken and cursorToPosition(c.source[], n) == before:
+        skip n
 
 proc analyse(c: var Con; b: var BasicBlock; n: var Cursor) =
   case n.kind
@@ -213,7 +238,7 @@ proc analyse(c: var Con; b: var BasicBlock; n: var Cursor) =
     b.invalidateWasMoved n
     b.symToDel.add n
     inc n
-  of ParLe:
+  of TagLit:
     if n.stmtKind in {ProcS, FuncS, ConverterS, MethodS, IteratorS, MacroS, TemplateS} or
         isDeclarative(n):
       skip n
@@ -229,15 +254,39 @@ proc analyse(c: var Con; b: var BasicBlock; n: var Cursor) =
           callPos: cursorToPosition(c.source[], n),
           target: peelComparableArg(callArg)
         )
+        # Do not descend into the children of `=wasMoved`/`=destroy`. Their
+        # argument *is* the location being tracked, and the `Symbol` case
+        # counts every occurrence as a use and calls `invalidateWasMoved` —
+        # so descending deleted the entry that was just added, one line above,
+        # and no pair could ever be found.
+        skip n
+        return
       of attachedDestroy:
-        if c.inFinally > 0 and (b.hasReturn or b.hasBreak):
+        if c.inFinally > 0 and b.hasReturn:
           discard
         else:
           c.wasMovedDestroyPair b, n, callArg
+        skip n
+        return
       of attachedSink:
         reverse = true
       of attachedDup, attachedCopy, attachedTrace:
         discard
+
+    # `jmp`/`lab` carry the control flow that `try`/`return`/`break` had before
+    # Leng lowering. They are Leng-only tags, so the `stmtKind` dispatch below
+    # sees `NoStmt` and would walk them as plain statements — which lets a
+    # `=wasMoved` pair with a `=destroy` that a jump can reach without it.
+    let tag = n.cursorTagId
+    if tag == TagId(leng_tags.JmpS):
+      returnStmt(b)
+      skip n
+      return
+    if tag == TagId(leng_tags.LabS):
+      if c.jmpTargets.contains(int(labelOf(n))):
+        joinStmt(b)
+      skip n
+      return
 
     case n.stmtKind
     of AsgnS:
@@ -309,9 +358,7 @@ proc analyse(c: var Con; b: var BasicBlock; n: var Cursor) =
           analyse(c, blockBody, n)
           mergeBasicBlockInfo(b, blockBody)
     of BreakS:
-      let label = n.firstSon
-      breakStmt(b, label)
-      skip n
+      raiseAssert "BUG: `break` in Leng output: lengcgen never emits one"
     of RetS, RaiseS:
       analyseChildren(c, b, n)
       returnStmt(b)
@@ -331,39 +378,37 @@ proc analyse(c: var Con; b: var BasicBlock; n: var Cursor) =
           analyse(c, b, son)
       else:
         analyseChildren(c, b, n)
-  of DotToken, UnknownToken, EofToken, Ident, StringLit, CharLit, IntLit, UIntLit, FloatLit, SymbolDef, ParRi:
+  else: # atoms and suffix kinds; classic: also a physical ParRi
     inc n
 
 proc opt(c: Con; n: var Cursor; dest: var TokenBuf) =
   case n.kind
-  of ParLe:
+  of TagLit:
     let pos = cursorToPosition(c.source[], n)
     if c.toDelete.contains(pos):
-      dest.add dotToken(n.info)
+      dest.addDotToken(n.info)
       skip n
     else:
-      dest.add n
-      inc n
-      while n.hasMore:
-        opt(c, n, dest)
-      dest.takeParRi n
-  of ParRi:
-    raiseAssert "unexpected ')' in tree rewrite"
-  of Symbol, SymbolDef, DotToken, UnknownToken, EofToken, Ident, StringLit, CharLit, IntLit, UIntLit, FloatLit:
-    dest.takeToken n
+      takeInto dest, n:
+        while n.hasMore:
+          opt(c, n, dest)
+  else:
+    dest.takeTree n
 
 proc optimizeArc*(pass: var Pass) =
   var c = Con(
     somethingTodo: false,
     inFinally: 0,
     toDelete: initIntSet(),
+    jmpTargets: initIntSet(),
     source: addr pass.buf
   )
+  var targetScan = pass.n
+  collectJmpTargets(c.jmpTargets, targetScan)
   var b = BasicBlock(
     wasMovedLocs: @[],
     kind: BbOther,
     hasReturn: false,
-    hasBreak: false,
     label: NoLabel,
     parent: nil,
     symToDel: @[]
@@ -385,8 +430,8 @@ proc runArcoptBody(buf: var TokenBuf; moduleSuffix = ""; bits = 0) =
 
 proc runArcoptTree(dest: var TokenBuf; n: var Cursor; moduleSuffix: string; bits: int) =
   case n.kind
-  of ParLe:
-    let tag = n.tagId
+  of TagLit:
+    let tag = n.cursorTagId
     let info = n.info
     if n.stmtKind == ProcS:
       let d = takeProcDecl(n)
@@ -395,7 +440,9 @@ proc runArcoptTree(dest: var TokenBuf; n: var Cursor; moduleSuffix: string; bits
       dest.addSubtree d.params
       dest.addSubtree d.returnType
       dest.addSubtree d.pragmas
-      if d.body.kind == ParLe:
+      if d.body.isTagLit and not hasPragma(d.pragmas, AssemblerP):
+        # (an `{.assembler.}` body is machine code: nothing to optimize, and
+        # its `while`/`break` are the back end's)
         var body = createTokenBuf(64)
         var b = d.body
         body.addSubtree b
@@ -406,19 +453,17 @@ proc runArcoptTree(dest: var TokenBuf; n: var Cursor; moduleSuffix: string; bits
         dest.addSubtree d.body
       dest.addParRi()
     else:
-      dest.takeToken n
-      while n.hasMore:
-        runArcoptTree(dest, n, moduleSuffix, bits)
-      dest.takeToken n
-  of ParRi:
-    raiseAssert "ParRi should not be encountered here"
+      dest.addParLe(n.cursorTagId, n.info)
+      n.into:
+        while n.hasMore:
+          runArcoptTree(dest, n, moduleSuffix, bits)
+      dest.addParRi()
   else:
-    dest.takeToken n
+    dest.takeTree n
 
 proc runArcopt*(buf: var TokenBuf; moduleSuffix = ""; bits = 0) =
   ## Direct entry point for already generated NIFC buffers.
   var n = beginRead(buf)
   var dest = createTokenBuf(buf.len)
   runArcoptTree(dest, n, moduleSuffix, bits)
-  endRead(buf)
   buf = ensureMove(dest)

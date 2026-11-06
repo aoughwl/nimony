@@ -80,3 +80,6 @@ proc main =
 # With rawthreads spelling the DWORD-typed arguments `culong`, the real thing
 # runs here and produces that output for the right reason.
 main()
+
+{.feature: "assumeSync".}  # test program: globals shared freely
+

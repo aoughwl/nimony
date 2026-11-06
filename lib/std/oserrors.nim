@@ -5,10 +5,14 @@ import syncio
 type
   OSErrorCode* = distinct int32 ## Specifies an OS Error Code.
 
+func `==`*(err1, err2: OSErrorCode): bool {.borrow.}
+
 when defined(windows):
   import windows/winlean
-else:
-  var errno {.importc: "errno", header: "<errno.h>".}: cint
+elif defined(posix):
+  from posix/posix import rawSyscalls
+  when not rawSyscalls:
+    from posix/posix import errno
 
 
 when defined(windows):
@@ -21,11 +25,23 @@ func raiseOSError*(errorCode: OSErrorCode, additionalInfo = "") {.noinline, rais
   ##
   ## Read the description of the `newOSError proc`_ to learn
   ## how the exception object is created.
+  ##
+  ## A zero `errorCode` maps to `Success`, and raising that is a no-op — this
+  ## proc would *return*, in breach of `.noreturn`, into a caller that has
+  ## already established the operation failed. It then carries on with whatever
+  ## the failed call left behind. That is not hypothetical: `errno` reads zero
+  ## whenever the error slot was never written for this call (a raw-syscall
+  ## wrapper, or libc's errno read through the wrong accessor), and the result
+  ## was a `-1` file descriptor travelling into `mmap` and a `MAP_FAILED` ring
+  ## being written through. The caller knows something went wrong; report that
+  ## rather than nothing.
   {.cast(noSideEffect).}:
     when defined(windows):
-      raise windowsToErrorCode(errorCode.int32)
+      var e = windowsToErrorCode(errorCode.int32)
     else:
-      raise posixToErrorCode(errorCode.int32)
+      var e = posixToErrorCode(errorCode.int32)
+    if e == Success: e = Failure
+    raise e
 
 #{.push stackTrace:off.}
 proc osLastError*(): OSErrorCode {.sideEffect.} =
@@ -46,6 +62,15 @@ proc osLastError*(): OSErrorCode {.sideEffect.} =
   ## * `raiseOSError proc`_
   when defined(windows):
     result = cast[OSErrorCode](getLastError())
+  elif defined(posix):
+    when rawSyscalls:
+      # A freestanding build has no errno: a raw call returns its error as
+      # -errno (`pcall`), and that is where to take the code from.
+      result = OSErrorCode(0)
+    else:
+      result = OSErrorCode(errno())
   else:
-    result = OSErrorCode(errno)
+    # Freestanding targets (wasm32 standalone): no OS, no errno. Zero,
+    # honestly, per the wasm bring-up convention.
+    result = OSErrorCode(0)
 #{.pop.}

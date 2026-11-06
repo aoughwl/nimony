@@ -8,7 +8,7 @@
 
 ## A **journaled** exit-summary tracker for the Final-IR nil/init analysis.
 ##
-## It supersedes the generic value-`Tracker` (`njvl/tracker.nim`) for this pass:
+## It supersedes the generic value-`Tracker` (`finalir/tracker.nim`) for this pass:
 ## the analysis state — the definite-assignment **init-set** and the `inferle`
 ## **facts** — is mutated *in place* under an undo journal, so a branch costs
 ## O(writes-since-checkpoint), never a whole-state copy. The old tracker copied
@@ -18,9 +18,10 @@
 ## and a real two-armed merge copies only the small per-branch *delta* of the
 ## init-set (plus the — normally tiny — fact set).
 ##
-## The two components travel together as one `FlowState`:
+## The three components travel together as one `FlowState`:
 ## - `inits` — journaled definite-assignment set (add/remove + undo).
 ## - `facts` — the `inferle.Facts` engine (already journaled).
+## - `borrows` — the journaled set of borrows that may be active.
 ##
 ## Control flow maps to the same operations the generic tracker documented:
 ## `gotoLabel`/`gotoReturn`/`gotoRaise`/`gotoContinue` record the state at a
@@ -28,14 +29,46 @@
 ## accumulated exit state back into fall-through; `splitBranch`/`commitThen`/
 ## `mergeBranches` drive an `ite`; `takeRaise`/`mapStates` serve `try`/`finally`.
 ## Facts are joined by intersection at every confluence (weakest common bound —
-## `inferle.merge`), matching the init-set's intersection join.
+## `inferle.merge`), matching the init-set's intersection join. Borrows are the
+## one *may* component: a borrow held on any incoming path is held, so they are
+## joined by union.
 
 import std/[tables, hashes, sets]
 include ".." / lib / nifprelude   # SymId (and its `==`/`hash`), like the rest of nimony/
+include ".." / lib / compat2      # `Hashable` for the `ExitKey` hash below
 import inferle, xints
-import ".." / njvl / tracker   # reuse ExitKind / ExitKey / labelKey
 
-export ExitKind, ExitKey, labelKey
+# --------------------------------------------------------------- exit keys
+# These used to live in the generic `Tracker[T, L]` of `finalir/tracker.nim`,
+# which this module superseded; nothing ever instantiated the generic again,
+# so its one surviving part moved here.
+
+type
+  ExitKind* = enum
+    ekLabel      ## a forward `jmp L`, loop-`break` (`jmp loopExit`) included
+    ekReturn     ## the primitive `return`, bound by the proc root
+    ekRaise      ## the primitive `raise`, bound by the nearest `except`
+    ekContinue   ## the loop back-edge, bound by its `loop` header
+
+  ExitKey*[L] = object
+    ## Every way control leaves a subtree. `continue` is *not* an acyclic
+    ## forward exit, but we key it here too so the loop header can pull it.
+    kind*: ExitKind
+    label*: L      ## meaningful only when `kind == ekLabel`
+
+func hash*[L: Hashable](k: ExitKey[L]): Hash =
+  result = hash(ord(k.kind))
+  if k.kind == ekLabel:
+    result = result !& hash(k.label)
+  result = !$result
+
+# `==` is left to the structural object equality: a custom `[L]`-generic `==`
+# is ambiguous with system's generic `==[T]` under Nimony, and the non-label
+# keys always carry `default(L)` in `label`, so field-wise equality already
+# matches the intended "same kind (and same label, when a label)" semantics.
+
+proc labelKey*[L](label: L): ExitKey[L] {.inline.} =
+  ExitKey[L](kind: ekLabel, label: label)
 
 # --------------------------------------------------------------- init-set
 
@@ -95,6 +128,84 @@ proc addedSince(x: Inits; cp: int): HashSet[SymId] =
 
 proc snapshot(x: Inits): HashSet[SymId] = x.s   # a plain value copy
 
+# --------------------------------------------------------------- borrows
+
+type
+  BorrowInfo* = object
+    borrower*: SymId   ## variable holding the borrow; upon `(kill borrower)` the borrow ends
+    loc*: Cursor       ## the borrowed location, as the lowered module writes
+                       ## it; `contracts_fir` reads root, fields and indices
+                       ## off the tree
+    info*: NifLineInfo
+
+  BorrowJEntry = object
+    added: bool
+    b: BorrowInfo
+
+  Borrows* = object
+    ## Journaled set of the borrows that may be active. Two entries are the
+    ## same borrow when they agree on `borrower` and `path`.
+    s: seq[BorrowInfo]
+    journal: seq[BorrowJEntry]
+    journaling: bool
+
+proc sameBorrow(a, b: BorrowInfo): bool {.inline.} =
+  a.borrower == b.borrower and toUniqueId(a.loc) == toUniqueId(b.loc)
+
+proc find(s: seq[BorrowInfo]; b: BorrowInfo): int =
+  result = -1
+  for i in 0 ..< s.len:
+    if sameBorrow(s[i], b): return i
+
+iterator items*(x: Borrows): BorrowInfo =
+  for b in x.s: yield b
+
+proc incl*(x: var Borrows; b: BorrowInfo) =
+  if x.s.find(b) < 0:
+    x.s.add b
+    if x.journaling: x.journal.add BorrowJEntry(added: true, b: b)
+
+proc delAt(x: var Borrows; i: int) =
+  if x.journaling: x.journal.add BorrowJEntry(added: false, b: x.s[i])
+  x.s.del i    # order is irrelevant, so swap-delete is fine
+
+proc endBorrowsOf*(x: var Borrows; borrower: SymId) =
+  ## The borrows held by `borrower` end: it died or was rebound.
+  var i = 0
+  while i < x.s.len:
+    if x.s[i].borrower == borrower: x.delAt i
+    else: inc i
+
+proc checkpoint*(x: Borrows): int {.inline.} = x.journal.len
+
+proc rollbackTo*(x: var Borrows; cp: int) =
+  var i = x.journal.len - 1
+  while i >= cp:
+    let e = x.journal[i]
+    if e.added:
+      let k = x.s.find(e.b)
+      if k >= 0: x.s.del k
+    else:
+      x.s.add e.b
+    dec i
+  x.journal.setLen cp
+
+proc snapshot(x: Borrows): seq[BorrowInfo] = x.s
+
+proc union(a, b: seq[BorrowInfo]): seq[BorrowInfo] =
+  result = a
+  for e in b:
+    if result.find(e) < 0: result.add e
+
+proc setBorrowsTo(x: var Borrows; cp: int; target: seq[BorrowInfo]) =
+  ## Journaled `x := target`, rolled back to `cp` first so the diff stays small.
+  x.rollbackTo cp
+  var i = 0
+  while i < x.s.len:
+    if target.find(x.s[i]) < 0: x.delAt i
+    else: inc i
+  for b in target: x.incl b
+
 # --------------------------------------------------------------- facts helper
 
 proc setFactsTo(f: var Facts; cp: int; target: Facts) =
@@ -124,10 +235,12 @@ type
     ## The whole analysis state, journaled in place.
     inits*: Inits
     facts*: Facts
+    borrows*: Borrows
 
   FlowCp* = object
     initsCp: int
     factsCp: int
+    borrowsCp: int
 
   FlowSnap* = object
     ## A materialized state, stashed at a pending exit or held while the other
@@ -135,21 +248,33 @@ type
     ## accumulator type the driver folds N-way (`case`/`try`) merges into.
     inits: HashSet[SymId]
     facts: Facts
+    borrows: seq[BorrowInfo]
 
 proc initFlowState*(): FlowState =
   result = FlowState(inits: initInits(), facts: createFacts())
   result.inits.enableJournaling()
   result.facts.enableJournaling()
+  result.borrows.journaling = true
 
 proc checkpoint*(fs: FlowState): FlowCp {.inline.} =
-  FlowCp(initsCp: fs.inits.checkpoint, factsCp: fs.facts.checkpoint)
+  FlowCp(initsCp: fs.inits.checkpoint, factsCp: fs.facts.checkpoint,
+         borrowsCp: fs.borrows.checkpoint)
 
 proc rollbackTo*(fs: var FlowState; cp: FlowCp) {.inline.} =
   fs.inits.rollbackTo cp.initsCp
   fs.facts.rollbackTo cp.factsCp
+  fs.borrows.rollbackTo cp.borrowsCp
 
 proc snapshot*(fs: FlowState): FlowSnap =
-  FlowSnap(inits: fs.inits.snapshot, facts: snapshotFacts(fs.facts))
+  FlowSnap(inits: fs.inits.snapshot, facts: snapshotFacts(fs.facts),
+           borrows: fs.borrows.snapshot)
+
+proc borrowsOf*(snap: FlowSnap): seq[BorrowInfo] {.inline.} = snap.borrows
+
+proc inclBorrows*(fs: var FlowState; bs: seq[BorrowInfo]) =
+  ## Add `bs` to the borrows that may be active (journaled): the may-join of
+  ## the current state with a state that reaches the same point.
+  for b in bs: fs.borrows.incl b
 
 proc inheritInits*(dst: var FlowState; src: FlowState) =
   ## Seed `dst`'s init-set with `src`'s — used at a *closure* boundary so a
@@ -169,7 +294,8 @@ proc joinSnap*(a, b: FlowSnap): FlowSnap =
   else:
     for x in b.inits:
       if x in a.inits: inits.incl x
-  FlowSnap(inits: inits, facts: merge(a.facts, 0, b.facts, false))
+  FlowSnap(inits: inits, facts: join(a.facts, b.facts),
+           borrows: union(a.borrows, b.borrows))
 
 proc setTo*(fs: var FlowState; cp: FlowCp; snap: FlowSnap) =
   ## Journaled `fs := snap`, rolled back to `cp` first so the diff stays small.
@@ -181,6 +307,7 @@ proc setTo*(fs: var FlowState; cp: FlowCp; snap: FlowSnap) =
   for k in snap.inits:
     fs.inits.incl k
   setFactsTo(fs.facts, cp.factsCp, snap.facts)
+  setBorrowsTo(fs.borrows, cp.borrowsCp, snap.borrows)
 
 # --------------------------------------------------------------- the tracker
 
@@ -203,6 +330,7 @@ type
     thenLive: bool
     thenInits: HashSet[SymId]         ## the then-branch's init *delta*
     thenFacts: Facts                  ## the then-branch's facts (if it lives)
+    thenBorrows: seq[BorrowInfo]      ## the then-branch's borrows (if it lives)
     thenDelta: seq[ExitJEntry]        ## the then-branch's net exit contributions
 
 proc initFlowTracker*(): FlowTracker =
@@ -268,28 +396,22 @@ proc bindRaise*(tr: var FlowTracker; fs: var FlowState) {.inline.} =
   bindKey(tr, fs, ExitKey[SymId](kind: ekRaise))
 
 proc bindLoopExit*(tr: var FlowTracker; fs: var FlowState; label: SymId) =
-  ## The `(lab loopExit)` after a `(loop)`. A loop is analyzed in one forward
-  ## pass (no fixpoint), so break-site *facts* may be iteration-specific and are
-  ## dropped — `fs.facts` keeps the conservative pre-loop set the driver rolled
-  ## back to. Definite-assignment is monotone, so break-site *inits* ARE joined
-  ## (a var initialized before every break is initialized after the loop).
+  ## The `(lab loopExit)` after a `(loop)`. The body is analyzed once, and only
+  ## under the facts no iteration can break (`restrictFactsToLoopInvariants`),
+  ## so what holds where a `break` or the guard jumps out holds on *every*
+  ## iteration's exit: the exit is joined exactly like any other label — the
+  ## guard's negation included, which is what `while k > Max: …` leaves behind
+  ## for the code after it.
   let key = labelKey(label)
-  if key in tr.exits:
-    let landed = getOrDefault(tr.exits, key)
-    jDel(tr, key)
-    if tr.live:
-      var keep: seq[SymId] = @[]
-      for k in fs.inits.snapshot:
-        if k notin landed.inits: keep.add k
-      for k in keep: fs.inits.excl k
-    else:
-      # only break paths reach here: install their joined init-set
-      var cur: seq[SymId] = @[]
-      for k in fs.inits.snapshot: cur.add k
-      for k in cur:
-        if k notin landed.inits: fs.inits.excl k
-      for k in landed.inits: fs.inits.incl k
-      tr.live = true
+  if key notin tr.exits:
+    # A `(lab)` with no `jmp` to it: `trFor` emits the exit of every `for` loop
+    # unconditionally, because the iterator's termination test is not generated
+    # until hexer. The label is the lowering's word that this point is reached,
+    # and `fs` already holds the conservative pre-loop state the driver rolled
+    # back to, so the only thing missing is liveness.
+    tr.live = true
+  else:
+    bindKey(tr, fs, key)
 
 proc dropContinue*(tr: var FlowTracker) {.inline.} =
   ## The loop header consumes the back-edge; a one-pass forward analysis drops it.
@@ -309,6 +431,16 @@ proc takeRaise*(tr: var FlowTracker): bool =
 
 # ---- branching
 
+proc exitsCheckpoint*(tr: FlowTracker): int {.inline.} = tr.journal.len
+
+proc rollbackExits*(tr: var FlowTracker; cp: int) =
+  ## Undo every exit-table mutation since `exitsCheckpoint` returned `cp`.
+  while tr.journal.len > cp:
+    let e = tr.journal[tr.journal.len - 1]
+    tr.journal.setLen(tr.journal.len - 1)
+    if e.had: tr.exits[e.key] = e.old
+    else: tr.exits.del e.key
+
 proc splitBranch*(tr: var FlowTracker; fs: FlowState): Branch =
   Branch(baseLive: tr.live, cp: fs.checkpoint, ejcp: tr.journal.len)
 
@@ -320,6 +452,7 @@ proc commitThen*(tr: var FlowTracker; fs: var FlowState; b: var Branch) =
   if b.thenLive:
     b.thenInits = fs.inits.addedSince(b.cp.initsCp)
     b.thenFacts = snapshotFacts(fs.facts)
+    b.thenBorrows = fs.borrows.snapshot
   # distinct exit keys the then-branch touched, with their post-then values
   b.thenDelta = @[]
   var seen = initHashSet[ExitKey[SymId]]()
@@ -332,12 +465,7 @@ proc commitThen*(tr: var FlowTracker; fs: var FlowState; b: var Branch) =
       else:
         b.thenDelta.add ExitJEntry(key: k, had: false)
     dec i
-  # undo the then-branch's exit-table mutations
-  while tr.journal.len > b.ejcp:
-    let e = tr.journal[tr.journal.len - 1]
-    tr.journal.setLen(tr.journal.len - 1)
-    if e.had: tr.exits[e.key] = e.old
-    else: tr.exits.del e.key
+  rollbackExits(tr, b.ejcp)
   # roll the state back to the baseline the then-branch started from
   fs.rollbackTo b.cp
   tr.live = b.baseLive
@@ -356,17 +484,27 @@ proc mergeBranches*(tr: var FlowTracker; fs: var FlowState; b: Branch) =
   if b.thenLive and elseLive:
     # merged init-set = baseline + (thenDelta ∩ elseDelta); merged facts = ⊔.
     let elseDelta = fs.inits.addedSince(b.cp.initsCp)
-    let mergedFacts = merge(b.thenFacts, 0, fs.facts, false)
+    let mergedFacts = join(b.thenFacts, fs.facts)
     fs.inits.rollbackTo b.cp.initsCp
     for k in elseDelta:
       if k in b.thenInits: fs.inits.incl k
     setFactsTo(fs.facts, b.cp.factsCp, mergedFacts)
+    fs.inclBorrows b.thenBorrows   # `fs` holds the else-branch's borrows
     tr.live = true
   elif b.thenLive:
     # else left; the post-`if` state is the then-branch's.
     fs.rollbackTo b.cp
     for k in b.thenInits: fs.inits.incl k
     setFactsTo(fs.facts, b.cp.factsCp, b.thenFacts)
+    setBorrowsTo(fs.borrows, b.cp.borrowsCp, b.thenBorrows)
     tr.live = true
   else:
     tr.live = elseLive   # `fs` already holds the else-branch state
+
+proc backEdgeBorrows*(tr: FlowTracker): seq[BorrowInfo] =
+  ## The borrows that reach the loop's back-edge. The body is analyzed once,
+  ## from the pre-loop state, but a loop may stop after any iteration: what
+  ## the body leaves borrowed is also borrowed after the loop.
+  let key = ExitKey[SymId](kind: ekContinue)
+  if key in tr.exits: result = getOrDefault(tr.exits, key).borrows
+  else: result = @[]

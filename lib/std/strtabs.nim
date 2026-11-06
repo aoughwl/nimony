@@ -111,9 +111,9 @@ iterator values*(t: StringTableRef): string =
 
 proc myhash(mode: StringTableMode, key: string): Hash =
   case mode
-  of modeCaseSensitive: result = hashes.hash(key)
-  of modeCaseInsensitive: result = hashes.hashIgnoreCase(key)
-  of modeStyleInsensitive: result = hashes.hashIgnoreStyle(key)
+  of modeCaseSensitive: result = hash(key)
+  of modeCaseInsensitive: result = hashIgnoreCase(key)
+  of modeStyleInsensitive: result = hashIgnoreStyle(key)
 
 proc myhash(t: StringTableRef, key: string): Hash =
   result = myhash(t.mode, key)
@@ -386,20 +386,25 @@ proc `%`*(f: string, t: StringTableRef, flags: set[FormatFlag] = {}): string {.r
   const
     PatternChars = {'a'..'z', 'A'..'Z', '0'..'9', '_', '\x80'..'\xFF'}
   result = ""
-  var i = 0
+  # `Natural`: these are cursors into `f`, so the lower half of every index
+  # obligation comes from the type rather than from a guard.
+  var i: Natural = 0
   while i < len(f):
-    if f[i] == '$':
+    if f[i] == '$' and i < f.len - 1:
+      # a `$` as the last character is an ordinary one
       case f[i+1]
       of '$':
         add(result, '$')
         inc(i, 2)
       of '{':
-        var j = i + 1
+        var j: Natural = i + 1
         while j < f.len and f[j] != '}': inc(j)
+        # `j` started at `i < f.len - 1` and stops at `f.len` at the latest
+        {.assume: j <= f.len.}
         add(result, getValue(t, flags, substr(f, i+2, j-1)))
         i = j + 1
       of 'a'..'z', 'A'..'Z', '\x80'..'\xFF', '_':
-        var j = i + 1
+        var j: Natural = i + 1
         while j < f.len and f[j] in PatternChars: inc(j)
         add(result, getValue(t, flags, substr(f, i+1, j-1)))
         i = j

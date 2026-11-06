@@ -31,23 +31,16 @@ proc pointeeType(c: var LLVMCode; typ: Cursor): Cursor =
   else:
     result = default(Cursor)
 
-proc llBinopKind(op: string): LLInstrKind =
-  case op
-  of "add": llAdd
-  of "sub": llSub
-  of "mul": llMul
-  of "sdiv": llSDiv
-  of "udiv": llUDiv
-  of "srem": llSRem
-  of "urem": llURem
-  of "shl": llShl
-  of "ashr": llAShr
-  of "lshr": llLShr
-  of "and": llAnd
-  of "or": llOr
-  of "xor": llXor
-  of "fneg": llFcmp # unused placeholder
-  else: llAdd
+
+proc coerceInPlace(c: var LLVMCode; val: var LLValue;
+                   srcTypeCursor, destTypeCursor: Cursor) =
+  ## Coerce `val` to `destTypeCursor`, overwriting it. `coerceValueLLVM` returns
+  ## through a `var` out-param, and handing it the same variable as both the
+  ## (immutable) input and the output aliases the two -- route it through a
+  ## temporary instead.
+  var coerced = LLValue()
+  coerceValueLLVM(c, val, srcTypeCursor, destTypeCursor, coerced)
+  val = coerced
 
 proc signedBinOp(c: var LLVMCode; n: var Cursor; op: string;
     result: var LLValue) =
@@ -59,12 +52,12 @@ proc signedBinOp(c: var LLVMCode; n: var Cursor; op: string;
     let srcRhs = getType(c.m, n)
     var rhs = LLValue(); genExprLLVM(c, n, rhs)
     if not typeEq(lhs.typ, typLL):
-      coerceValueLLVM(c, lhs, srcLhs, typCursor, true, lhs)
+      coerceInPlace(c, lhs, srcLhs, typCursor)
     if not typeEq(rhs.typ, typLL):
-      coerceValueLLVM(c, rhs, srcRhs, typCursor, true, rhs)
+      coerceInPlace(c, rhs, srcRhs, typCursor)
     let t = c.nextTemp()
     let res = llReg(t, typLL)
-    c.emit newLLBinInstr(llBinopKind(op), res = res, binOp = op,
+    c.emit newLLBinInstr(res = res, binOp = op,
                          binLhs = lhs, binRhs = rhs)
     result = res
     while n.hasMore: skip n
@@ -80,13 +73,13 @@ proc unsignedBinOp(c: var LLVMCode; n: var Cursor; signedOp, unsignedOp: string;
     let srcRhs = getType(c.m, n)
     var rhs = LLValue(); genExprLLVM(c, n, rhs)
     if not typeEq(lhs.typ, typLL):
-      coerceValueLLVM(c, lhs, srcLhs, typCursor, true, lhs)
+      coerceInPlace(c, lhs, srcLhs, typCursor)
     if not typeEq(rhs.typ, typLL):
-      coerceValueLLVM(c, rhs, srcRhs, typCursor, true, rhs)
+      coerceInPlace(c, rhs, srcRhs, typCursor)
     let op = if isUnsigned: unsignedOp else: signedOp
     let t = c.nextTemp()
     let res = llReg(t, typLL)
-    c.emit newLLBinInstr(llBinopKind(op), res = res, binOp = op,
+    c.emit newLLBinInstr(res = res, binOp = op,
                          binLhs = lhs, binRhs = rhs)
     result = res
     while n.hasMore: skip n
@@ -105,9 +98,9 @@ proc cmpOp(c: var LLVMCode; n: var Cursor; signedPred, unsignedPred: string;
     # LLVM cmp needs both operands at one type: widen the narrower one.
     if not typeEq(lhs.typ, rhs.typ):
       if typeSizeBits(c, lhsType) < typeSizeBits(c, rhsType):
-        coerceValueLLVM(c, lhs, lhsType, rhsType, false, lhs)
+        coerceInPlace(c, lhs, lhsType, rhsType)
       else:
-        coerceValueLLVM(c, rhs, rhsType, lhsType, false, rhs)
+        coerceInPlace(c, rhs, rhsType, lhsType)
     let t = c.nextTemp()
     if isFloatType(lhs.typ):
       let fpPred = case signedPred
@@ -183,7 +176,7 @@ proc genAtomicCall(c: var LLVMCode; externName: string; args: seq[LLValue];
   of "__atomic_store_n":
     c.emit LLInstr(kind: llStore, storeValue: args[1], storePtr: args[0],
                    storeAtomic: true, storeOrdering: ordering,
-                       storeAlign: align)
+                   storeAlign: atomicAlign(c, args[1].typ))
     result = llNoneVal()
   of "__atomic_exchange_n":
     let t = c.nextTemp()
@@ -229,7 +222,7 @@ proc genAtomicCall(c: var LLVMCode; externName: string; args: seq[LLValue];
                    armwAlign: align)
     let r = c.nextTemp()
     let rRes = llReg(r, retType)
-    c.emit LLInstr(kind: llAdd, result: rRes, binOp: "add", binLhs: res,
+    c.emit LLInstr(kind: llBinOp, result: rRes, binOp: "add", binLhs: res,
         binRhs: args[1])
     result = rRes
   of "__atomic_sub_fetch":
@@ -240,7 +233,7 @@ proc genAtomicCall(c: var LLVMCode; externName: string; args: seq[LLValue];
                    armwAlign: align)
     let r = c.nextTemp()
     let rRes = llReg(r, retType)
-    c.emit LLInstr(kind: llSub, result: rRes, binOp: "sub", binLhs: res,
+    c.emit LLInstr(kind: llBinOp, result: rRes, binOp: "sub", binLhs: res,
         binRhs: args[1])
     result = rRes
   of "__atomic_fetch_add":
@@ -321,6 +314,18 @@ proc genAtomicCall(c: var LLVMCode; externName: string; args: seq[LLValue];
       c.emit LLInstr(kind: llCall, result: res, callCallee: llGlobalRef(externName, c.prim.ptrT),
                      callRetType: retType, callArgs: args)
       result = res
+
+proc sizeToI64(c: var LLVMCode; v: LLValue): LLValue =
+  ## The `llvm.mem*` intrinsics take an `i64` length; a Leng size expression
+  ## is whatever integer the target's `int` is. Sizes are never negative, so a
+  ## narrower one zero-extends.
+  if v.kind == llvInt or (v.typ.kind == llInt and v.typ.intBits == 64):
+    result = v.withType(c.prim.i64)
+  else:
+    let t = c.nextTemp()
+    result = llReg(t, c.prim.i64)
+    c.emit LLInstr(kind: llZext, result: result, castOp: "zext", castSrc: v,
+                   castDstType: c.prim.i64)
 
 proc genMemIntrinsicCall(c: var LLVMCode; externName: string; args: seq[
     LLValue]; retType: LLType; result: var LLValue) =
@@ -446,8 +451,62 @@ proc genGccBuiltinCall(c: var LLVMCode; externName: string; args: seq[LLValue];
     result = callIntrinsic("llvm.bswap.i64", c.prim.i64)
   of "__builtin_expect":
     result = args[0]
+  of "__builtin_sqrt", "__builtin_sqrtf":
+    let t = c.nextTemp()
+    let res = llReg(t, retType)
+    c.emit LLInstr(kind: llCall, result: res,
+      callCallee: llGlobalRef(if externName == "__builtin_sqrtf": "llvm.sqrt.f32"
+                              else: "llvm.sqrt.f64", c.prim.ptrT),
+      callRetType: retType, callArgs: @[args[0]])
+    result = res
   else:
     discard
+
+proc genInstrLLVM(c: var LLVMCode; n: var Cursor; result: var LLValue) =
+  # A portable row lowers exactly like the GCC builtin it stands for, and
+  # `genGccBuiltinCall` already emits those: the `llvm.cttz`/`ctlz`/`ctpop`/
+  # `bswap` call, the `i1 is_zero_poison` operand, and the i64→i32 truncation.
+  # It is keyed on the builtin NAME, which is what `cBuiltinFor` returns, so
+  # `(instr …)` needs no lowering of its own — resolve the row and reuse it.
+  # A target-pinned row has no portable spelling by construction, so there
+  # `cBuiltinFor` yields "" and this rejects rather than substituting.
+  let start = n
+  let retType = genTypeLLVMReadOnly(c, getType(c.m, start))    
+  n.into:
+    var bits = 0
+    let op = intrinsicOfCallee(c.m, n, bits)   # `n` is at the callee symbol
+    if op == NoIntrinsicOp:
+      error c.m, "callee of (instr ...) carries no instruction/intrinsic pragma: ", start
+
+    var args: seq[LLValue] = @[]
+    skip n                                  # the callee symbol
+    while n.hasMore:
+      var a = LLValue()
+      genExprLLVM(c, n, a)
+      args.add a
+
+    c.setLoc(start.info)
+    if op.isAtomic:
+      genAtomicCall(c, cBuiltinFor(op, bits), args, retType, result)
+    elif op.isMemOp:
+      # the same lowering as a call to the importc'd C function of that name
+      args[2] = sizeToI64(c, args[2])
+      let name = case op
+                 of MemsetOp: "memset"
+                 of MemcpyOp: "memcpy"
+                 else: "memcmp"
+      genMemIntrinsicCall(c, name, args, retType, result)
+
+    else:
+      let builtin = cBuiltinFor(op, bits)
+      if builtin.len == 0:
+        # We can't find gcc builtin for it, but it means that intrinsic is
+        # target specific and currently unsupported
+
+        error c.m, "the LLVM backend has no lowering for this instruction: ", start
+
+      genGccBuiltinCall(c, builtin, args, retType, result)
+
 
 proc genCallWithType(c: var LLVMCode; n: var Cursor; retType: LLType;
     result: var LLValue) =
@@ -502,7 +561,8 @@ proc genCallWithType(c: var LLVMCode; n: var Cursor; retType: LLType;
     result = res
 
 proc genCallLLVM(c: var LLVMCode; n: var Cursor; result: var LLValue) =
-  genCallWithType(c, n, c.prim.ptrT, result)
+  let ptrT = c.prim.ptrT
+  genCallWithType(c, n, ptrT, result)
 
 proc genCallExprLLVM(c: var LLVMCode; n: var Cursor; result: var LLValue) =
   genCallLLVM(c, n, result)
@@ -517,7 +577,7 @@ proc isLengPtr(tk: LengType): bool {.inline.} =
   tk in {PtrT, AptrT, ProctypeT}
 
 proc coerceValueLLVM(c: var LLVMCode; val: LLValue; srcTypeCursor, destTypeCursor: Cursor;
-                     isCast: bool; result: var LLValue) =
+                     result: var LLValue) =
   let destTyp = genTypeLLVMReadOnly(c, destTypeCursor)
   if typeEq(val.typ, destTyp):
     result = val
@@ -553,13 +613,21 @@ proc coerceValueLLVM(c: var LLVMCode; val: LLValue; srcTypeCursor, destTypeCurso
     result = res
   elif isLengFloat(srcTK) and isLengInt(destTK):
     let res = llReg(t, destTyp)
-    c.emit LLInstr(kind: llFptosi, result: res, castOp: "fptosi", castSrc: val,
-        castDstType: destTyp)
+    if destTK in {UT, CT, BoolT}:
+      c.emit LLInstr(kind: llFptoui, result: res, castOp: "fptoui",
+          castSrc: val, castDstType: destTyp)
+    else:
+      c.emit LLInstr(kind: llFptosi, result: res, castOp: "fptosi",
+          castSrc: val, castDstType: destTyp)
     result = res
   elif isLengInt(srcTK) and isLengFloat(destTK):
     let res = llReg(t, destTyp)
-    c.emit LLInstr(kind: llSitofp, result: res, castOp: "sitofp", castSrc: val,
-        castDstType: destTyp)
+    if srcTK in {UT, CT, BoolT}:
+      c.emit LLInstr(kind: llUitofp, result: res, castOp: "uitofp",
+          castSrc: val, castDstType: destTyp)
+    else:
+      c.emit LLInstr(kind: llSitofp, result: res, castOp: "sitofp",
+          castSrc: val, castDstType: destTyp)
     result = res
   elif isLengInt(srcTK) and isLengInt(destTK):
     # Constant integer casts fold to the target type with no instruction.
@@ -570,7 +638,7 @@ proc coerceValueLLVM(c: var LLVMCode; val: LLValue; srcTypeCursor, destTypeCurso
     let destBits = typeSizeBits(c, destTypeCursor)
     if srcBits < destBits:
       let res = llReg(t, destTyp)
-      if isCast or srcTK in {UT, CT, BoolT}:
+      if srcTK in {UT, CT, BoolT}:
         c.emit LLInstr(kind: llZext, result: res, castOp: "zext", castSrc: val,
             castDstType: destTyp)
       else:
@@ -591,26 +659,28 @@ proc coerceValueLLVM(c: var LLVMCode; val: LLValue; srcTypeCursor, destTypeCurso
     if typeEq(anonDestType, val.typ):
       result = val.withType(destTyp)
       return
-    let res = llReg(t, destTyp)
-    c.emit LLInstr(kind: llBitcast, result: res, castOp: "bitcast",
-        castSrc: val, castDstType: destTyp)
-    result = res
+
+    # scalars already checked
+    # This means that frontend forgot to generate memcpy
+    # and old bitcast generation in this branch was wrong
+    error c.m,
+      "the LLVM backend cannot convert " & serialize(val.typ) & " to: ",
+      destTypeCursor
 
 proc genConvOrCast(c: var LLVMCode; n: var Cursor; result: var LLValue) =
-  let isCast = n.exprKind == CastC
   n.into:
     let destTypeCursor = n
     skip n
     let srcTypeCursor = getType(c.m, n)
     var val = LLValue(); genExprLLVM(c, n, val)
-    coerceValueLLVM(c, val, srcTypeCursor, destTypeCursor, isCast, result)
+    coerceValueLLVM(c, val, srcTypeCursor, destTypeCursor, result)
     while n.hasMore: skip n
 
 proc genAddrLLVM(c: var LLVMCode; n: var Cursor; result: var LLValue) =
   var lval = LLValue()
   n.into:
     genLvalueLLVM(c, n, lval)
-    if n.hasMore and n.typeQual == CppRefQ:
+    if n.hasMore and n.typeQual == CpprefQ:
       skip n
     while n.hasMore: skip n
   result = lval.withType(c.prim.ptrT)
@@ -679,6 +749,18 @@ proc isAddressableExpr(n: Cursor): bool {.inline.} =
   of DerefC, AtC, PatC, DotC, ErrvC, OvfC, BaseobjC: result = true
   else: result = false
 
+proc genIndexLLVM(c: var LLVMCode; n: var Cursor; result: var LLValue) =
+  ## C's integer promotion (`byte` 200 must not become -56).
+  ## Other backends also do it, but integer promotion might be incorrect.
+  let typ = scalarTypeKind(c, getType(c.m, n))
+  genExprLLVM(c, n, result)
+  if typ in {UT, CT, BoolT} and result.typ.kind == llInt and
+      result.typ.intBits < c.bits:
+    let wide = llReg(c.nextTemp(), c.llIntBits(c.bits))
+    c.emit LLInstr(kind: llZext, result: wide, castOp: "zext", castSrc: result,
+                   castDstType: wide.typ)
+    result = wide
+
 proc genAtLLVM(c: var LLVMCode; n: var Cursor; result: var LLValue) =
   var arrType: Cursor
   var arr = LLValue()
@@ -696,7 +778,7 @@ proc genAtLLVM(c: var LLVMCode; n: var Cursor; result: var LLValue) =
       c.emitAlloca(tmp, typ)
       c.emitStore(val, llReg(tmp, c.prim.ptrT))
       arr = llReg(tmp, c.prim.ptrT)
-    genExprLLVM(c, n, idx)
+    genIndexLLVM(c, n, idx)
     while n.hasMore: skip n
   let arrTypeName = genTypeLLVMReadOnly(c, arrType)
   result = c.emitGEP(arrTypeName, arr,
@@ -709,7 +791,7 @@ proc genPatLLVM(c: var LLVMCode; n: var Cursor; result: var LLValue) =
   n.into:
     baseType = getType(c.m, n)
     genExprLLVM(c, n, base)
-    genExprLLVM(c, n, idx)
+    genIndexLLVM(c, n, idx)
     while n.hasMore: skip n
   let elemCursor = pointeeType(c, baseType)
   if cursorIsNil(elemCursor):
@@ -753,7 +835,7 @@ proc genLvalueLLVM(c: var LLVMCode; n: var Cursor; result: var LLValue) =
     var ptrVal = LLValue()
     n.into:
       genExprLLVM(c, n, ptrVal)
-      if n.hasMore and n.typeQual == CppRefQ:
+      if n.hasMore and n.typeQual == CpprefQ:
         skip n
       while n.hasMore: skip n
     result = ptrVal.withType(c.prim.ptrT)
@@ -775,15 +857,21 @@ proc genLvalueLLVM(c: var LLVMCode; n: var Cursor; result: var LLValue) =
       skip n
       genLvalueLLVM(c, n, result)
       while n.hasMore: skip n
-  of SufC, ParC, AddrC, NilC, InfC, NeginfC, NanC, FalseC, TrueC,
+  of SufC, ParC, AddrC, HaddrC, NilC, InfC, NeginfC, NanC, FalseC, TrueC,
      AndC, OrC, NotC, NegC, SizeofC, AlignofC, OffsetofC,
      OconstrC, AconstrC,
      AddC, SubC, MulC, DivC, ModC, ShrC, ShlC,
      BitandC, BitorC, BitxorC, BitnotC,
-     EqC, NeqC, LeC, LtC, CastC, ConvC, CallC:
+     EqC, NeqC, LeC, LtC, CastC, ConvC, CallC, InstrC:
     error c.m, "not an lvalue: ", n
 
 proc genExprLLVM(c: var LLVMCode; n: var Cursor; result: var LLValue) =
+  # Expression-producing templates are the common case (`>=` is one), so the
+  # frame has to open here too, not just on statements (#1987).
+  withExpansionFrames(c, n.info):
+    genExprBodyLLVM(c, n, result)
+
+proc genExprBodyLLVM(c: var LLVMCode; n: var Cursor; result: var LLValue) =
   case n.exprKind
   of NoExpr:
     case n.kind
@@ -883,7 +971,7 @@ proc genExprLLVM(c: var LLVMCode; n: var Cursor; result: var LLValue) =
     skip n
     result = LLValue(kind: llvFloat, floatText: "0x7FF0000000000000",
         typ: c.prim.f64)
-  of NegInfC:
+  of NeginfC:
     skip n
     result = LLValue(kind: llvFloat, floatText: "0xFFF0000000000000",
         typ: c.prim.f64)
@@ -910,7 +998,7 @@ proc genExprLLVM(c: var LLVMCode; n: var Cursor; result: var LLValue) =
       while n.hasMore: skip n
     let t = c.nextTemp()
     let res = llReg(t, typ)
-    c.emit LLInstr(kind: llXor, result: res, binOp: "xor", binLhs: val,
+    c.emit LLInstr(kind: llBinOp, result: res, binOp: "xor", binLhs: val,
                    binRhs: llIntTextC("-1", typ))
     result = res
   of NegC:
@@ -926,7 +1014,7 @@ proc genExprLLVM(c: var LLVMCode; n: var Cursor; result: var LLValue) =
       c.emit LLInstr(kind: llFneg, result: res, fnegVal: val)
       result = res
     else:
-      c.emit LLInstr(kind: llSub, result: res, binOp: "sub",
+      c.emit LLInstr(kind: llBinOp, result: res, binOp: "sub",
                      binLhs: llIntTextC("0", typ), binRhs: val)
       result = res
   of EqC: genBoolCmpOp(c, n, "eq", "eq", result)
@@ -939,7 +1027,8 @@ proc genExprLLVM(c: var LLVMCode; n: var Cursor; result: var LLValue) =
     var lhs = LLValue()
     var rhs = LLValue()
     n.into:
-      c.emitAlloca(resName, c.prim.i8)
+      let i8 = c.prim.i8
+      c.emitAlloca(resName, i8)
       c.emitStore(llIntTextC("0", c.prim.i8), llReg(resName, c.prim.ptrT))
       genExprLLVM(c, n, lhs)
       let lhsBool = c.nextTemp()
@@ -966,7 +1055,7 @@ proc genExprLLVM(c: var LLVMCode; n: var Cursor; result: var LLValue) =
       c.setLoc(andInfo)
       c.emit LLInstr(kind: llBr, brTarget: endLabel)
       discard c.startBlock(endLabel)
-      result = c.emitLoad(llReg(resName, c.prim.ptrT), c.prim.i8)
+      result = c.emitLoad(llReg(resName, c.prim.ptrT), i8)
       while n.hasMore: skip n
   of OrC:
     let orInfo = n.info
@@ -974,7 +1063,8 @@ proc genExprLLVM(c: var LLVMCode; n: var Cursor; result: var LLValue) =
     var lhs = LLValue()
     var rhs = LLValue()
     n.into:
-      c.emitAlloca(resName, c.prim.i8)
+      let i8 = c.prim.i8
+      c.emitAlloca(resName, i8)
       c.emitStore(llIntTextC("1", c.prim.i8), llReg(resName, c.prim.ptrT))
       genExprLLVM(c, n, lhs)
       let lhsBool = c.nextTemp()
@@ -1001,7 +1091,7 @@ proc genExprLLVM(c: var LLVMCode; n: var Cursor; result: var LLValue) =
       c.setLoc(orInfo)
       c.emit LLInstr(kind: llBr, brTarget: endLabel)
       discard c.startBlock(endLabel)
-      result = c.emitLoad(llReg(resName, c.prim.ptrT), c.prim.i8)
+      result = c.emitLoad(llReg(resName, c.prim.ptrT), i8)
       while n.hasMore: skip n
   of NotC:
     let notInfo = n.info
@@ -1025,7 +1115,9 @@ proc genExprLLVM(c: var LLVMCode; n: var Cursor; result: var LLValue) =
     let retTypeCursor = getType(c.m, n)
     let retType = genTypeLLVMReadOnly(c, retTypeCursor)
     genCallWithType(c, n, retType, result)
-  of AddrC:
+  of InstrC:
+    genInstrLLVM(c, n, result)
+  of AddrC, HaddrC:
     genAddrLLVM(c, n, result)
   of DerefC:
     let derefType = getType(c.m, n)
@@ -1033,7 +1125,7 @@ proc genExprLLVM(c: var LLVMCode; n: var Cursor; result: var LLValue) =
     var ptrVal = LLValue()
     n.into:
       genExprLLVM(c, n, ptrVal)
-      if n.hasMore and n.typeQual == CppRefQ:
+      if n.hasMore and n.typeQual == CpprefQ:
         skip n
       while n.hasMore: skip n
     result = c.emitLoad(ptrVal, loadType)
@@ -1155,6 +1247,7 @@ proc genExprLLVM(c: var LLVMCode; n: var Cursor; result: var LLValue) =
           n.into:
             let fldSym = n.symId
             skip n
+            let srcType = getType(c.m, n)
             var fieldVal = LLValue(); genExprLLVM(c, n, fieldVal)
             let inhDepth = if n.hasMore and n.kind == IntLit: (let d = int(
                 intVal(n)); skip n; d) else: 0
@@ -1171,6 +1264,8 @@ proc genExprLLVM(c: var LLVMCode; n: var Cursor; result: var LLValue) =
                 curBody = navigateToObjectBody(c.m, curType)
                 gepType = genTypeLLVMReadOnly(c, curType)
             let fldPtr = genFieldPtrLLVM(c, curBody, fldSym, gepType, gepTarget)
+            let fldType = typeOfField(c.m, curBody, fldSym)
+            coerceInPlace(c, fieldVal, srcType, fldType)
             c.emitStore(fieldVal, fldPtr)
             while n.hasMore: skip n
         else:
@@ -1211,7 +1306,8 @@ proc genExprLLVM(c: var LLVMCode; n: var Cursor; result: var LLValue) =
     result = c.emitLoad(lval, loadType)
   of ErrvC, OvfC:
     var lval = LLValue(); genLvalueLLVM(c, n, lval)
-    result = c.emitLoad(lval, c.prim.i8)
+    let i8 = c.prim.i8
+    result = c.emitLoad(lval, i8)
 
 proc genCondLLVM(c: var LLVMCode; n: var Cursor; result: var LLValue) =
   let condInfo = n.info

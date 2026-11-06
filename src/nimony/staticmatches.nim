@@ -9,9 +9,18 @@
 
 ## Helpers for matching value (`static`) generic parameters and the compile-time
 ## values bound to them. These are the parts of the static-parameter machinery
-## that do *not* depend on the `Match` object; the `Match`-bound logic
-## (`foldValueExpr`, `staticValueToBind`, `bindStaticTypevar`, ...) stays in
-## `sigmatch`.
+## that do *not* depend on the `Match` object.
+##
+## The explicit-generic-argument pipeline is split across three modules and is
+## the same for routine calls, explicit routine instantiation and type
+## instantiation:
+## - **sem** (`semLocalTypeImpl` with `AllowValues` at explicit generic-arg
+##   sites): semcheck each argument as a compile-time value or a type.
+## - **bind** (`sigmatch.matchExplicitGenericArg` / `staticValueToBind` /
+##   `bindStaticTypevar`, plus the `Match`-bound `foldValueExpr`): validate the
+##   sem'd argument against the parameter and canonicalize the bound value.
+## - **structural helpers** (this module): `Match`-free predicates such as
+##   `isStaticValue`, `staticValueType` and `staticValueTypeMatches`.
 
 import std/assertions
 include ".." / lib / nifprelude
@@ -25,68 +34,97 @@ proc isStaticTypevar*(s: SymId): bool =
   result = res.decl.symKind == StaticTypevarY
 
 proc sameStaticSymbol*(a, b: SymId): bool =
-  if a == b:
-    return true
-  let sa = pool.syms[a]
-  let sb = pool.syms[b]
-  result = isInstantiation(sa) and isInstantiation(sb) and
-    removeModule(sa) == removeModule(sb)
+  result = pool.symSameEntity(a, b)
 
-proc isStaticValue*(n: Cursor): bool =
-  ## A canonical compile-time value as bound to a `staticTypevar`: a primitive
-  ## literal, a const/enum-field/value-typevar symbol, or a typed aggregate
-  ## constructor (array/set/tuple/object) whose elements are themselves static.
+proc isConstantImpl(n: Cursor; allowOps: bool): bool =
+  ## The walk behind `isStaticValue` and `isConstantArg`. `allowOps` is the
+  ## latter's tier-1 extension: `staticParam` references, `nil`/`inf`/`nan`, the
+  ## fixed primitive opcode set and conversions over constant operands.
+  if not n.hasMore: return false
   case n.kind
-  of IntLit, UIntLit, FloatLit, CharLit, StringLit:
+  of IntLit, UIntLit, FloatLit, CharLit, StrLit:
     result = true
   of Symbol:
     let res = tryLoadSym(n.symId)
     result = res.status == LacksNothing and
-      res.decl.symKind in {ConstY, EfldY, StaticTypevarY}
-  of ParLe:
+      (res.decl.symKind in {ConstY, EfldY, StaticTypevarY} or
+       allowOps and res.decl.symKind == StaticParamY)
+  of TagLit:
     case n.exprKind
     of FalseX, TrueX:
       result = true
+    of NilX, InfX, NeginfX, NanX:
+      result = allowOps
     of SufX:
       var elem = n
       inc elem
-      result = isStaticValue(elem)
+      result = isConstantImpl(elem, allowOps)
     of AconstrX, SetconstrX, TupconstrX, OconstrX:
       var elem = n
-      inc elem
+      elem = sub(elem)
       skip elem # type
       result = true
       while elem.hasMore:
         if elem.substructureKind in {KvU, RangeU}:
-          inc elem
+          elem = sub(elem)
           skip elem # key or range start
-          if not isStaticValue(elem):
+          if not isConstantImpl(elem, allowOps):
             result = false
             break
           skip elem
-          if elem.kind == ParRi:
+          if not elem.hasMore:
             break
           inc elem
         else:
-          if not isStaticValue(elem):
+          if not isConstantImpl(elem, allowOps):
             result = false
             break
           skip elem
+    of AddX, SubX, MulX, NegX, EqX, NeqX, LeX, LtX, ConvX, HconvX, DconvX:
+      # `(op T a b)` / `(neg T a)` / `(conv T a)`: skip the type, check operands
+      result = allowOps
+      if allowOps:
+        var it = sub(n)
+        skip it # type
+        while it.hasMore:
+          if not isConstantImpl(it, allowOps):
+            result = false
+            break
+          skip it
+    of ExprX:
+      # a `(expr x)` wrapper around a single value, as left by sem for
+      # parenthesized expressions
+      result = false
+      if allowOps:
+        var it = sub(n)
+        result = it.hasMore
+        while it.hasMore:
+          if not isConstantImpl(it, allowOps):
+            result = false
+            break
+          skip it
     else:
       result = false
   else:
     result = false
 
+proc isStaticValue*(n: Cursor): bool =
+  ## A canonical compile-time value as bound to a `staticTypevar`: a primitive
+  ## literal, a const/enum-field/value-typevar symbol, or a typed aggregate
+  ## constructor (array/set/tuple/object) whose elements are themselves static.
+  isConstantImpl(n, allowOps = false)
+
 proc staticValueType*(a: Cursor): Cursor =
   ## The type of a static value: a symbol's declared type or an aggregate
   ## constructor's leading type node.
   result = default(Cursor)
+  if not a.hasMore: return
   case a.kind
   of Symbol:
     let res = tryLoadSym(a.symId)
     if res.status == LacksNothing and isLocal(res.decl.symKind):
       result = asLocal(res.decl).typ
-  of ParLe:
+  of TagLit:
     case a.exprKind
     of AconstrX, SetconstrX, TupconstrX, OconstrX:
       var typ = a
@@ -103,7 +141,7 @@ proc staticOpenArrayElemType*(t: Cursor): Cursor =
   result = default(Cursor)
   var t = t
   var depth = 0
-  while t.kind == Symbol and depth < 20:
+  while t.isSymbol and depth < 20:
     let res = tryLoadSym(t.symId)
     if res.status != LacksNothing or res.decl.symKind != TypeY:
       return default(Cursor)
@@ -111,19 +149,19 @@ proc staticOpenArrayElemType*(t: Cursor): Cursor =
     if decl.typevars.typeKind == InvokeT:
       t = decl.typevars
       break
-    elif decl.body.kind == Symbol:
+    elif decl.body.isSymbol:
       t = decl.body
     else:
       return default(Cursor)
     inc depth
   if t.typeKind == InvokeT:
     inc t
-    if t.kind == Symbol and pool.syms[t.symId] == OpenArrayHeadName:
+    if t.isSymbol and pool.symString(t.symId) == OpenArrayHeadName:
       inc t
       result = t
   elif t.typeKind == VarargsT:
-    inc t
-    if t.kind != ParRi:
+    t = sub(t)
+    if t.hasMore:
       result = t
 
 proc staticValueTypeMatches*(elemType, valueType: Cursor): bool =
@@ -134,12 +172,12 @@ proc staticValueTypeMatches*(elemType, valueType: Cursor): bool =
     return false
   if sameTrees(elemType, valueType):
     return true
-  if elemType.kind == Symbol and valueType.kind == Symbol:
+  if elemType.isSymbol and valueType.isSymbol:
     return sameStaticSymbol(elemType.symId, valueType.symId)
   if elemType.typeKind == VarargsT and valueType.typeKind == ArrayT:
     var elem = elemType
-    inc elem
-    if elem.kind == ParRi:
+    elem = sub(elem)
+    if not elem.hasMore:
       return true
     var arrElem = valueType
     inc arrElem
@@ -150,3 +188,12 @@ proc staticValueTypeMatches*(elemType, valueType: Cursor): bool =
     inc arrElem
     return sameTrees(openArrayElem, arrElem)
   false
+
+proc isConstantArg*(n: Cursor): bool =
+  ## Tier-1 constant expression, the argument restriction of a `staticParam`:
+  ## literals, `const` / enum field / `staticParam` / `staticTypevar`
+  ## references, the fixed primitive opcode set (`+ - *`, unary `-` and the
+  ## comparisons), conversions of such values and aggregate constructors over
+  ## them. Anything else would need general CTFE, which is never implicit: such
+  ## an argument must be written `static(expr)` at the call site.
+  isConstantImpl(n, allowOps = true)

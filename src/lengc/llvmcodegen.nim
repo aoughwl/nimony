@@ -11,7 +11,12 @@
 # serializer (llvmserializer.nim) renders to .ll text. All LLVM syntax
 # knowledge lives in the serializer.
 
-import std / [assertions, syncio, sets, formatfloat, packedsets,
+when defined(nimony):
+  # See llvmirmodel.nim: a nil `LLType` means "no type here"; the generators
+  # (all `include`d into this module) rely on that throughout.
+  {.feature: "lenientnils".}
+
+import std / [assertions, syncio, sets, formatfloat,
     strutils, sequtils, tables]
 from std / os import changeFileExt, splitFile, extractFilename, fileExists,
     getCurrentDir, absolutePath
@@ -56,6 +61,9 @@ type
     subprogramId*: int
     subprogramFileId*: int
     retainedNodes*: seq[int]
+    frameStack*: seq[CrucialOrigin] # active template expansions, outermost first;
+                                    # pushed when the walk enters a node whose
+                                    # head info carries a forged filename
 
   DebugInfo* = object
     nextMetadataId*: int
@@ -66,6 +74,9 @@ type
     diBasicTypeCache*: Table[string, int] # "i32"/"float"/… -> DIBasicType id
     compositeTypeDone*: HashSet[SymId]    # symIds with fully built DICompositeType
     globalExprs*: seq[int] # DIGlobalVariableExpression IDs for DICompileUnit globals
+    fileIdsByName*: Table[string, int]  # source path -> DIFile meta
+    inlineSpCache*: Table[string, int] # expanded routine (mangled) -> spId
+    nullSigId*: int # shared `!DISubroutineType(types: !{null})` for template SPs
 
 type
   PrimTypes* = object
@@ -89,6 +100,7 @@ type
     debug*: DebugInfo
 
 proc initPrimTypes*(): PrimTypes =
+  result = default(PrimTypes)
   result.voidT = newLLVoidType()
   result.i1 = newLLIntType(1)
   result.i8 = newLLIntType(8)
@@ -113,10 +125,26 @@ proc llIntBits*(c: LLVMCode; n: int): LLType =
   of 64: c.prim.i64
   else: newLLIntType(n)
 
+proc errorAt(m: MainModule; msg: string; n: Cursor) {.noreturn.} =
+  ## `error` without the trailing render of `n`, for a message that already names
+  ## what is wrong in prose (the render would append the raw mangled symbol).
+  let info = rawLineInfo(n)
+  if info.isValid:
+    write stdout, realFile(m.pool.filenames[info.file])
+    write stdout, "(" & $info.line & ", " & $(info.col+1) & ") "
+  # `Error: `, not the `[Error] ` of the rendering `error` above: this is a
+  # user-facing diagnostic, and that is the spelling every other user-facing
+  # nimony error uses (the test harness keys the expected exit code off it).
+  write stdout, "Error: "
+  writeLine stdout, msg
+  when defined(debug):
+    echo getStackTrace()
+  quit 1
+
 proc error(m: MainModule; msg: string; n: Cursor) {.noreturn.} =
   let info = rawLineInfo(n)
   if info.isValid:
-    write stdout, m.pool.filenames[info.file]
+    write stdout, realFile(m.pool.filenames[info.file])
     write stdout, "(" & $info.line & ", " & $(info.col+1) & ") "
   write stdout, "[Error] "
   write stdout, msg
@@ -125,10 +153,60 @@ proc error(m: MainModule; msg: string; n: Cursor) {.noreturn.} =
     echo getStackTrace()
   quit 1
 
+# `strutils.parseInt` and `os.absolutePath` are `.raises` (ValueError) under
+# Nimony. Their inputs here come from the front end (digit strings) and from the
+# file table, so a failure is an internal error -- catch it locally instead of
+# spreading `raises` through the whole generator (see doc/porting.md).
+
+proc parseIntOrQuit(s: string): int =
+  result = 0
+  try:
+    result = parseInt(s)
+  except:
+    quit "lengc: expected an integer literal but got: '" & s & "'"
+
+proc absoluteDirOrQuit(dir: string): string =
+  ## Absolute spelling of `dir`, the current directory for an empty one. Both
+  ## `getCurrentDir` and `absolutePath` (whose `root` default calls it) raise.
+  result = ""
+  try:
+    result = if dir == "": getCurrentDir() else: absolutePath(dir)
+  except:
+    quit "lengc: cannot resolve the absolute path of: '" & dir & "'"
+
 # ---- Block / emission helpers ----
 
 proc dbgLocation(c: var LLVMCode; info: NifLineInfo): string
 
+proc pushExpansionFrames(c: var LLVMCode; info: NifLineInfo): int =
+  ## Enter the template expansions named by `info`'s filename, if it is a
+  ## forged one, and return how many levels were pushed so the caller can pop
+  ## exactly that many. Zero for ordinary code, which is the common case.
+  ##
+  ## The frame is a property of a *region* of the tree, not of one token: the
+  ## front end marks only the head of an expansion (see
+  ## `templates.forgeExpansionInfo`), and everything the walk reaches while
+  ## that head is open belongs to the same expansion. Instructions lowered
+  ## from inside it therefore get the frame even though their own tokens carry
+  ## plain line info.
+  result = 0
+  if not info.isValid or not info.file.isValid: return
+  let fname = c.m.pool.filenames[info.file]
+  if not isCrucialFile(fname): return
+  for origin in crucialOrigins(fname):
+    c.currentProc.frameStack.add origin
+    inc result
+
+proc popExpansionFrames(c: var LLVMCode; n: int) {.inline.} =
+  for i in 0 ..< n: discard c.currentProc.frameStack.pop()
+
+template withExpansionFrames(c: var LLVMCode; info: NifLineInfo; body: untyped) =
+  ## Run `body` with `info`'s expansion frames active. The pop is unconditional
+  ## rather than in a `finally`: the generator quits the process on error, so
+  ## there is no unwinding path to protect against.
+  let pushed = pushExpansionFrames(c, info)
+  body
+  popExpansionFrames(c, pushed)
 
 proc funcByIndex(c: var LLVMCode; idx: int): var LLFunc {.inline.} =
   if idx == InitFuncIdx:
@@ -211,7 +289,7 @@ proc llIntTextC*(text: string; typ: LLType): LLValue {.inline.} =
 proc typeEq*(a, b: LLType): bool {.inline.} =
   ## Structural type equality. Fast path on pointer identity for interned types.
   if system.`==`(a, b): return true
-  if a.isNil or b.isNil: return false
+  if a == nil or b == nil: return false
   serialize(a) == serialize(b)
 
 proc withType*(v: LLValue; typ: LLType): LLValue {.inline.} =
@@ -220,6 +298,7 @@ proc withType*(v: LLValue; typ: LLType): LLValue {.inline.} =
 
 proc disp*(v: LLValue): string {.inline.} =
   ## Display text of a value (for building callee names / signatures).
+  result = ""
   serializeUnqualified(v, result)
 
 proc mangleSym(c: var LLVMCode; s: SymId): string =
@@ -229,16 +308,14 @@ proc mangleSym(c: var LLVMCode; s: SymId): string =
   if x != nil and x.extern != StrId(0):
     result = c.m.pool.strings[x.extern]
   else:
-    result = mangleToC(c.m.pool.syms[s])
+    result = mangleToC(c.m.pool.symString(s))
 
 proc nifSymBaseName*(c: var LLVMCode; symId: SymId): string =
   ## Extract the original Nim identifier from a NIF symbol like
   ## ``myVar.0.module`` → ``myVar``.
-  let full = c.m.pool.syms[symId]
-  var isGlobal = false
-  result = extractBasename(full, isGlobal)
+  result = c.m.pool.symBasename(symId)
   if result.len == 0:
-    result = full
+    result = c.m.pool.symString(symId)
 
 # ---- Pragma / type helpers ----
 
@@ -291,7 +368,9 @@ proc baseTypeOfObject*(m: var MainModule; objBody: Cursor): Cursor =
 # ---- Forward declarations (visible to included files) ----
 
 proc genStmtLLVM(c: var LLVMCode; n: var Cursor)
+proc genStmtBodyLLVM(c: var LLVMCode; n: var Cursor)
 proc genExprLLVM(c: var LLVMCode; n: var Cursor; result: var LLValue)
+proc genExprBodyLLVM(c: var LLVMCode; n: var Cursor; result: var LLValue)
 proc genLvalueLLVM(c: var LLVMCode; n: var Cursor; result: var LLValue)
 proc genCondLLVM(c: var LLVMCode; n: var Cursor; result: var LLValue)
 proc genOnErrorLLVM(c: var LLVMCode; n: var Cursor)
@@ -301,14 +380,19 @@ proc genDITypeReadOnly(c: var LLVMCode; n: Cursor): int
 proc genGlobalConstr(c: var LLVMCode; n: var Cursor;
     declaredType: Cursor): LLValue
 proc coerceValueLLVM(c: var LLVMCode; val: LLValue; srcTypeCursor, destTypeCursor: Cursor;
-                     isCast: bool; result: var LLValue)
+                     result: var LLValue)
 proc genCallWithType(c: var LLVMCode; n: var Cursor; retType: LLType;
     result: var LLValue)
 proc genCallExprLLVM(c: var LLVMCode; n: var Cursor; result: var LLValue)
 
-proc llFloatHexText(f: float): string {.inline.} =
+proc llFloatHexText(f: float): string =
   # LLVM float literal as hex: `0x` + IEEE-754 bits — exact, avoids the decimal-point rule.
-  "0x" & toHex(cast[uint64](f), 16)
+  # Spelled out rather than via `strutils.toHex`, which Nimony does not have.
+  const HexChars = "0123456789ABCDEF"
+  let bits = cast[uint64](f)
+  result = "0x"
+  for i in countdown(15, 0):
+    result.add HexChars[int((bits shr (i*4)) and 0xF'u64)]
 
 # ---- Type generation ----
 
@@ -423,13 +507,15 @@ proc genGlobalVarDeclLLVM(c: var LLVMCode; n: var Cursor; vk: VarKindLLVM;
           idx = i
           break
       if idx >= 0:
+        # In C these are predefined macros, so there is no symbol at all.
+        # But if we made it public, we would get duplicate symbols, so it's private.
         c.module.globals.add LLGlobal(name: extName, typ: typ,
-            initVal: llIntText($idx, typ), isConstant: true)
+            initVal: llIntText($idx, typ), isConstant: true, isPrivate: true)
       skip d.value
       return
 
     let name = if externName != StrId(0): c.m.pool.strings[externName]
-               else: mangleToC(c.m.pool.syms[lit])
+               else: mangleToC(c.m.pool.symString(lit))
 
     var t = d.typ
     let typ = genTypeLLVM(c, t)
@@ -444,8 +530,8 @@ proc genGlobalVarDeclLLVM(c: var LLVMCode; n: var Cursor; vk: VarKindLLVM;
       c.module.globals.add g
     else:
       # Module-private constants (plain `const`, string literals) hide their
-      # global; exportc/importc keep external linkage.
-      let isPriv = vk == IsConst and externName == StrId(0)
+      # global; exportc/importc/template keep external linkage.
+      let isPriv = vk == IsConst and externName == StrId(0) and not c.inToplevel
       if d.value.kind != DotToken:
         var v = d.value
         let initVal = genGlobalConstr(c, v, d.typ)
@@ -499,7 +585,9 @@ proc genLocalVarDeclLLVM(c: var LLVMCode; n: var Cursor) =
         if onErrAction.kind != DotToken:
           genOnErrorLLVM(c, onErrAction)
       else:
+        let srcType = getType(c.m, d.value)
         var val = LLValue(); genExprLLVM(c, d.value, val)
+        coerceInPlace(c, val, srcType, d.typ)
         c.setLoc(varInfo)
         c.emit LLInstr(kind: llStore, storeValue: val,
                        storePtr: llReg(name, c.prim.ptrT))
@@ -542,6 +630,17 @@ proc parseProcPragmasLLVM(c: var LLVMCode; n: var Cursor): PragmaInfo =
       of NodeclP:
         result.flags.incl NodeclP
         skip n
+      of DynlibP:
+        # Static-import library annotation for the NATIVE backend (arkham);
+        # meaningless for LLVM output — the linker resolves the symbol.
+        skip n
+      of ConstrefP:
+        # A PARAMETER pragma; never legal on a proc.
+        error c.m, "invalid proc pragma: ", n
+      of ImportjsP:
+        # As in codegen.parseProcPragmas: the splice template is jorogumo's
+        # question, and there is nothing to lower it to here.
+        errorAt c.m, "importjs is a JS-backend pragma and has no LLVM lowering", n
       of ImportcppP, ImportcP, ExportcP:
         n.into:
           if n.kind == StrLit:
@@ -559,6 +658,20 @@ proc parseProcPragmasLLVM(c: var LLVMCode; n: var Cursor): PragmaInfo =
       of SelectanyP:
         result.flags.incl pk
         skip n
+      of InstructionP, IntrinsicP:
+        # An intrinsic declares a machine instruction, not a callable: there is
+        # nothing to emit for the declaration itself.
+        result.flags.incl pk
+        skip n
+      of InterruptP:
+        # No interrupt table here either; see the C backend's `parseProcPragmas`.
+        result.flags.incl pk
+        skip n
+      of AssemblerP, NakedP, RegisterP, StackP:
+        # `{.assembler.}` bodies are arkham's; the location pins are assertions
+        # inside one. See the C backend's `parseProcPragmas` for the reasoning.
+        result.flags.incl pk
+        skip n
       of WasP:
         n.into:
           result.wasName = toString(n, false)
@@ -568,7 +681,7 @@ proc parseProcPragmasLLVM(c: var LLVMCode; n: var Cursor): PragmaInfo =
       of InlineP:
         result.flags.incl pk
         skip n
-      of NoinlineP:
+      of AlwaysInlineP, NoinlineP:
         result.flags.incl pk
         skip n
       of AttrP:
@@ -586,10 +699,9 @@ proc genSymDefLLVM(c: var LLVMCode; n: Cursor; prag: PragmaInfo): string =
       if prag.extern != StrId(0):
         result = c.m.pool.strings[prag.extern]
       else:
-        result = c.m.pool.syms[lit]
-        extractBasename(result)
+        result = c.m.pool.symBasename(lit)
     else:
-      result = mangleToC(c.m.pool.syms[lit])
+      result = mangleToC(c.m.pool.symString(lit))
   else:
     result = ""
     error c.m, "expected SymbolDef but got: ", n
@@ -601,6 +713,11 @@ proc genParamPragmasLLVM(c: var LLVMCode; n: var Cursor) =
     n.loopInto:
       case n.pragmaKind
       of AttrP, WasP:
+        skip n
+      of ConstrefP:
+        # Provenance only (see `doc/tags.md`): the pointer stands for a
+        # by-value source parameter. Nothing to emit — it exists for
+        # `funcsummary`/the optimizer.
         skip n
       else:
         error c.m, "invalid pragma: ", n
@@ -619,6 +736,34 @@ proc genProcDeclLLVM(c: var LLVMCode; n: var Cursor; isExtern: bool) =
   let procInfo = n.info
   var prc = takeProcDecl(n)
   let prag = parseProcPragmasLLVM(c, prc.pragmas)
+  if prag.flags * {InstructionP, IntrinsicP} != {}:
+    # An intrinsic declares an instruction, not a callable: there is nothing to
+    # emit for the declaration itself, and its body slot is empty. Falling
+    # through would build an `LLFunc` with an entry block and no terminator —
+    # invalid IR. The C backend has the same guard in `genProcDecl`.
+    c.m.closeScope()
+    c.inToplevel = true
+    c.currentProc = oldProc
+    c.currentBlockIdx = oldBlock
+    return
+  if prag.flags * {AssemblerP, NakedP} != {}:
+    # Same reasoning as the C backend (see its `genProcDecl`): an `{.assembler.}`
+    # body names machine registers and promises a one-to-one instruction mapping,
+    # which no IR-level backend can honour. Refuse it by name instead of emitting
+    # a body that silently means something else.
+    errorAt c.m, "the LLVM backend cannot compile an `{.assembler.}` proc; it must " &
+      "be assembled by arkham and linked as an object (see doc/asm-c-interop.md)",
+      prc.name
+  if InterruptP in prag.flags:
+    errorAt c.m, "the LLVM backend has no interrupt table to install an " &
+      "`{.interrupt.}` handler in; use `{.exportc: \"...\".}` to bind one by name " &
+      "against a startup file, or compile it with arkham",
+      prc.name
+  if {ImportcP, ImportcppP} * prag.flags != {} and InlineP notin prag.flags and
+      prc.body.kind != DotToken:
+    # The back end emits only a declaration for an imported proc; a body here
+    # is a hexer bug, not something to drop silently.
+    errorAt c.m, "BUG: imported proc reached Leng with a body", prc.name
 
   let name = genSymDefLLVM(c, prc.name, prag)
 
@@ -647,7 +792,7 @@ proc genProcDeclLLVM(c: var LLVMCode; n: var Cursor; isExtern: bool) =
         let paramType = genTypeLLVM(c, t)
         if d.typ.typeKind != VarargsT:
           paramTypes.add paramType
-          let paramName = mangleToC(c.m.pool.syms[s])
+          let paramName = mangleToC(c.m.pool.symString(s))
           paramNames.add paramName
           paramWasNames.add extractWasPragma(d.pragmas)
           paramSyms.add s
@@ -705,7 +850,8 @@ proc genProcDeclLLVM(c: var LLVMCode; n: var Cursor; isExtern: bool) =
     # Generate body
     genStmtLLVM c, prc.body
 
-    finalizeSubprogram(c, spId, paramDITypes, c.currentProc.retainedNodes)
+    let retainedNodes = c.currentProc.retainedNodes
+    finalizeSubprogram(c, spId, paramDITypes, retainedNodes)
 
     if not c.currentProc.needsTerminator:
       if prc.returnType.kind == DotToken:
@@ -832,9 +978,7 @@ proc generateLLVMCode*(s: var State; inp, outp: string; flags: set[LLVMGenFlag])
 
   let llText = serializeModule(c.module)
 
-  if vfsExists(outp) and vfsRead(outp) == llText:
-    discard "unchanged, keep mtime for incremental builds"
-  else:
-    vfsWrite outp, llText
+  # Always written, as the C backend's `.c` (doc/internals/ic.md).
+  vfsWrite outp, llText
 
   c.m.closeScope()

@@ -9,6 +9,11 @@
 import std / [memfiles, parseutils, assertions]
 import stringviews
 import vfs
+import nifcore  # the ONE token-kind enum, shared with the binary token model
+export NifKind
+
+const StringLit* = StrLit
+  ## The reader's traditional name for the string-literal token kind.
 when defined(nimony):
   import std/syncio
 
@@ -19,25 +24,31 @@ const
   ControlCharsOrWhite = ControlChars + {' ', '\n', '\t', '\r'}
   HexChars = {'0'..'9', 'A'..'F'} # lowercase letters are not in the NIF spec!
   Digits = {'0'..'9'}
+  HexNumberDigits = {'0'..'9', 'A'..'F', 'a'..'f'} # unlike escapes, numbers accept both cases
   B62Digits = {'0'..'9', 'A'..'Z', 'a'..'z'}
 
 type
-  NifKind* = enum
-    UnknownToken, EofToken,
-    DotToken, Ident, Symbol, SymbolDef,
-    StringLit, CharLit, IntLit, UIntLit, FloatLit,
-    ParLe, ParRi
-
   FilePos* = object
     col*, line*: int32
 
+  SymbolPart* = enum
+    ## Which component of a split symbol an `ExtendedSuffix` token carries.
+    ## A NIF symbol is `<name>.<disamb>[.<dedup>].<module>` (`<module>` is
+    ## absent for a local symbol), so these are exactly the fields of the
+    ## symbol object the compiler wants instead of a string.
+    SymDisamb   ## the `12` of `abc.12.Ikey.mod`
+    SymDedup    ## the `Ikey`: the key a generic instantiation is deduplicated by
+    SymModule   ## the `mod`: the module suffix
+
   TokenFlag = enum
     TokenHasEscapes, FilenameHasEscapes, TokenHasModuleSuffixExpansion,
-    CommentHasEscapes
+    CommentHasEscapes, NumberHasBasePrefix
 
   ExpandedToken* = object
     tk*: NifKind
     flags: set[TokenFlag]
+    part*: SymbolPart ## for `ExtendedSuffix`: which component of the preceding symbol this is
+    suffixes*: uint8  ## for `Symbol`/`SymbolDef`: how many `ExtendedSuffix` tokens follow
     kind*: uint16   # for clients to fill in ("known node kinds")
     data*: StringView
     pos*: FilePos
@@ -53,6 +64,20 @@ type
     line*: int32 # file position within the NIF file, not affected by line annotations
     indexAt: int  # position of the index
     unusedNameHint: ExpandedToken
+    splitSyms: bool
+    # The components of the symbol that was returned last, minus its name, and
+    # minus the components already handed out. `pendingTotal` is what the head
+    # token announced in `suffixes`; `pendingLeft` counts down to zero.
+    pending: StringView
+    pendingLeft, pendingTotal: int32
+    pendingFlags: set[TokenFlag]
+    pendingHasDisamb, pendingHasModule: bool
+    # The optional line-based syntax (see `open`). `depth` counts the open `(`
+    # of the current top-level node; `inLineNode` is true while that node is a
+    # `LineNode`, whose `)` is the newline that ends it.
+    lineBased: bool
+    inLineNode: bool
+    depth: int32
 
 proc `$`*(t: ExpandedToken): string =
   case t.tk
@@ -64,6 +89,12 @@ proc `$`*(t: ExpandedToken): string =
   of Ident, Symbol, SymbolDef,
      StringLit, CharLit, IntLit, UIntLit, FloatLit:
     result = $t.tk & ":" & $t.data
+  of ExtendedSuffix:
+    # a symbol component, in split mode; see `splitSymbols`
+    result = $t.part & ":" & $t.data
+  of TagLit, LineInfoLit:
+    # binary-only kinds; the textual reader never produces them
+    result = "<" & $t.tk & ">"
 
 template inc(p: pchar; diff = 1) =
   p = cast[pchar](cast[int](p) + diff)
@@ -148,13 +179,18 @@ proc handleHex(p: pchar): char =
   else: discard
   result = char(output)
 
-proc decodeEscape(p: var pchar): char {.inline.} =
+proc decodeEscape(p: var pchar; sentinel: pchar): char {.inline.} =
   ## Decode a single NIF27 escape body. Caller has already advanced past the
   ## leading `\`. On return, `p` points just past the escape (advanced by 1
   ## for a shortcut, 2 for a hex pair). The shortcut bodies (`n`, `t`, `r`,
   ## `|`, `^`) are deliberately chosen so that none of them is a hex digit
   ## or a NIF control character, which lets a one-byte look-ahead pick the
   ## form unambiguously.
+  ##
+  ## The body never extends past `sentinel` (the end of the token): a token
+  ## that ends in a `\` or in `\H` keeps the backslash literally and `p`
+  ## stays put, so the remaining byte, if any, decodes as an ordinary one.
+  if p >= sentinel: return '\\'
   case ^p
   of 'n': result = '\x0A'; inc p
   of 't': result = '\x09'; inc p
@@ -162,8 +198,11 @@ proc decodeEscape(p: var pchar): char {.inline.} =
   of '|': result = '\x5C'; inc p
   of '^': result = '\x22'; inc p
   else:
-    result = handleHex(p)
-    inc p, 2
+    if p +! 1 < sentinel:
+      result = handleHex(p)
+      inc p, 2
+    else:
+      result = '\\'
 
 proc decodeChar*(t: ExpandedToken): char =
   assert t.tk == CharLit
@@ -171,7 +210,8 @@ proc decodeChar*(t: ExpandedToken): char =
   if result == '\\':
     var p = t.data.p
     inc p
-    result = decodeEscape(p)
+    # the lexer only accepts `'\HH'` as an escaped CharLit
+    result = decodeEscape(p, p +! 2)
 
 proc decodeStr*(r: Reader; t: ExpandedToken): string =
   if TokenHasEscapes in t.flags:
@@ -181,7 +221,7 @@ proc decodeStr*(r: Reader; t: ExpandedToken): string =
     while p < sentinel:
       if ^p == '\\':
         inc p
-        result.add decodeEscape(p)
+        result.add decodeEscape(p, sentinel)
       else:
         result.add ^p
         inc p
@@ -194,13 +234,23 @@ proc decodeStr*(r: Reader; t: ExpandedToken): string =
     result = newString(t.data.len + r.thisModule.len)
     if t.data.len > 0:
       copyMem(beginStore(result, result.len), t.data.p, t.data.len)
-      copyMem(beginStore(result, result.len, t.data.len), r.thisModule.readRawData, r.thisModule.len)
-      endStore(result)
+    # The module suffix is copied even when there is nothing before it: in the
+    # reader's split-symbol mode the expanding component is the module and
+    # nothing else, so its `data` is empty.
+    copyMem(beginStore(result, result.len, t.data.len), r.thisModule.readRawData, r.thisModule.len)
+    endStore(result)
   else:
     result = newString(t.data.len)
     if t.data.len > 0:
       copyMem(beginStore(result, result.len), t.data.p, t.data.len)
       endStore(result)
+
+proc needsDecoding*(t: ExpandedToken): bool {.inline.} =
+  ## Whether `decodeStr` would do anything but copy `t.data`: an escape to
+  ## expand, or a module suffix to append. When it is false the bytes ARE the
+  ## value, so a client that interns them (`getOrInclFromView`) can skip
+  ## building a string at all.
+  TokenHasEscapes in t.flags or TokenHasModuleSuffixExpansion in t.flags
 
 proc decodeComment*(t: ExpandedToken): string =
   ## Decode the captured `#…#` comment, expanding `\HH` escapes. Returns "" if
@@ -218,7 +268,7 @@ proc decodeComment*(t: ExpandedToken): string =
   while p < sentinel:
     if ^p == '\\':
       inc p
-      result.add decodeEscape(p)
+      result.add decodeEscape(p, sentinel)
     else:
       result.add ^p
       inc p
@@ -231,7 +281,7 @@ proc decodeFilename*(t: ExpandedToken): string =
     while p < sentinel:
       if ^p == '\\':
         inc p
-        result.add decodeEscape(p)
+        result.add decodeEscape(p, sentinel)
       else:
         result.add ^p
         inc p
@@ -240,41 +290,133 @@ proc decodeFilename*(t: ExpandedToken): string =
     copyMem(beginStore(result, result.len), t.filename.p, t.filename.len)
     endStore(result)
 
+proc digitValue(c: char): int {.inline.} =
+  case c
+  of '0'..'9': result = ord(c) - ord('0')
+  of 'A'..'F': result = ord(c) - ord('A') + 10
+  of 'a'..'f': result = ord(c) - ord('a') + 10
+  else: result = 0
+
+proc decodeMagnitude(t: ExpandedToken; negative: var bool): BiggestUInt =
+  ## Decodes an integer that has a `0x`, `0o` or `0b` prefix. The lexer
+  ## only produces well-formed spellings, so no validation happens here.
+  ## Overflow of the 64 bit range is an assertion failure, as it is for the
+  ## decimal fast path.
+  result = 0
+  var i = 0
+  negative = false
+  if t.data[i] == '-':
+    negative = true
+    inc i
+  var base = 10'u64
+  if i+1 < t.data.len and t.data[i] == '0':
+    case t.data[i+1]
+    of 'x': base = 16; inc i, 2
+    of 'o': base = 8; inc i, 2
+    of 'b': base = 2; inc i, 2
+    else: discard
+  while i < t.data.len:
+    let c = t.data[i]
+    if c != '_':
+      let d = BiggestUInt(digitValue(c))
+      assert result <= (high(BiggestUInt) - d) div base, "integer literal out of range"
+      result = result * base + d
+    inc i
+
 proc decodeFloat*(t: ExpandedToken): BiggestFloat =
   result = 0.0
   assert t.tk == FloatLit
+  # `_` separators are skipped by `parseutils` itself
   let res = parseutils.parseBiggestFloat(toOpenArray(t.data.p, 0, t.data.len-1), result)
   assert res == t.data.len
 
 proc decodeUInt*(t: ExpandedToken): BiggestUInt =
   result = 0
   assert t.tk == UIntLit
-  let res = parseutils.parseBiggestUInt(toOpenArray(t.data.p, 0, t.data.len-1), result)
-  assert res == t.data.len
+  if NumberHasBasePrefix in t.flags:
+    var negative = false
+    result = decodeMagnitude(t, negative)
+    assert not negative or result == 0, "negative unsigned integer literal"
+  else:
+    let res = parseutils.parseBiggestUInt(toOpenArray(t.data.p, 0, t.data.len-1), result)
+    assert res == t.data.len
 
 proc decodeInt*(t: ExpandedToken): BiggestInt =
   result = 0
   assert t.tk == IntLit
-  let res = parseutils.parseBiggestInt(toOpenArray(t.data.p, 0, t.data.len-1), result)
-  assert res == t.data.len
+  if NumberHasBasePrefix in t.flags:
+    var negative = false
+    let m = decodeMagnitude(t, negative)
+    if negative:
+      assert m <= BiggestUInt(high(BiggestInt)) + 1, "integer literal out of range"
+      result = cast[BiggestInt](0'u64 - m)
+    else:
+      assert m <= BiggestUInt(high(BiggestInt)), "integer literal out of range"
+      result = BiggestInt(m)
+  else:
+    let res = parseutils.parseBiggestInt(toOpenArray(t.data.p, 0, t.data.len-1), result)
+    assert res == t.data.len
+
+proc decodeDisamb*(t: ExpandedToken): int =
+  ## The value of a `SymDisamb` component: `abc.12.mod` gives 12. Only the
+  ## leading digits are read (a well-formed symbol has nothing else there).
+  assert t.tk == ExtendedSuffix and t.part == SymDisamb
+  result = 0
+  var i = 0
+  while i < t.data.len and t.data[i] in Digits:
+    result = result * 10 + (ord(t.data[i]) - ord('0'))
+    inc i
+
+proc digitsWithSeparators(p: var pchar; eof: pointer; len: var int;
+                          digitSet: set[char]): bool {.inline.} =
+  ## Consumes `D ('_'? D)*`; false if there is no leading digit or a `_` is
+  ## not followed by a digit.
+  result = p < eof and ^p in digitSet
+  while result and p < eof:
+    if ^p in digitSet:
+      inc p
+      inc len
+    elif ^p == '_':
+      inc p
+      inc len
+      if p >= eof or ^p notin digitSet:
+        result = false
+    else:
+      break
+
+template malformedNumber(p: var pchar; eof: pointer; result: var ExpandedToken) =
+  # consume the rest of the malformed number so it is one error token
+  while p < eof and ^p notin ControlCharsOrWhite:
+    inc p
+    inc result.data.len
+  result.tk = UnknownToken
+
+template unsignedSuffix(p: var pchar; eof: pointer; result: var ExpandedToken) =
+  if p < eof and ^p == 'u':
+    result.tk = UIntLit
+    inc p
+    # ignore the suffix 'u'
+
+template hasBasePrefix(p: pchar; eof: pointer): bool =
+  ## `p` starts `0x`, `0o` or `0b`; see `handlePrefixedNumber`.
+  ^p == '0' and p +! 1 < eof and ^(p +! 1) in {'x', 'o', 'b'}
 
 proc handleNumber(r: var Reader; result: var ExpandedToken) =
+  ## Scans a decimal number atom; `_` may separate two digits. A malformed
+  ## spelling (`1_`, `1__2`, `1._0`, ...) is consumed and reported as
+  ## `UnknownToken`. Base-prefixed integers are `handlePrefixedNumber`'s.
   useCpuRegisters:
     if p < eof and ^p in Digits:
       result.tk = IntLit # overwritten if we detect a float or unsigned
-      while p < eof and ^p in Digits:
-        inc p
-        inc result.data.len
+      var ok = digitsWithSeparators(p, eof, result.data.len, Digits)
 
-      if p < eof and ^p == '.':
+      if ok and p < eof and ^p == '.':
         result.tk = FloatLit
         inc p
         inc result.data.len
-        while p < eof and ^p in Digits:
-          inc p
-          inc result.data.len
+        ok = digitsWithSeparators(p, eof, result.data.len, Digits)
 
-      if p < eof and ^p == 'E':
+      if ok and p < eof and ^p == 'E':
         result.tk = FloatLit
         inc p
         inc result.data.len
@@ -282,14 +424,40 @@ proc handleNumber(r: var Reader; result: var ExpandedToken) =
           if ^p == '-' or ^p == '+':
             inc p
             inc result.data.len
-        while p < eof and ^p in Digits:
-          inc p
-          inc result.data.len
+        ok = digitsWithSeparators(p, eof, result.data.len, Digits)
 
-      if p < eof and ^p == 'u':
-        result.tk = UIntLit
-        inc p
-        # ignore the suffix 'u'
+      if not ok:
+        malformedNumber(p, eof, result)
+      elif result.tk == IntLit:
+        unsignedSuffix(p, eof, result)
+
+proc handlePrefixedNumber(r: var Reader; result: var ExpandedToken) =
+  ## Scans an integer with a `0x`, `0o` or `0b` prefix; the caller has checked
+  ## `hasBasePrefix`. A prefix without digits (`0x`) or a decimal digit outside
+  ## the base (`0b102`) makes the whole spelling an `UnknownToken`.
+  useCpuRegisters:
+    result.tk = IntLit
+    result.flags.incl NumberHasBasePrefix
+    var ok = false
+    case ^(p +! 1)
+    of 'x':
+      inc p, 2
+      inc result.data.len, 2
+      ok = digitsWithSeparators(p, eof, result.data.len, HexNumberDigits)
+    of 'o':
+      inc p, 2
+      inc result.data.len, 2
+      ok = digitsWithSeparators(p, eof, result.data.len, {'0'..'7'})
+    else:
+      inc p, 2
+      inc result.data.len, 2
+      ok = digitsWithSeparators(p, eof, result.data.len, {'0', '1'})
+    if ok and p < eof and ^p in Digits: ok = false
+
+    if not ok:
+      malformedNumber(p, eof, result)
+    else:
+      unsignedSuffix(p, eof, result)
 
 proc decodeB62(c: char): int {.inline.} =
   ## Decode a single base62 digit (0-9, A-Z, a-z) to its numeric value 0..61.
@@ -375,9 +543,231 @@ proc handleSuffix(r: var Reader; result: var ExpandedToken) {.inline.} =
     inc r.p           # consume the opening '#'
     captureComment r, result   # consumes through the closing '#'
 
-proc next*(r: var Reader; result: var ExpandedToken) =
+proc splitSymbols*(r: var Reader; enable = true) {.inline.} =
+  ## Turn the split-symbol parsing mode on or off (default: off).
+  ##
+  ## A NIF symbol is not a string but an object: `<name>.<disamb>.<module>`,
+  ## or `<name>.<disamb>.<dedup>.<module>` for a generic instantiation, or
+  ## just `<name>.<disamb>` for a local symbol. Handing the whole thing to a
+  ## client as one string is what makes the rest of the compiler take it
+  ## apart again, over and over.
+  ##
+  ## In split mode the reader takes it apart ONCE, while it still has the
+  ## raw bytes: a `Symbol`/`SymbolDef` token carries only `<name>`, and its
+  ## `suffixes` field says how many `ExtendedSuffix` tokens follow — one per
+  ## remaining component, in order, each tagged with its `part`. So
+  ## `abc.12.Ikey.mod` arrives as
+  ##
+  ##   Symbol "abc" (suffixes: 3), SymDisamb "12", SymDedup "Ikey", SymModule "mod"
+  ##
+  ## `ExtendedSuffix` is the binary model's "more bits for the token before
+  ## me" kind; a symbol component is exactly that, so no new token kind is
+  ## needed and every existing `case` over `NifKind` still compiles.
+  ##
+  ## An atom with no dot to split on at all -- an operator definition such as
+  ## `[]=` -- is left whole: `suffixes` is 0 and the token is what it always
+  ## was. A symbol whose disambiguator is not a number (arkham's legacy
+  ## `_exit.sys.mod`) still yields its module; only the name/disambiguator
+  ## boundary needs the digit, so everything but the module is the name.
+  r.splitSyms = enable
+
+proc symbolsAreSplit*(r: Reader): bool {.inline.} = r.splitSyms
+
+proc hasEscapes(data: StringView; first, last: int): bool =
+  var i = first
+  while i <= last:
+    if data[i] == '\\': return true
+    inc i
+  result = false
+
+proc splitSymbol(r: var Reader; result: var ExpandedToken) =
+  ## Cut the just-lexed symbol into its `<name>` and the components that
+  ## follow it, which subsequent `next` calls hand out as `ExtendedSuffix`
+  ## tokens. `result.data` is shortened to the name.
+  ##
+  ## Same grammar as `nifcore.splitSpelling`, applied to the RAW bytes, where
+  ## an escaped dot (`\2E`) is still three bytes and so cannot be mistaken for
+  ## a separator: the module is the last dot-separated component unless it
+  ## STARTS with a digit (`p.0h107` is a local symbol, not one from a module
+  ## called `0h107`), and the name ends at the last `.` followed by a digit,
+  ## because a name may contain dots itself (`a.b.c.23`).
+  let origLen = result.data.len
+  var lastDot = -1
+  var k = 0
+  while k < origLen:
+    if result.data[k] == '.': lastDot = k
+    inc k
+
+  var head = origLen
+  var moduleStart = -1
+  if lastDot >= 0:
+    if lastDot+1 < origLen:
+      if result.data[lastDot+1] notin Digits:
+        moduleStart = lastDot+1
+        head = lastDot
+    else:
+      # a trailing dot is the "my own module" shorthand: the module is there,
+      # spelled as nothing at all
+      moduleStart = lastDot+1
+      head = lastDot
+
+  var i = head - 2
+  while i > 0:
+    if result.data[i] == '.' and result.data[i+1] in Digits: break
+    dec i
+
+  var start = 0
+  if i > 0:
+    r.pendingHasDisamb = true
+    start = i+1
+    result.data.len = i
+  elif moduleStart >= 0:
+    # no numeric disambiguator (`_exit.sys.mod`): everything but the module is
+    # the name, which is what `splitSymName` has always answered here
+    r.pendingHasDisamb = false
+    start = moduleStart
+    result.data.len = head
+  else:
+    return # not a symbol at all; leave it whole
+
+  r.pendingHasModule = moduleStart >= 0
+  # `result.data.len` is the name by now; the components run from `start` to the
+  # symbol's ORIGINAL end.
+  r.pending = StringView(p: result.data.p +! start, len: origLen - start)
+  var comps = 1'i32
+  for j in 0 ..< r.pending.len:
+    if r.pending[j] == '.': inc comps
+  r.pendingTotal = comps
+  r.pendingLeft = comps
+  r.pendingFlags = result.flags
+  result.suffixes = uint8(comps)
+  # The name keeps only the flags that are about the name: a trailing dot
+  # (module suffix expansion) belongs to the last component, and escapes
+  # only to the components that actually contain a backslash.
+  result.flags.excl TokenHasModuleSuffixExpansion
+  if TokenHasEscapes in result.flags and not hasEscapes(result.data, 0, result.data.len-1):
+    result.flags.excl TokenHasEscapes
+
+proc nextSymbolPart(r: var Reader; result: var ExpandedToken) =
+  ## Hand out the next component of the symbol returned earlier.
   result = default(ExpandedToken)
-  skipWhitespace r
+  result.tk = ExtendedSuffix
+  result.part =
+    if r.pendingLeft == r.pendingTotal and r.pendingHasDisamb: SymDisamb
+    elif r.pendingLeft == 1 and r.pendingHasModule: SymModule
+    else: SymDedup
+  var n = 0
+  while n < r.pending.len and r.pending[n] != '.': inc n
+  result.data = StringView(p: r.pending.p, len: n)
+  if TokenHasEscapes in r.pendingFlags and hasEscapes(result.data, 0, n-1):
+    result.flags.incl TokenHasEscapes
+  dec r.pendingLeft
+  if r.pendingLeft == 0:
+    # `abc.12.` means "the module I am being read from"; the empty last
+    # component is the one that expands to it.
+    if TokenHasModuleSuffixExpansion in r.pendingFlags:
+      result.flags.incl TokenHasModuleSuffixExpansion
+    r.pending = StringView(p: nil, len: 0)
+  else:
+    r.pending = StringView(p: r.pending.p +! (n+1), len: r.pending.len - (n+1))
+
+# ── Line-based syntax (optional NIF extension) ────────────────────────────
+#
+# A top-level line that does not start with `(` is read as `(tag arg1 ...)`,
+# and a number, identifier or symbol that continues with `-`, `/` or `:`
+# extends up to the next whitespace, parenthesis or suffix and is a string
+# literal instead. The reader produces the very same tokens as for the
+# parenthesized form: a `ParLe` for the tag and a `ParRi` (with empty `data`)
+# for the newline that ends the node.
+
+const
+  IdentStartChars = {'a'..'z', 'A'..'Z', '_', '\\', '\x80'..'\xFF'}
+  IdentChars = IdentStartChars + Digits
+  LineStrStart = {'-', '/', ':'}
+  LineStrEnd = {' ', '\t', '\n', '\r', '(', ')', '@', '~', '#'}
+  # where an identifier or symbol ends in line mode: `-` and `/` are no
+  # control characters, but they start a string
+  LineWordEnd = ControlCharsOrWhite + {'-', '/'}
+
+template continuesAsStr(r: Reader): bool =
+  ## Line mode: the number, identifier or symbol just read continues with
+  ## `-`, `/` or `:` and so is the start of a string literal.
+  r.lineBased and r.p < r.eof and ^r.p in LineStrStart
+
+proc lineStr(r: var Reader; result: var ExpandedToken) =
+  ## Extend the token that starts at `result.data.p` up to the next whitespace,
+  ## parenthesis or suffix (`@`, `~`, `#`) and turn it into a string literal.
+  useCpuRegisters:
+    while p < eof and ^p notin LineStrEnd:
+      if ^p == '\\': result.flags.incl TokenHasEscapes
+      inc p
+    result.data.len = p -! result.data.p
+  result.tk = StringLit
+  result.flags.excl TokenHasModuleSuffixExpansion
+  handleSuffix(r, result)
+
+proc lineHead(r: var Reader; result: var ExpandedToken) =
+  ## The `TagHead` that starts a `LineNode`. A line that does not start with
+  ## an identifier is surfaced as one `UnknownToken` spanning the rest of it.
+  useCpuRegisters:
+    result.data.p = p
+    if ^p in IdentStartChars:
+      while p < eof and ^p in IdentChars:
+        # an escape's body may be a shortcut such as `\|`
+        let n = if ^p == '\\' and p +! 1 < eof: 2 else: 1
+        inc result.data.len, n
+        inc p, n
+    if result.data.len > 0 and (p >= eof or ^p in ControlCharsOrWhite):
+      result.tk = ParLe
+    else:
+      while p < eof and ^p != '\n':
+        inc p
+      result.data.len = p -! result.data.p
+  if result.tk == ParLe:
+    r.inLineNode = true
+    handleSuffix(r, result)
+
+proc linePrelude(r: var Reader; tok: var ExpandedToken): bool =
+  ## The line-based syntax's part of `next`, run instead of skipping the
+  ## whitespace. Returns true when it produced the token itself; otherwise the
+  ## ordinary tokenizer takes over at `r.p`.
+  if r.inLineNode and r.depth == 0:
+    # the newline is significant here
+    useCpuRegisters:
+      while p < eof and ^p in {' ', '\t', '\r'}: inc p
+    if r.p >= r.eof or ^r.p == '\n':
+      # the `)` of the line node; the newline itself is skipped next time
+      tok.tk = ParRi
+      tok.data = StringView(p: r.p, len: 0)
+      r.inLineNode = false
+      return true
+  else:
+    skipWhitespace r
+    if r.p >= r.eof: return false
+  result = false
+  case ^r.p
+  of '(':
+    inc r.depth
+  of ')':
+    if r.depth > 0: dec r.depth
+  else:
+    if not r.inLineNode and r.depth == 0:
+      lineHead(r, tok)
+      result = true
+
+proc next*(r: var Reader; result: var ExpandedToken) =
+  if r.pendingLeft > 0:
+    nextSymbolPart(r, result)
+    return
+  result = default(ExpandedToken)
+  # In the unified NifKind, ordinal 0 is DotToken, not UnknownToken — the
+  # classification branches below rely on `tk` starting out as "unknown"
+  # (e.g. the char-literal branch leaves it untouched on a lex error).
+  result.tk = UnknownToken
+  if r.lineBased:
+    if linePrelude(r, result): return
+  else:
+    skipWhitespace r
   if r.p >= r.eof:
     result.tk = EofToken
     return
@@ -426,19 +816,23 @@ proc next*(r: var Reader; result: var ExpandedToken) =
   of '\'':
     inc r.p
     result.data.p = r.p
-    if ^r.p == '\\':
+    if r.p >= r.eof:
+      discard "keep it as UnknownToken"
+    elif ^r.p == '\\':
       result.flags.incl TokenHasEscapes
-      inc r.p
-      if r.p[0] in HexChars and r.p[1] in HexChars:
-        inc r.p, 2
+      # `\HH'` needs four more bytes
+      if r.p +! 3 < r.eof and r.p[1] in HexChars and r.p[2] in HexChars:
+        inc r.p, 3
         if ^r.p == '\'':
           inc r.p
           result.tk = CharLit # now valid
+      else:
+        inc r.p
     elif ^r.p in ControlChars:
       discard "keep it as UnknownToken"
     else:
       inc r.p
-      if ^r.p == '\'':
+      if r.p < r.eof and ^r.p == '\'':
         inc r.p
         result.tk = CharLit # only now valid
     if result.tk == CharLit:
@@ -456,6 +850,7 @@ proc next*(r: var Reader; result: var ExpandedToken) =
       result.tk = SymbolDef
       if result.data[result.data.len-1] == '.':
         result.flags.incl TokenHasModuleSuffixExpansion
+      if r.splitSyms: splitSymbol(r, result)
       handleSuffix(r, result)
 
   of '-':
@@ -463,32 +858,47 @@ proc next*(r: var Reader; result: var ExpandedToken) =
     result.data.p = r.p
     inc r.p
     inc result.data.len
-    handleNumber r, result
-    handleSuffix(r, result)
+    if r.p < r.eof and hasBasePrefix(r.p, r.eof): handlePrefixedNumber r, result
+    else: handleNumber r, result
+    if continuesAsStr(r): lineStr(r, result)
+    else: handleSuffix(r, result)
 
-  of '0'..'9':
+  of '0':
+    # The only digit that can start `0x`, `0o` or `0b`.
+    result.data.p = r.p
+    if hasBasePrefix(r.p, r.eof): handlePrefixedNumber r, result
+    else: handleNumber r, result
+    if continuesAsStr(r): lineStr(r, result)
+    else: handleSuffix(r, result)
+
+  of '1'..'9':
     # bare-digit number (NIF27): no sign prefix on positives.
-    useCpuRegisters:
-      result.data.p = p
-      result.data.len = 0
+    result.data.p = r.p
     handleNumber r, result
-    handleSuffix(r, result)
+    if continuesAsStr(r): lineStr(r, result)  # `2024-08-12`, `14:05`
+    else: handleSuffix(r, result)
 
   else:
-    useCpuRegisters:
-      result.data.p = p
-      var hasDot = false
-      while p < eof and ^p notin ControlCharsOrWhite:
-        if ^p == '\\': result.flags.incl TokenHasEscapes
-        elif ^p == '.': hasDot = true
-        inc result.data.len
-        inc p
+    var hasDot = false
+    template scanWord(wordEnd: set[char]) =
+      useCpuRegisters:
+        result.data.p = p
+        while p < eof and ^p notin wordEnd:
+          if ^p == '\\': result.flags.incl TokenHasEscapes
+          elif ^p == '.': hasDot = true
+          inc result.data.len
+          inc p
+    if r.lineBased: scanWord(LineWordEnd)
+    else: scanWord(ControlCharsOrWhite)
 
-    if result.data.len > 0:
+    if continuesAsStr(r):
+      lineStr(r, result)  # `a/b.txt`, `x-y`, `https://x`, `/usr/bin`
+    elif result.data.len > 0:
       if hasDot:
         result.tk = Symbol
         if result.data[result.data.len-1] == '.':
           result.flags.incl TokenHasModuleSuffixExpansion
+        if r.splitSyms: splitSymbol(r, result)
       else:
         result.tk = Ident
       handleSuffix(r, result)
@@ -560,18 +970,26 @@ proc extractModuleSuffix*(filename: string): string =
     elif not skip:
       result.add c
 
-proc open*(filename: string): Reader =
+proc open*(filename: string; lineBased = false): Reader =
+  ## With `lineBased`, the reader accepts NIF's optional line-based syntax:
+  ## a top-level line not starting with `(` is a node `(tag args...)` that ends
+  ## at the newline, and a number, identifier or symbol that continues with
+  ## `-`, `/` or `:` is a string literal (`a/b.txt`, `2024-08-12`, `14:05`).
+  ## Such a module is a flat list of top-level nodes; `next` returns them one
+  ## after another until `EofToken`.
   let f = try:
       vfsOpenMmap(filename)
     except:
       when defined(debug) and not defined(nimony): writeStackTrace()
       quit "[Error] cannot open: " & filename
-  result = Reader(f: f, p: nil, thisModule: extractModuleSuffix(filename))
+  result = Reader(f: f, p: nil, thisModule: extractModuleSuffix(filename),
+                  lineBased: lineBased)
   result.p = cast[pchar](result.f.data)
   result.eof = result.p +! result.f.size
   readDirectives result
 
-proc openFromBuffer*(buf: sink string; thisModule: sink string): Reader =
+proc openFromBuffer*(buf: sink string; thisModule: sink string;
+                     lineBased = false): Reader =
   ## The Reader keeps `buf` alive as the owner of the source bytes. `buf` may be
   ## a short SSO string whose chars live *inline* in the string object; a plain
   ## `readRawData` pointer into it would dangle the moment the Reader is moved
@@ -579,7 +997,9 @@ proc openFromBuffer*(buf: sink string; thisModule: sink string): Reader =
   ## with the object. `readRawDataStable` pins `buf` to its heap representation,
   ## whose payload address survives those moves, so the cached `r.p`/`r.eof`
   ## stay valid for as long as the Reader (and thus `buf`) is alive.
-  result = Reader(buf: ensureMove buf, thisModule: ensureMove thisModule)
+  ## See `open` for `lineBased`.
+  result = Reader(buf: ensureMove buf, thisModule: ensureMove thisModule,
+                  lineBased: lineBased)
   let n = result.buf.len
   result.p = readRawDataStable(result.buf)
   result.eof = result.p +! n
@@ -598,6 +1018,13 @@ proc offset*(r: var Reader): int {.inline.} =
 proc jumpTo*(r: var Reader; offset: int) {.inline.} =
   r.p = cast[pchar](r.f.data) +! offset
   assert cast[pointer](r.p) >= r.f.data and r.p < r.eof
+  # `offset` is the position AFTER the whole symbol, so a jump abandons the
+  # components of a split symbol that were not asked for.
+  r.pendingLeft = 0
+  r.pending = StringView(p: nil, len: 0)
+  # In the line-based syntax, a jump target is taken to be a top-level node.
+  r.inLineNode = false
+  r.depth = 0
 
 proc indexStartsAt*(r: Reader): int =
   r.indexAt
@@ -609,11 +1036,231 @@ proc firstUnusedName*(r: Reader): string =
     result = decodeStr(r, r.unusedNameHint)
 
 when isMainModule and not defined(nimony):
-  #const test = r"(.nif27)(stmts :\5B\5D=)"
-  const test = "nimcache/sysvq0asl.s.nif"
-  var r = open(test)
-  var tok = default(ExpandedToken)
-  while true:
+  proc tokens(input: string; split: bool): seq[string] =
+    ## Every token of `input`, rendered as "<what>:<decoded text>".
+    var r = openFromBuffer(input, "ThisMod")
+    r.splitSymbols split
+    result = @[]
+    var tok = default(ExpandedToken)
+    while true:
+      r.next(tok)
+      case tok.tk
+      of EofToken: break
+      of Symbol: result.add "sym" & $tok.suffixes & ":" & r.decodeStr(tok)
+      of SymbolDef: result.add "def" & $tok.suffixes & ":" & r.decodeStr(tok)
+      of ExtendedSuffix:
+        var s = $tok.part & ":" & r.decodeStr(tok)
+        if tok.part == SymDisamb: s.add "=" & $decodeDisamb(tok)
+        result.add s
+      of ParLe: result.add "(" & $tok.data
+      of ParRi: result.add ")"
+      else: result.add $tok.tk & ":" & r.decodeStr(tok)
+    close r
+
+  proc numbers(input: string): seq[string] =
+    ## Every token of `input`, numbers rendered by their decoded value.
+    var r = openFromBuffer(input, "ThisMod")
+    result = @[]
+    var tok = default(ExpandedToken)
+    while true:
+      r.next(tok)
+      case tok.tk
+      of EofToken: break
+      of IntLit: result.add "i" & $decodeInt(tok)
+      of UIntLit: result.add "u" & $decodeUInt(tok)
+      of FloatLit: result.add "f" & $int64(decodeFloat(tok) * 100.0) # in hundredths
+      of ParLe: result.add "(" & $tok.data
+      of ParRi: result.add ")"
+      else: result.add $tok.tk & ":" & $tok.data
+    close r
+
+  # Numbers: base prefixes and `_` digit separators.
+  assert numbers("(n 0xFF 0xff 0o377 0b1111_1111 -0xFF 0xDEAD_BEEFu 1_000_000)") ==
+    @["(n", "i255", "i255", "i255", "i255", "i-255", "u3735928559", "i1000000", ")"]
+  assert numbers("1_234.5_6E+0_2 1234.56E+02 0x1E3 012 -0o17 0b0u") ==
+    @["f12345600", "f12345600", "i483", "i12", "i-15", "u0"]
+  assert numbers("0x7FFF_FFFF_FFFF_FFFF -0x8000_0000_0000_0000 0xFFFF_FFFF_FFFF_FFFFu") ==
+    @["i9223372036854775807", "i-9223372036854775808", "u18446744073709551615"]
+  # malformed spellings are one error token each
+  for bad in ["0x", "0o8", "0b102", "0x_FF", "1_", "1__2", "1_.0", "1._0",
+              "1E_2", "1E+_2", "1_u"]:
+    assert numbers(bad) == @["UnknownToken:" & bad], bad
+  # `#` and `:` may appear literally inside a string; the comment follows the quote
+  block:
+    var r = openFromBuffer("(tag 0 \"2026-10-11T12:00:00Z\") \"key: value; # text\"#comment#", "ThisMod")
+    var tok = default(ExpandedToken)
+    r.next(tok); r.next(tok); r.next(tok)
+    assert tok.tk == StringLit and r.decodeStr(tok) == "2026-10-11T12:00:00Z"
+    r.next(tok); r.next(tok)
+    assert tok.tk == StringLit and r.decodeStr(tok) == "key: value; # text"
+    assert decodeComment(tok) == "comment"
+    close r
+
+  # Off by default: a symbol is one token carrying the whole string, exactly
+  # as every existing client expects.
+  assert tokens("(stmts abc.12.Ikey.mod :def.1.mod tmp.14)", false) ==
+    @["(stmts", "sym0:abc.12.Ikey.mod", "def0:def.1.mod", "sym0:tmp.14", ")"]
+
+  # On: the reader takes the symbol apart and reports the components as
+  # `ExtendedSuffix` tokens following the head.
+  assert tokens("abc.12.Ikey.mod", true) ==
+    @["sym3:abc", "SymDisamb:12=12", "SymDedup:Ikey", "SymModule:mod"]
+  assert tokens("abc.12.mod", true) ==
+    @["sym2:abc", "SymDisamb:12=12", "SymModule:mod"]
+  # A local symbol has no module.
+  assert tokens("tmp.14", true) == @["sym1:tmp", "SymDisamb:14=14"]
+  # A symbol definition splits the same way.
+  assert tokens(":def.1.mod", true) ==
+    @["def2:def", "SymDisamb:1=1", "SymModule:mod"]
+  # A trailing dot is the "my own module" shorthand: it is the last component
+  # that expands, not the name.
+  assert tokens("x.3.", true) ==
+    @["sym2:x", "SymDisamb:3=3", "SymModule:ThisMod"]
+  # Only the disambiguator's dot ends the name; the name may contain dots.
+  assert tokens("a.b.c.23.mod", true) ==
+    @["sym2:a.b.c", "SymDisamb:23=23", "SymModule:mod"]
+  # An escaped dot is `\2E` in the raw bytes and so cannot be mistaken for a
+  # separator; the escapes stay with the component that has them.
+  assert tokens("a\\2Eb.5.mod", true) ==
+    @["sym2:a.b", "SymDisamb:5=5", "SymModule:mod"]
+  # An operator definition has no dot to split on and is left whole.
+  assert tokens("foo.bar", true) == @["sym1:foo", "SymModule:bar"]
+  assert tokens(":\\5B\\5D=", true) == @["def0:[]="]
+  # A disambiguator the inliner minted is NOT a module, however non-numeric it
+  # looks after its first character.
+  assert tokens("p.0h107", true) == @["sym1:p", "SymDisamb:0h107=0"]
+  # ...and one with no numeric part at all (arkham's legacy syproc names) still
+  # yields its module; everything before it is the name.
+  assert tokens("_exit.sys.sysvq0asl", true) ==
+    @["sym1:_exit.sys", "SymModule:sysvq0asl"]
+  # Line info and comments ride on the head, as before.
+  assert tokens("abc.12.mod@3,4#hi#", true) ==
+    @["sym2:abc", "SymDisamb:12=12", "SymModule:mod"]
+
+  block: # a jump abandons the components nobody asked for
+    var r = openFromBuffer("abc.12.mod tail.1", "ThisMod")
+    r.splitSymbols()
+    assert r.symbolsAreSplit
+    var tok = default(ExpandedToken)
+    let start = offset(r)
     r.next(tok)
-    if tok.tk == EofToken: break
-    echo r.decodeStr tok, " ", tok
+    assert tok.tk == Symbol and tok.suffixes == 2'u8
+    r.jumpTo start
+    r.next(tok)
+    assert r.decodeStr(tok) == "abc"
+    r.next(tok)
+    assert tok.tk == ExtendedSuffix and tok.part == SymDisamb
+    close r
+
+  proc lineTokens(input: string): seq[string] =
+    ## Like `tokens`, for the line-based syntax; string literals are quoted.
+    var r = openFromBuffer(input, "ThisMod", lineBased = true)
+    result = @[]
+    var tok = default(ExpandedToken)
+    while true:
+      r.next(tok)
+      case tok.tk
+      of EofToken: break
+      of ParLe: result.add "(" & $tok.data
+      of ParRi: result.add ")"
+      of StringLit: result.add "\"" & r.decodeStr(tok) & "\""
+      of UnknownToken: result.add "?" & $tok.data
+      else: result.add r.decodeStr(tok)
+    close r
+
+  block: # line-based syntax
+    assert lineTokens("copy a/b.txt dest/b.txt\nwarn 2024-08-12 \"permission denied\"") ==
+      @["(copy", "\"a/b.txt\"", "\"dest/b.txt\"", ")",
+        "(warn", "\"2024-08-12\"", "\"permission denied\"", ")"]
+    # the same AST as the parenthesized form
+    assert lineTokens("copy a/b.txt dest/b.txt\n") ==
+      lineTokens("(copy \"a/b.txt\" \"dest/b.txt\")")
+    # both forms mix; directives keep their form and are skipped as usual
+    assert lineTokens("(.nif27)\ninfo 2024-08-12T09:14:03Z \"server started\" (port 8080)\n") ==
+      @["(info", "\"2024-08-12T09:14:03Z\"", "\"server started\"", "(port", "8080", ")", ")"]
+    assert lineTokens("(a x) b c\n(d)") == @["(a", "x", ")", "(b", "c", ")", "(d", ")"]
+    # a parenthesized argument (and a string) continues the line
+    assert lineTokens("a (b\n  c) \"x\ny\"\n  d") ==
+      @["(a", "(b", "c", ")", "\"x\ny\"", ")", "(d", ")"]
+    # empty and blank lines, indentation, CRLF, a line with just a tag
+    assert lineTokens("\n  \t\n  ls\r\n\r\nls x\r\n") == @["(ls", ")", "(ls", "x", ")"]
+    assert lineTokens("") == newSeq[string]()
+    # the string rule applies at every nesting level of a line-based module
+    assert lineTokens("a (b x/y)\n(c x/y)") ==
+      @["(a", "(b", "\"x/y\"", ")", ")", "(c", "\"x/y\"", ")"]
+    # a number that continues with `-`, `/` or `:` extends to the whitespace
+    assert lineTokens("t 2024-08-12 2024-08-12T14:05:09.25+02:00 2024-08-12x 1/2 14:05 12:00Z") ==
+      @["(t", "\"2024-08-12\"", "\"2024-08-12T14:05:09.25+02:00\"",
+        "\"2024-08-12x\"", "\"1/2\"", "\"14:05\"", "\"12:00Z\"", ")"]
+    # other numbers stay numbers
+    assert lineTokens("t 42 -7 1.5 1.5E-3 x.1") ==
+      @["(t", "42", "-7", "1.5", "1.5E-3", "x.1", ")"]
+    # so do identifiers and symbols; once one continues with `-`, `/` or `:`,
+    # control characters other than parentheses and suffix introducers are
+    # part of the string
+    assert lineTokens("get x-y /usr/bin a/b.txt my\\20dir/a.txt dest/x. a/b:c\"d#e# (p a/b)") ==
+      @["(get", "\"x-y\"", "\"/usr/bin\"", "\"a/b.txt\"", "\"my dir/a.txt\"",
+        "\"dest/x.\"", "\"a/b:c\"d\"", "(p", "\"a/b\"", ")", ")"]
+    assert lineTokens("get https://nim-lang.org C:/tmp/x.txt key: a.b:c") ==
+      @["(get", "\"https://nim-lang.org\"", "\"C:/tmp/x.txt\"", "\"key:\"",
+        "\"a.b:c\"", ")"]
+    # an auto string carries a suffix like every other atom
+    block:
+      var r = openFromBuffer("t src/main.nim@0,3#c# 2024-08-12~2 12@3,4", "ThisMod", lineBased = true)
+      var tok = default(ExpandedToken)
+      r.next(tok)
+      r.next(tok)
+      assert tok.tk == StringLit and r.decodeStr(tok) == "src/main.nim"
+      assert tok.pos.line == 3 and decodeComment(tok) == "c"
+      r.next(tok)
+      assert tok.tk == StringLit and r.decodeStr(tok) == "2024-08-12" and tok.pos.col == -2
+      r.next(tok)
+      assert tok.tk == IntLit and tok.pos.col == 3 and tok.pos.line == 4
+      close r
+    # `-` without digits is an empty number: `--color` continues with `-`
+    assert lineTokens("ls --color -3") == @["(ls", "\"--color\"", "-3", ")"]
+    # `..` alone is still two empty nodes
+    assert lineTokens("up ..") == @["(up", ".", ".", ")"]
+    # the tag carries a suffix
+    block:
+      var r = openFromBuffer("warn@0,1#disk#  2024-08-12", "ThisMod", lineBased = true)
+      var tok = default(ExpandedToken)
+      r.next(tok)
+      assert tok.tk == ParLe and tok.data == "warn" and tok.pos.line == 1
+      assert decodeComment(tok) == "disk"
+      close r
+    # a line that does not start with an identifier is one error token
+    assert lineTokens("./run.sh x\nok") == @["?./run.sh x", "(ok", ")"]
+    # line tracking is unaffected
+    block:
+      var r = openFromBuffer("a\n\nb\n", "ThisMod", lineBased = true)
+      var tok = default(ExpandedToken)
+      while true:
+        r.next(tok)
+        if tok.tk == EofToken: break
+      assert r.line == 3
+      close r
+    # off by default: plain NIF is read exactly as before
+    assert tokens("(a) b", false) == @["(a", ")", "Ident:b"]
+
+  block: # an escape cut short by the end of its token keeps the backslash
+    assert tokens("ab\\", false) == @["Ident:ab\\"]
+    assert tokens("ab\\4", false) == @["Ident:ab\\4"]
+    assert tokens("ab\\4 x", false) == @["Ident:ab\\4", "Ident:x"]
+    assert tokens("\"ab\\", false) == @["StrLit:ab\\"]
+    assert tokens("\"a\\41\"", false) == @["StrLit:aA"]
+    # a char literal cut short by the end of the input is no CharLit
+    for bad in ["'", "'\\", "'\\4", "'\\41", "'a"]:
+      var r = openFromBuffer(bad, "ThisMod")
+      var tok = default(ExpandedToken)
+      r.next(tok)
+      assert tok.tk != CharLit, bad
+      close r
+    block:
+      var r = openFromBuffer("'\\41'", "ThisMod")
+      var tok = default(ExpandedToken)
+      r.next(tok)
+      assert tok.tk == CharLit and decodeChar(tok) == 'A'
+      close r
+
+  echo "nifreader: OK"

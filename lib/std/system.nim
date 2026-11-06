@@ -1,6 +1,8 @@
 ## System module for Nimony
 
 {.feature: "lenientnils".}
+{.feature: "staticContracts".}
+{.feature: "assumeSync".}
 
 include "system/basic_types"
 
@@ -21,12 +23,17 @@ const
 
 func `[]`*[T: tuple](x: T, i: int): untyped {.magic: "TupAt".}
 func `[]`*[I, T](x: array[I, T], i: I): var T {.magic: "ArrAt".}
+func `[]`*[I, T; J: SomeInteger](x: array[I, T], i: J): var T {.magic: "ArrAt".}
+  ## Any integer indexes an array by ordinal value, relative to the array's own
+  ## index range; never via the 0-based openArray `[]` (nim-lang/nimony#2750).
 func `[]`*(x: cstring, i: int): var char {.magic: "Pat".}
 func `[]`*[T](x: ptr UncheckedArray[T], i: int): var T {.magic: "Pat".}
 func `[]`*[T](x: UncheckedArray[T], i: int): var T {.magic: "Pat".}
 template `[]=`*[T: tuple](x: T, i: int, elem: typed) =
   (x[i]) = elem
 template `[]=`*[I, T](x: array[I, T], i: I; elem: T) =
+  (x[i]) = elem
+template `[]=`*[I, T; J: SomeInteger](x: array[I, T], i: J; elem: T) =
   (x[i]) = elem
 template `[]=`*(x: cstring, i: int; elem: char) =
   (x[i]) = elem
@@ -46,6 +53,12 @@ include "system/arithmetics"
 
 include "system/comparisons"
 
+func old*(x: int): int {.semantics: "old".} = x
+  ## The value `x` had when the routine was *entered*. Meaningful only inside an
+  ## `.ensures`, which is never evaluated at run time — it is how a routine that
+  ## mutates a `var` parameter states what the mutation leaves alone:
+  ## `ensures: s.len == old(s.len)`.
+
 func defined*(x: untyped): bool {.magic: Defined.}
   ## Checks whether the symbol named by `x` is defined (typically via `-d:name` or `define`).
 func declared*(x: untyped): bool {.magic: Declared.}
@@ -58,6 +71,11 @@ func astToStr*[T](x: T): string {.magic: AstToStr.}
 func compiles*(x: untyped): bool {.magic: Compiles.}
   ## Special compile-time procedure that checks whether `x` can be compiled
   ## without any semantic error.
+
+func `static`*(x: untyped): untyped {.magic: Static.}
+  ## Evaluates `x` at compile time, like a `const` initializer, and yields its
+  ## value: `static(fib(10))`. The only way to pass an arbitrary call to a
+  ## `static` parameter; compile-time evaluation is never implicit.
   ## This can be used to check whether a type supports some operation:
   ##   ```nim
   ##   when compiles(3 + 4):
@@ -65,53 +83,7 @@ func compiles*(x: untyped): bool {.magic: Compiles.}
   ##   ```
 
 
-const
-  # Use string literals for one digit numbers to avoid the allocations as they are so common.
-  NegTen = [
-    "-0", "-1", "-2", "-3", "-4",
-    "-5", "-6", "-7", "-8", "-9"]
-
-func `$`*(x: uint64): string =
-  result = ""
-  if x < 10:
-    result = NegTen[int x].substr(1, 1)
-  else:
-    var y = x
-    while true:
-      result.add char((y mod 10'u) + uint('0'))
-      y = y div 10'u
-      if y == 0'u: break
-    let last = result.len-1
-    var i = 0
-    let b = result.len div 2
-    while i < b:
-      let ch = result[i]
-      result[i] = result[last-i]
-      result[last-i] = ch
-      inc i
-
-func `$`*(x: int64): string =
-  if x < 0:
-    if x > -10:
-      result = NegTen[int(-x)]
-    elif x == -9223372036854775808:
-      result = "-" & $cast[uint64](x)
-    else:
-      result = "-" & $(0-x)
-  elif x < 10:
-    result = ""
-    result.add char(x + int64('0'))
-  else:
-    result = $cast[uint64](x)
-
-func `$`*(x: int32): string =
-  $(int64(x))
-
-func addInt*(s: var string; x: int64) {.inline.} =
-  s.add $x
-
-func addInt*(s: var string; x: uint64) {.inline.} =
-  s.add $x
+include "system/formatint"
 
 func `$`*(b: bool): string =
   if b: "true" else: "false"
@@ -131,6 +103,8 @@ func unsafeAddr*[T](x: T): ptr T {.magic: "Addr", noSideEffect.}
 
 func sizeof*[T](x: typedesc[T]): int {.magic: "SizeOf", noSideEffect.}
   ## Returns the size of type `T` in bytes.
+func nimCanFormCycles[T](x: typedesc[T]): bool {.magic: "CanFormCycles", noSideEffect.}
+  ## For `seq`'s collector fence; the public one is `typetraits.canFormCycles`.
 
 template sizeof*[T](_: T): int =
   ## Returns the size in bytes of the type of the given value.
@@ -185,6 +159,11 @@ include "system/setops"
 
 include "system/ctypes"
 
+when defined(embedded):
+  # The console of a bare-metal image, and its `exit`. Included BEFORE `exits`,
+  # which uses it, and only on the target that has no OS to ask instead.
+  include "system/semihosting"
+
 include "system/exits"
 include "system/atomintrin"
 include "system/memory"
@@ -196,11 +175,26 @@ template linear*() {.pragma.}
   ## this to allow parallel `c[i] = …` writes. `seq`/array indexing is linear;
   ## `Table` indexing is not (it may rehash and relocate other slots).
 
+const MaxContainerLen* = high(int) div 2
+  ## No seq, string or openArray is longer than this: the allocator refuses
+  ## to grow one past it, and an openArray view that would be longer is empty.
+  ## It is what makes `i + n.len` provably wrap-free for an index `i < s.len`:
+  ## the sum of two such lengths is at most `high(int) - 1`. It costs nothing
+  ## real — a 64-bit address space holds far less, a 32-bit one no single
+  ## 2 GiB block.
+
 include "system/seqimpl"
 include "system/stringimpl"
 include "system/openarrays"
 
-include "system/arcops"
+# The memory management strategy, chosen by `--mm:NAME`: `$MM` expands to
+# `system/<name>`, so a strategy is a file and needs no `when` chain here.
+# After `seqimpl`/`stringimpl`: `derefs` refers to some of their procs by
+# declaration number. `seq`'s `when declared(nimSeqFenceEnter)` still sees a
+# fence the runtime declares: generic bodies are checked when instantiated.
+include "$MM"
+
+include "system/refops"
 
 func newConstr[T](t: typedesc[T]): T {.magic: "NewRef", nodecl.}
 func new*[T: ref](x: out T) {.inline.} = x = newConstr(T)
@@ -216,6 +210,7 @@ template ord*[T: Ordinal|enum](x: T): int =
   int(x)
 
 include "system/panics"
+include "system/ownedrefs"
 
 include "system/dyncalls"
 
@@ -239,6 +234,14 @@ type
 func abs*[T: ComparableAndNegatable](x: T): T {.inline.} =
   ## Returns the absolute value of `x`.
   if x < 0: -x else: x
+
+func abs*(x: float64): float64 {.inline.} =
+  ## Clears the sign bit, as C's fabs: abs(-0.0) is +0.0 (the generic `x < 0` test keeps -0.0).
+  cast[float64](cast[uint64](x) and 0x7fff_ffff_ffff_ffff'u64)
+
+func abs*(x: float32): float32 {.inline.} =
+  ## Clears the sign bit, as C's fabsf.
+  cast[float32](cast[uint32](x) and 0x7fff_ffff'u32)
 
 template isNil*(s: cstring): bool = s == nil
 
@@ -297,17 +300,121 @@ proc advance*(c: Continuation): Continuation =
   ## to be called directly. Used by the compiler to run a coroutine.
   result = scheduler(c)
 
-proc complete*(c: Continuation) =
-  ## Used by the compiler to run a coroutine until it has no next step
-  ## (`stopping`): it either finishes or parks (`delay(); suspend()`) to await
-  ## an external scheduler. With the default trivial scheduler a park simply
-  ## stops the loop; a real scheduler resumes parked continuations and drives
-  ## them onward. Takes `c` by value so a coroutine may reassign the variable
-  ## it was driven from (e.g. to reschedule via `delay(call)`). Bare
-  ## `suspend()` transitions synchronously, so it does not stop the loop.
-  var c = c
+type
+  Join = object of CoroutineBase
+    ## The side that waits for a coroutine: a regular proc's `complete`, or a
+    ## `for` loop over a `.passive` iterator. It is the coroutine's `caller`,
+    ## so the coroutine runs it when it finishes — on whichever thread resumed
+    ## it — and at every `yield`, which also leaves its resume point in
+    ## `resume`. Running it marks it `done` and continues at its own `caller`:
+    ## nothing for a regular proc, the loop's next state in a `.passive` one.
+    done: int
+      ## 0 while the coroutine runs, 1 once it ran `j`. -1 while it runs
+      ## cancelled: `=destroy` runs an abandoned iterator to its end, and every
+      ## `yield` of a `.passive` iterator is followed by an `iterCancelled`
+      ## check that returns, so the iterator's own exit path destroys its locals.
+    resume: Continuation
+
+proc joined(coro: ptr CoroutineBase): Continuation {.nimcall.} =
+  let j = cast[ptr Join](coro)
+  result = j.caller # before `done`: after it the waiter may reuse `j`
+  atomicStoreN(addr j.done, 1, ATOMIC_RELEASE)
+
+proc attach(j: ptr Join; c: Continuation) =
+  ## Used by the compiler: `c`, fresh from `delay(call)` or an iterator's init,
+  ## reports to `j` from now on.
+  # field by field: a whole-object store would `=destroy` the old value first
+  j.caller = Continuation(fn: nil, env: nil)
+  j.done = 0
+  j.resume = c
+  if c.env != nil:
+    c.env.caller = Continuation(fn: joined, env: cast[ptr CoroutineBase](j))
+
+var passiveWaitHook: proc () {.nimcall.} = nil
+
+proc setPassiveWaitHook*(hook: proc () {.nimcall.}) {.inline.} =
+  ## What a thread does while it waits for a parked coroutine to finish: a
+  ## thread pool makes it help with the pool's work, so a worker waiting here
+  ## cannot starve the pool of the very worker that would resume it.
+  passiveWaitHook = hook
+
+proc builtinCpuRelax() {.intrinsic: "CpuRelax".}
+
+proc run(j: ptr Join) =
+  ## Runs `j.resume` until the coroutine has run `j`: trampoline on this
+  ## thread, and if it parked, wait for whoever resumes it.
+  var c = j.resume
+  j.resume = Continuation(fn: nil, env: nil)
+  if j.done != -1: j.done = 0 # a cancelled run stays cancelled
   while not stopping(c):
     c = scheduler(c)
+  while atomicLoadN(addr j.done, ATOMIC_ACQUIRE) <= 0:
+    if passiveWaitHook != nil: passiveWaitHook()
+    else: builtinCpuRelax()
+
+proc complete*(c: Continuation) =
+  ## Runs `c`, fresh from `delay(call)`, to completion — parks included, like a
+  ## regular proc's call of a `.passive` proc, which is what the compiler turns
+  ## such a call into.
+  if not stopping(c):
+    if c.env.caller.fn != nil:
+      panic "complete: the coroutine already has a caller"
+    var j = Join()
+    attach(addr j, c)
+    run(addr j)
+
+proc iterYield(caller, resume: Continuation): Continuation =
+  ## Used by the compiler: a `.passive` iterator's `yield` — record where it
+  ## continues, then hand control to the loop.
+  cast[ptr Join](caller.env).resume = resume
+  result = caller
+
+proc iterNext(j: ptr Join): bool =
+  ## Used by the compiler: one step of a `for` loop in a regular proc, parks
+  ## included. Answers whether the iterator yielded.
+  run(j)
+  result = j.resume.fn != nil
+
+proc iterAdvance(j: ptr Join) {.passive.} =
+  ## Used by the compiler: one step of a `for` loop in a `.passive` routine. A
+  ## suspension point the CPS transform lowers itself (`iterSwitch`), so this
+  ## body never runs.
+  discard
+
+proc iterSwitch(j: ptr Join; next: Continuation): Continuation =
+  ## Used by the compiler: what `iterAdvance` lowers to — the loop continues at
+  ## `next` once the step is over, and the step starts now.
+  j.caller = next
+  result = j.resume
+  j.resume = Continuation(fn: nil, env: nil)
+
+proc iterFinished(j: ptr Join): bool {.inline.} =
+  ## Used by the compiler: did the step just taken end the iterator?
+  result = j.resume.fn == nil
+
+proc iterCancelled(coro: ptr CoroutineBase): bool {.inline.} =
+  ## Used by the compiler: right after a `.passive` iterator's `yield`, is the
+  ## loop gone? The iterator's `caller` is its loop's `Join` (`attach`).
+  result = cast[ptr Join](coro.caller.env).done == -1
+
+proc `=destroy`(j: Join) =
+  ## A `for` loop left before its iterator finished, by whatever way out of
+  ## the loop's scope. The iterator is parked at a `yield`: resume it with
+  ## `done = -1`, and it returns from there, destroying its locals and
+  ## freeing its frame like any other return.
+  if j.resume.env != nil:
+    # the frame's `caller` is `j` itself, addressable unlike the parameter
+    let jp = cast[ptr Join](j.resume.env.caller.env)
+    jp.caller = Continuation(fn: nil, env: nil) # not the loop's next state
+    while jp.resume.env != nil: # a `yield` on the way out parks it again
+      jp.done = -1 # `joined` set it to 1 at that `yield`
+      run(jp)
+
+proc `=wasMoved`(j: var Join) {.nodestroy, inline.} =
+  ## No parked iterator to finish: `=destroy` has nothing to resume.
+  j.resume = Continuation(fn: nil, env: nil)
+
+proc `=copy`(dest: var Join; src: Join) {.error.}
 
 proc parked*(c: Continuation): bool {.inline.} =
   ## True when a coroutine has parked via `suspend()` and not yet been
@@ -344,6 +451,9 @@ proc finalizeCoroutine*(c: var Continuation) =
   if c.env != nil:
     cancel(c.env)
     if c.env.caller.env == nil:
+      # the iterator's locals are fields of its frame; `=destroy` dispatches
+      # to the frame type's hook, as for a value-owned frame's `ref`
+      `=destroy`(c.env[])
       deallocFrame(c.env)
     c.fn = nil
     c.env = nil
@@ -363,7 +473,7 @@ func `==`*[T: Equatable](x, y: seq[T]): bool =
   if x.len != y.len:
     return false
 
-  for i in 0..x.len-1:
+  for i in 0 ..< x.len:
     if x[i] != y[i]:
       return false
 
@@ -412,7 +522,7 @@ func addEscapedChar*(s: var string, c: char) {.noSideEffect, inline.} =
     s.add(HexChars[int((n and 0xF0) shr 4)])
     s.add(HexChars[int(n and 0xF)])
 
-func addQuoted*[T](s: var string, x: T) =
+func addQuoted*[T](s: var string, x: T) {.untyped.} =
   ## Appends `x` to string `s` in place, applying quoting and escaping
   ## if `x` is a string or char.
   ##
@@ -462,15 +572,21 @@ func addQuoted*[T](s: var string, x: T) =
     s.add($x)
 
 type
-  # TODO: change to `range[0..high(int)]` when range type is implemented
-  Natural* = int
+  Natural* = range[0 .. high(int)]
     ## is an `int` type ranging from zero to the maximum value
-    ## of an `int`. This type is often useful for documentation and debugging.
+    ## of an `int`.
+    ##
+    ## It is a real `range` type, so a `Natural` parameter *states* `0 <= x` and
+    ## the contract analysis reads it straight off the type
+    ## (`contracts_fir.seedRangeFacts`). That is what lets an indexing routine
+    ## discharge the lower half of `0 <= i and i < s.len` without a guard or a
+    ## `.requires` at any call site. Binding a value to a `Natural` owes
+    ## `0 <= value` in return, and that obligation is proven at compile time —
+    ## no range check is ever emitted.
 
-  # TODO: change to `range[1..high(int)]`
-  Positive* = int
+  Positive* = range[1 .. high(int)]
     ## is an `int` type ranging from one to the maximum value
-    ## of an `int`. This type is often useful for documentation and debugging.
+    ## of an `int`. Like `Natural`, it is a real `range` type.
 
   HSlice*[T, U] = object   ## "Heterogeneous" slice type.
     a*: T                  ## The lower bound (inclusive).
@@ -496,6 +612,10 @@ func `..<`*[T, U: Ordinal](a: sink T; b: sink U): HSlice[T, U] {.inline.} =
   ## This is the *value* form used by slice indexing such as `s[a ..< b]`;
   ## the for-loop form `for i in a ..< b` resolves to the `..<` iterator.
   result = HSlice[T, U](a: a, b: pred(b))
+
+func contains*[T: Comparable](s: Slice[T]; x: T): bool {.inline.} =
+  ## True when `x` lies within the inclusive interval `s`; enables `x in a .. b`.
+  not (x < s.a) and not (s.b < x)
 
 type
   BackwardsIndex* = distinct int ## Type constructed by `^` for reversed
@@ -540,9 +660,11 @@ func `[]`*[T](s: seq[T]; x: HSlice[int, int]): seq[T] {.nodestroy.} =
   let b = min(x.b, s.len - 1)
   let n = if b >= a: (b - a) + 1 else: 0
   result = newSeqUninit[T](n)
+  # `result.len`, not `n`: it is 0 when the allocation was refused.
   var i = 0
-  while i < n:
-    (result.rawData[i]) = `=dup`(s.rawData[a+i])
+  while i < result.len:
+    {.cast(noSideEffect).}:
+      (result.rawData[i]) = `=dup`(s.rawData[a+i])
     inc i
 
 func `[]`*[T](s: seq[T]; x: HSlice[int, BackwardsIndex]): seq[T] {.inline.} =
@@ -559,7 +681,25 @@ proc typeof*(x: untyped; mode = typeOfIter): typedesc {.magic: TypeOf.}
 
 proc allocFrame*(size: int): ptr CoroutineBase =
   ## Allocates a new coroutine frame of the given size on the heap.
-  result = cast[ptr CoroutineBase](alloc(size))
+  ##
+  ## ZEROED, and that is load-bearing rather than tidy. A frame holds the
+  ## coroutine's locals, and the CPS lowering writes them with ordinary
+  ## DESTRUCTIVE assignments — `=destroy` the old value, then store the new one —
+  ## including the very first write, when there is no old value. On raw `alloc`
+  ## memory that first `=destroy` reads whatever the allocator last left there:
+  ## for a `string` it is `nimStrDestroy` branching on a garbage `slen`, and a
+  ## garbage `slen > 14` would call `dealloc` on a garbage pointer.
+  ##
+  ## Zero is a valid — and destructible — initial value for every type that can
+  ## live in a frame: a `string` reads `slen = 0` (the empty short string), a
+  ## `seq` reads `data = nil`, a `ref` reads nil, and `=destroy` on each is a
+  ## no-op. `deallocFrame` below also reads `frame.callee` before anything is
+  ## guaranteed to have written it.
+  ##
+  ## The alternative — teaching the lowering to emit an initializing store for the
+  ## first write to each frame field — is better code, and is not a prerequisite
+  ## for this being correct: it would make the memset redundant, not necessary.
+  result = cast[ptr CoroutineBase](alloc0(size))
 
 proc deallocFrame*(frame: ptr CoroutineBase) =
   ## Frees a coroutine frame previously allocated by `allocFrame`.
@@ -571,3 +711,32 @@ type
     msg*: string
 
 var exc* {.threadvar.}: ref Exception
+
+proc newException*[T](exceptn: typedesc[T]; message: string): ref T {.inline, untyped.} =
+  ## Creates a heap-based exception object of type `T` for Nim 2 interop:
+  ## `raise newException(ValueError, "wrong value")`.
+  new(result)
+  result.msg = message
+
+proc instantiationInfo*(): tuple[filename: string, line: int, column: int] {.magic: "InstantiationInfo".}
+  ## The source position of the call. Inside a template body it is the
+  ## position of the template's call site, so a template can report where it
+  ## was invoked. `filename` is the file name without directories.
+
+template uncheckedBorrow*(x: untyped): untyped =
+  ## `x`, borrowed without the borrow checker's protection: the programmer
+  ## vouches that nothing mutates `x` while the borrow lasts. Needed to
+  ## iterate a location reached through a `ref`, which an alias of the `ref`
+  ## could otherwise mutate under the loop:
+  ##
+  ##   ```nim
+  ##   for k, v in uncheckedBorrow(node.table):
+  ##     echo k
+  ##   ```
+  ##
+  ## A `seq` is better iterated by index, and any container can be moved out
+  ## of its location for the loop and back in afterwards; neither needs such
+  ## a promise.
+  addr(x)[]
+
+include "system/dollars"

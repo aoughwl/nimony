@@ -15,6 +15,7 @@ import ".." / nimony / [nimony_model, programs, decls]
 import hexer_context, iterinliner, desugar, xelim, duplifier, lifter, destroyer,
   constparams, vtables_backend, eraiser, lambdalifting, cps, passes,
   funcsummary, intramodinliner, arcopt
+import ".." / finalir / finalir
 # `arcopt` runs on the final NIFC (try/finally already lowered to explicit
 # control flow). It is the BasicBlock-based pass ported from the battle-tested
 # `nim/compiler/optimizer.nim`: a stack of basic blocks each owning a pending
@@ -29,7 +30,7 @@ when defined(verifyArc):
 
 proc publishHooks*(n: var Cursor) =
   case n.kind
-  of ParLe:
+  of TagLit:
     case n.stmtKind
     of ProcS, FuncS, MacroS, MethodS, ConverterS:
       let decl = asRoutine(n)
@@ -40,61 +41,77 @@ proc publishHooks*(n: var Cursor) =
     else:
       n.into:
         while n.hasMore: publishHooks(n)
-  of ParRi:
-    raiseAssert "BUG: unexpected ParRi in publishHooks"
   else:
     inc n
 
 proc transform*(c: var EContext; n: Cursor; moduleSuffix: string; bits: int): TokenBuf =
-  # Prepare initial buffer from elimForLoops
-  var n = n
-  var dest = createTokenBuf(300)
-  elimForLoops(c, dest, n)
-  var initialBuf = move dest
+  # The input is already the Final IR (`doc/final_ir.md`): nimsem lowers a
+  # module before publishing it. Every pass here reads and writes that form.
+  var input = createTokenBuf(300)
+  input.addSubtree n
+  var pass = initPass(ensureMove input, moduleSuffix, "iterinliner", bits)
 
-  # Initialize the Pass pipeline
-  var pass = initPass(initialBuf, moduleSuffix, "desugar", bits)
+  # Pass 1: inline the inline iterators
+  var m = pass.n
+  elimForLoops(c, pass.dest, m)
 
-  # Pass 1: Desugar
-  desugar(pass, c.activeChecks)
+  # Pass 2: Desugar
+  pass.prepareForNext("desugar")
+  desugar(pass, c.activeChecks, c.liftingCtx)
 
   # Pass 3: Lambda Lifting
   pass.prepareForNext("lambdalift")
   elimLambdas(pass)
 
-  # Pass 6: Inject Raising Calls (Exception Handling)
+  # Pass 5: Exception Handling — ALL of it. A raising call becomes a temp plus
+  # a check, and the success tuple lands in the same pass: signatures, the
+  # `result` slot, the temps, and every use projected onto its value half.
+  # Emitted as STATEMENTS in front of the enclosing statement, so it does not
+  # re-introduce the `(expr (stmts ...) tmp)` nesting that used to require a
+  # second `xelim` run right after it.
+  #
+  # Everything downstream therefore sees a finished shape: the destroyer sees a
+  # tuple-typed temp like any other local and `cps` sees a coroutine that
+  # happens to return a tuple. The cost of deciding it here is the one
+  # `eraiser.nim`'s header describes — the lifter synthesises a hook per
+  # `(ErrorCode, T)` that only delegates to `T`'s, which the inliner prunes.
+  #
+  # The flip side: nothing lowers raises after this point, so a later pass that
+  # needs to signal an error emits the finished form (the duplifier's
+  # out-of-memory check, via `builtintypes.addRaisedCode`).
   pass.prepareForNext("eraiser")
-  var needsXelimIgnored = false
-  injectRaisingCalls(pass, c.bits div 8, needsXelimIgnored)
+  injectRaisingCalls(pass, c.bits div 8)
 
-  # Pass 4: Lower Expressions (first time)
-  pass.prepareForNext("xelim1")
-  lowerExprs(pass)
-
-  # Pass 5: Inject Duplication Points
+  # Pass 6: Inject Duplication Points. Like the eraiser it emits its owning
+  # temps as statements (`bindToTemp` → `c.hoisted`), which is what removed the
+  # `xelim2` run that used to sit between this pass and the destroyer.
   pass.prepareForNext("duplifier")
   injectDups(pass, c.liftingCtx)
 
-
-  # Pass 7: Lower Expressions (second time, after raises)
-  pass.prepareForNext("xelim2")
-  lowerExprs(pass)
-
-  # Pass 8: Inject Destructors (RAII/Cleanup)
+  # Pass 6: Inject Destructors (RAII/Cleanup)
   pass.prepareForNext("destroyer")
   injectDestructors(pass, c.liftingCtx)
 
-  # Special handling: Merge generated hooks
-  assert pass.dest[pass.dest.len-1].kind == ParRi
-  shrink(pass.dest, pass.dest.len-1)
-
+  # Special handling: Merge generated hooks. The destroyer left the root
+  # `(stmts` open for us; append the hooks, then close it.
+  # The lifter emits Nimony IR (nimsem runs it too), so its hooks are lowered
+  # to the Final IR here.
   if c.liftingCtx[].dest.len > 0:
-    var hookReader = beginRead(c.liftingCtx[].dest)
-    #echo "HOOKS: ", toString(hookReader)
-    publishHooks hookReader
-    endRead(c.liftingCtx[].dest)
-
-  pass.dest.add move(c.liftingCtx[].dest)
+    var hooks = createTokenBuf(c.liftingCtx[].dest.len + 2)
+    hooks.addParLe StmtsS, NoLineInfo
+    hooks.add move(c.liftingCtx[].dest)
+    hooks.addParRi()
+    var hookPass = initPass(ensureMove hooks, moduleSuffix, "finalir_hooks", bits,
+                            pass.nextTemp)
+    toFinalIr(hookPass, analysisFacts = false)
+    var hookReader = beginRead(hookPass.dest)
+    hookReader.into:
+      let first = hookReader
+      while hookReader.hasMore:
+        publishHooks hookReader
+      hookReader = first
+      while hookReader.hasMore:
+        pass.dest.takeTree hookReader
   pass.dest.addParRi()
 
   when defined(verifyArc):
@@ -109,6 +126,7 @@ proc transform*(c: var EContext; n: Cursor; moduleSuffix: string; bits: int): To
         stderr.writeLine "verify_arc diagnostics for ", pass.moduleSuffix, ":"
         stderr.writeLine toString(arcErrs, false)
 
+  # Pass 7: CPS transform (coroutines)
   pass.prepareForNext("cps")
   transformToCps(pass)
 
@@ -121,11 +139,14 @@ proc transform*(c: var EContext; n: Cursor; moduleSuffix: string; bits: int): To
   pass.prepareForNext("constparams")
   injectConstParamDerefs(pass, c.bits div 8, needsXelimAgain)
 
-  # Final pass: Lower expressions and casts.
-  # LowerCasts mode also lowers expressions, so this replaces
-  # the previously conditional xelim_final pass.
+  # Pass 11: the remaining REAL lowering step, not a repair pass: `LowerCasts`
+  # unnests calls (the Final-IR "calls are unnested statements" rule) and binds
+  # a cast's source and result to variables. `vtables`/`constparams` still emit
+  # `(expr (stmts ...) v)` for their temps, so this run also flattens those —
+  # converting them to the `hoisted` discipline is what would leave this pass
+  # with nothing but its own two jobs. See `doc/final_ir.md`.
   pass.prepareForNext("xelim_final")
-  lowerExprs(pass, LowerCasts)
+  lowerExprs(pass, LowerCasts, bitCastsInBackend = c.nativeBackend)
   pass.finishPass()
 
   result = ensureMove(pass.dest)

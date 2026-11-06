@@ -13,6 +13,10 @@
 ## shared default generator. The default-generator procs are **not** thread-safe
 ## — give each thread its own `Rand` via `initRand`.
 
+# The default-generator procs share `state` without synchronization (see
+# above); that is documented behaviour, so opt out of the shared-global check.
+{.feature: "assumeSync".}
+
 type
   Rand* = object ## State of a random number generator. Create one with `initRand`.
     a0, a1: uint64
@@ -72,7 +76,7 @@ proc rand*(r: var Rand; max: Natural): int =
   ## Random integer in `0 .. max` (inclusive) using `r`.
   int(randUint64(r, uint64(max)))
 
-proc rand*(max: int): int =
+proc rand*(max: Natural): int =
   ## Random integer in `0 .. max` using the default generator.
   rand(state, max)
 

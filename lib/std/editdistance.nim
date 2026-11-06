@@ -30,9 +30,9 @@ func editDistance*(a, b: string): int =
     return editDistance(b, a)
   # strip common prefix
   var
-    iStart = 0 ## The character starting index of the first rune in both strings `a` and `b`
-    iNextA = 0
-    iNextB = 0
+    iStart: Natural = 0 ## The character starting index of the first rune in both strings `a` and `b`
+    iNextA: Natural = 0
+    iNextB: Natural = 0
     runeA, runeB: Rune
     lenRunesA = 0 ## The number of relevant runes in string `a`.
     lenRunesB = 0 ## The number of relevant runes in string `b`.
@@ -120,12 +120,12 @@ func editDistance*(a, b: string): int =
   iCurrentA = iStart
   var
     char2pI = -1
-    char2pPrev = 0
+    char2pPrev: Natural = 0
   for i in 1 .. (len1 - 1):
     iNextA = iCurrentA
     a.fastRuneAt(iNextA, runeA)
     var
-      char2p = 0
+      char2p: Natural = 0
       diff = 0
       x = 0
       p = 0
@@ -140,13 +140,13 @@ func editDistance*(a, b: string): int =
         char2p = iStart
         for j in 0 ..< offset:
           runeB = b.runeAt(char2p)
-          inc(char2p, runeB.size)
+          if char2p < b.len: inc(char2p, runeB.size) # past the end every index reads `replRune`
         char2pI = i + 1
         char2pPrev = char2p
       p = offset
       runeB = b.runeAt(char2p)
       var c3 = row[p] + (if runeA != runeB: 1 else: 0)
-      inc(char2p, runeB.size)
+      if char2p < b.len: inc(char2p, runeB.size) # past the end every index reads `replRune`
       inc(p)
       x = row[p] + 1
       diff = x
@@ -166,7 +166,7 @@ func editDistance*(a, b: string): int =
       dec(diff)
       runeB = b.runeAt(char2p)
       var c3 = diff + (if runeA != runeB: 1 else: 0)
-      inc(char2p, runeB.size)
+      if char2p < b.len: inc(char2p, runeB.size) # past the end every index reads `replRune`
       inc(x)
       if x > c3: x = c3
       diff = row[p] + 1

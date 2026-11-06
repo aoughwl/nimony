@@ -1,7 +1,7 @@
 ## Custom runner for the pnak package-fetcher tests: build `pnak`, then run
 ## every self-contained `t*.nim` integration test here.
 import std / [os, strutils]
-import "../../src/hastur"
+import "../../src/hastur/kit"
 
 proc arg(name: string): string =
   let prefix = "--" & name & ":"
@@ -13,5 +13,7 @@ if arg("bindir").len > 0: toolchainDir = arg("bindir")
 if arg("cachedir").len > 0: nimcacheDir = arg("cachedir")
 let dir = if arg("dir").len > 0: arg("dir") else: getCurrentDir()
 
-buildPnak()
+# `--no-build`: the tree walk's `build all` already built it.
+if "--no-build" notin commandLineParams():
+  buildPnak()
 pnaktests(dir)

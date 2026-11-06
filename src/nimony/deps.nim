@@ -910,7 +910,7 @@ proc collectDepPath(c: DepContext; origin, path: string;
   ## Resolve one imported module path relative to `origin` and, if it is a new
   ## `.nim` module, queue it for the next BFS round. Dedup is by `modname` (the
   ## key used for `.p.nif` / `.p.deps.nif`), matching `processedModules`.
-  let f2 = resolveFileWrapper(c.config.paths, origin, path)
+  let f2 = resolveFile(c.config.paths, origin, path)
   if not semos.fileExists(f2): return
   if f2.endsWith(".nif"): return  # .nif inputs never need nifling
   let mp = c.toPair(f2)

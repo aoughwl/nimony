@@ -1,4 +1,4 @@
-﻿#       Nimony
+#       Nimony
 # (c) Copyright 2024 Andreas Rumpf
 #
 # See the file "license.txt", included in this
@@ -190,7 +190,7 @@ type
     pendingSumtypes*: TokenBuf
       ## synthesized oneof type declarations to emit at module end
     refObjOwners*: Table[SymId, SymId]
-      ## `T.Obj` â†’ `T` for every `type T = ref|ptr object` split off by
+      ## `T.Obj` → `T` for every `type T = ref|ptr object` split off by
       ## `semTypeSection`. The split runs in `SemcheckTopLevelSyms`, but the
       ## object body -- and with it a sum type's synthesized `anum` -- is
       ## semchecked one phase later, by which time `T.Obj` is an ordinary
@@ -225,7 +225,7 @@ type
       ## WRITTEN in, and an expansion mixes two provenances in one tree:
       ## the body comes from the expanded routine's module, while the
       ## arguments substituted into it come from the call site. `file`
-      ## discriminates the two â€” a token whose line info names the routine's
+      ## discriminates the two — a token whose line info names the routine's
       ## own file is body, anything else is a substituted argument and is
       ## judged against the module being compiled.
       ##
@@ -294,7 +294,7 @@ type
       ## be used as custom pragmas that accept arguments, e.g.
       ## `template ensuresNif*(x: untyped) {.pragma.}` lets later code attach
       ## `{.ensuresNif: addedAny(dest).}`. The template body is not expanded
-      ## here â€” the annotation is simply accepted and dropped, matching
+      ## here — the annotation is simply accepted and dropped, matching
       ## Nim's treatment for tooling-only pragmas.
     usingStmtMap*: Table[StrId, TypeCursor] # mapping of identifiers to types declared in using statements
     pragmaStack*: seq[TokenBuf] # used to implement {.push.} and {.pop.}
@@ -318,8 +318,8 @@ type
       ## Absolute paths of the files this module's semchecking READ outside
       ## its own source: what a `.plugin` reported via `plugins.dependsOn` and
       ## what `slurp`/`staticRead` folded. `semmain.writeNewDepsFile` writes
-      ## them as `(dependency â€¦)` into `.s.deps.nif`, and `deps.nim` turns them
-      ## into extra inputs of the *next* build's nimsem node â€” the depfile
+      ## them as `(dependency …)` into `.s.deps.nif`, and `deps.nim` turns them
+      ## into extra inputs of the *next* build's nimsem node — the depfile
       ## pattern, so the first build runs regardless and every later one is
       ## exact (nim-lang/nimony#1378). Filled through `recordFileDep`.
     queriedIsMain*: bool
@@ -368,7 +368,7 @@ type
       ## phase 3 `handleSymDef` reuses this symbol for the same decl (treating
       ## it as OkExistingFresh) so the body phase does not redeclare it and the
       ## symbol keeps the same name as if it had never been resolved early.
-      ## Persists phase 2 â†’ phase 3; cleared per module at phase-2 start.
+      ## Persists phase 2 → phase 3; cleared per module at phase-2 start.
 
 proc hooksOf*(c: SemContext; typ: SymId): HooksPerType =
   ## The hooks of `typ` as sem knows them. The hooks of this module (and of

@@ -68,6 +68,7 @@ import std/intsets
 import std/ioring
 import std/json
 import std/lexbase
+import std/lists
 import std/locks
 import std/logging
 import std/macros
@@ -108,6 +109,7 @@ import std/streams
 import std/stripes
 import std/strtabs
 import std/strutils
+import std/sums
 import std/symlinks
 import std/syncio
 import std/system

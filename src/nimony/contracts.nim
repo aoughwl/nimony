@@ -280,7 +280,9 @@ proc wantNotNil(c: var Context; n: Cursor) =
     discard "fine, addresses are not nil"
   else:
     let t = getType(c.typeCache, n)
-    if markedAs(t, NotnilU):
+    if t.typeKind == PointerT:
+      discard "LOCAL-PATCH: opaque `pointer` args (lifter-generated =trace `src`) are not nil-proved"
+    elif markedAs(t, NotnilU):
       discard "fine, per type we know it is not nil"
     else:
       let r = analysableRoot(c, n)

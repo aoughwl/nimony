@@ -366,7 +366,7 @@ proc gs(g: var JSGen; n: var Cursor) =
     g.nl(); g.genBlock n
   of VarS, GvarS, TvarS, ConstS:
     g.genVar n
-  of AsgnS, StoreS:
+  of AsgnS:
     n.into:
       g.nl()
       g.gx n            # lvalue
@@ -451,7 +451,7 @@ proc genToplevel(g: var JSGen; n: var Cursor) =
         g.gx n
   of StmtsS:
     n.loopInto: g.genToplevel n
-  of CallS, AsgnS, StoreS, IfS, WhileS, CaseS, DiscardS, ScopeS:
+  of CallS, AsgnS, IfS, WhileS, CaseS, DiscardS, ScopeS:
     g.gs n
   else:
     g.nl(); g.todo("toplevel:" & $n.stmtKind, n)

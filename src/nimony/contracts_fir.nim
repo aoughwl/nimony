@@ -637,6 +637,8 @@ proc wantNotNil(c: var NjvlContext; n: Cursor) =
       discard "fine, per type we know it is not nil"
     elif isNonNilExpr(c, n):
       discard "fine, expression is trivially not nil"
+    elif t.typeKind == PointerT:
+      discard "LOCAL-PATCH: opaque `pointer` args (lifter-generated =trace src) are not nil-proved"
     elif t.typeKind in RoutineTypes and not markedAs(t, NilU):
       discard "fine, proc values are not nil unless explicitly marked nil"
     else:

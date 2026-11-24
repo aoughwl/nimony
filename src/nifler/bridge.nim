@@ -450,7 +450,18 @@ proc toNif*(n, parent: PNode; c: var TranslationContext; allowEmpty = false) =
     handleCaseIdentDefs(n[n.len-1], n, c)
     c.b.endTree()
 
-  of nkStmtListType, nkStmtListExpr:
+  of nkStmtListExpr, nkStmtListType:
+    # WINDOWS-LOCAL PATCH (Nim 2.2.2 parser): `(a = b; c = d)` arrives as a
+    # StmtListExpr whose last child is a statement (or nkEmpty); emit a plain
+    # statement list instead of an expr, which nimsem rejects.
+    if n.len > 0 and n[n.len-1].kind in {nkAsgn, nkFastAsgn, nkEmpty, nkDiscardStmt,
+        nkReturnStmt, nkBreakStmt, nkContinueStmt, nkRaiseStmt, nkWhileStmt, nkForStmt}:
+      c.b.addTree(StmtsL)
+      relLineInfo(n, parent, c)
+      for i in 0..<n.len:
+        if n[i].kind != nkEmpty: toNif(n[i], n, c)
+      c.b.endTree()
+      return
     c.b.addTree(ExprL)
     c.b.addTree(StmtsL)
     relLineInfo(n, parent, c)
